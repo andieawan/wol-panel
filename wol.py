@@ -1407,7 +1407,7 @@ LOG_LABELS = {
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
     "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
     "terminal-gagal": "Password terminal salah", "terminal-buka-kunci": "Membuka kunci terminal",
-    "tambah-vm": "Menambah VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
+    "tambah-vm": "Menambah VM", "ubah-vm": "Mengubah data VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
     "vm-os-upgrade": "Update OS", "vm-os-upgrade-gagal": "Update OS gagal", "vm-app-update": "Update aplikasi",
     "vm-app-update-gagal": "Update aplikasi gagal", "vm-reboot": "Reboot", "vm-reboot-gagal": "Reboot gagal",
 }
@@ -1547,6 +1547,7 @@ def home_page(user, csrf, q):
             nf = len(flagged(d["id"]))
             if nf:
                 warn = f'<div style="margin-top:6px"><a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a></div>'
+        edit = (f'<a class="btn quiet sm" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a>' if is_admin(user) else "")
         cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
 <div class="dev-head"><div><h2>{E(d['name'])}</h2>
 <div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}</div>
@@ -1555,7 +1556,7 @@ def home_page(user, csrf, q):
 <div class="dev-acts">
 <form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="btn primary" data-busy="Mengirim…">{icon('power')}Hidupkan</button></form>
 <a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote {icon('ext')}</a>
-{stop}</div></article>""")
+{stop}{edit}</div></article>""")
     if not cards:
         tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
             else '<p class="small">Hubungi admin untuk menambahkan komputer.</p>'
@@ -2035,6 +2036,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
             btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel akan bisa membuka shell root ke " + vm["name"] + " dari jaringan sekolah. Setelah ini jalankan perintah pasang yang muncul di VM itu.", "Izinkan", "Izinkan terminal?")}>'
                         f'{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Izinkan terminal</button></form>')
         btns.append(f'<form method="post" action="/servers/install">{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Pasang ulang</button></form>')
+        btns.append(f'<a class="btn sm quiet" href="/servers?edit={quote(vm["id"])}#form-vm">Ubah</a>')
         btns.append(del_form("/servers/delete", csrf, f"{vm['name']} dihapus dari panel. Akses SSH panel di VM tetap ada sampai dihapus dari /root/.ssh/authorized_keys.",
                              f"Hapus {vm['name']}?", id=vm["id"]))
 
@@ -2073,13 +2075,16 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
     if not cards:
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada VM</h3>'
                      '<p class="small" style="margin:0">Tambahkan VM aplikasi (Pusat, Absensi, BK, …) di bawah.</p></div>')
-    add = f"""<details class="card" id="form-vm" style="padding:0"{" open" if not vms or q.get("f_name") else ""}>
-<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah VM</summary>
-<form method="post" action="/servers/add" style="padding:0 16px 16px">{hidden(csrf)}
-<div class="grid"><label>Nama<input name="name" required maxlength="60" placeholder="mis. VM Absensi" value="{E(q.get('f_name', [''])[0])}"></label>
-<label>IP / host<input name="host" required maxlength="100" placeholder="mis. 192.168.10.21" spellcheck="false" value="{E(q.get('f_host', [''])[0])}"></label>
-<label>Port SSH<input name="port" type="number" min="1" max="65535" value="{E(q.get('f_port', ['22'])[0])}"></label></div>
-<button class="btn primary" data-busy="Menyimpan…">Tambah VM</button></form></details>"""
+    ed = next((v for v in vms if v["id"] == q.get("edit", [""])[0]), None)
+    fv = lambda k, dflt="": E(q[f"f_{k}"][0] if f"f_{k}" in q else str((ed or {}).get(k, dflt)))
+    add = f"""<details class="card" id="form-vm" style="padding:0"{" open" if not vms or ed or q.get("f_name") else ""}>
+<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus') if not ed else ''}{'Ubah ' + E(ed['name']) if ed else 'Tambah VM'}</summary>
+<form method="post" action="/servers/add" style="padding:0 16px 16px">{hidden(csrf, orig=ed['id'] if ed else '')}
+<div class="grid"><label>Nama<input name="name" required maxlength="60" placeholder="mis. VM Absensi" value="{fv('name')}"></label>
+<label>IP / host<input name="host" required maxlength="100" placeholder="mis. 192.168.10.21" spellcheck="false" value="{fv('host')}"></label>
+<label>Port SSH<input name="port" type="number" min="1" max="65535" value="{fv('port', '22')}"></label></div>
+<div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if ed else 'Tambah VM'}</button>
+{'<a class="btn quiet" href="/servers">Batal</a>' if ed else ''}</div></form></details>"""
     interval = f"""<form method="post" action="/servers/interval" class="inline" style="margin-top:4px">{hidden(csrf)}
 <label style="flex:0 1 260px">Cek otomatis setiap (jam)<input name="hours" type="number" min="0" max="168" value="{E(str(CFG.get('vm_check_hours', 6)))}"></label>
 <button class="btn">Simpan</button></form><p class="mut small" style="margin:6px 0 0">0 = hanya saat tombol Cek diklik. Update tetap dijalankan manual.</p>"""
@@ -2487,7 +2492,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------- server / VM
     def do_vm_add(self, form, user, ip):
         name, host = form.get("name", "").strip(), form.get("host", "").strip()
-        keep = {"f_name": name, "f_host": host, "f_port": form.get("port", "22")}
+        orig = form.get("orig", "")
+        keep = {"f_name": name, "f_host": host, "f_port": form.get("port", "22"), **({"edit": orig} if orig else {})}
         try:
             port = int(form.get("port") or 22)
             if not 1 <= port <= 65535:
@@ -2496,6 +2502,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.back("/servers", "Port SSH harus angka 1–65535.", True, **keep)
         if not name or len(name) > 60 or not re.fullmatch(r"[A-Za-z0-9.-]{1,100}", host):
             return self.back("/servers", "Isi nama dan IP/host VM yang valid.", True, **keep)
+        if orig:
+            vm = next((v for v in CFG["vms"] if v["id"] == orig), None)
+            if not vm:
+                return self.back("/servers", "VM tidak ditemukan.", True)
+            if vm_job_running(vm["id"]):
+                return self.back("/servers", "Tunggu proses di VM ini selesai dulu.", True, **keep)
+            moved = (vm["host"], int(vm.get("port", 22))) != (host, port)
+            vm.update(name=name, host=host, port=port)
+            save_config(CFG)
+            write_log(user, "ubah-vm", vm["id"], ip)
+            return self.back("/servers", f"{name} disimpan." + (" Klik Cek untuk memastikan panel bisa menjangkau alamat barunya." if moved else ""))
         vid = slugify(name)
         base, i = vid, 2
         while any(v["id"] == vid for v in CFG["vms"]):
