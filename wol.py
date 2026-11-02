@@ -987,9 +987,9 @@ cat > /usr/local/sbin/wol-update <<'WOLEOF'
 WOLEOF
 chown root:root /usr/local/sbin/wol-update; chmod 755 /usr/local/sbin/wol-update
 
-if [ ! -f /etc/wol-update.conf ]; then
+if [ ! -f /etc/wol-update.conf ] || ! grep -q '^APP_DIR="/' /etc/wol-update.conf; then
   APP=""
-  for f in /var/www/*/deploy/update.sh /var/www/*/*/deploy/update.sh; do
+  for f in /var/www/*/deploy/update.sh /var/www/*/*/deploy/update.sh /root/wol-panel/deploy/update.sh; do
     [ -f "$f" ] && {{ APP="$(dirname "$(dirname "$f")")"; break; }}
   done
   echo "APP_DIR=\\"$APP\\"" > /etc/wol-update.conf

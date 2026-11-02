@@ -185,6 +185,12 @@ Keamanan:
   `reboot`, tanpa shell bebas.
 - Folder aplikasi dideteksi dari `/var/www/*/deploy/update.sh` dan bisa diubah di `/etc/wol-update.conf`.
 
+**Memperbarui WOL Panel sendiri dari menu Server:** tambahkan container panel sebagai VM (IP container itu sendiri),
+lalu jalankan perintah pasangnya di container tersebut. Repo panel di `/root/wol-panel` terdeteksi otomatis, dan
+**Update aplikasi** menjalankan `deploy/update.sh` milik panel (`git pull` + `install.sh`). Layanan panel dimulai
+ulang 5 detik setelah update selesai, jadi halaman cukup dimuat ulang. Perintah yang sama bisa dijalankan manual:
+`cd ~/wol-panel && bash deploy/update.sh`.
+
 Mencabut akses panel dari sebuah VM:
 
 ```bash

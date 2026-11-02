@@ -53,5 +53,10 @@ EOF
 
 systemctl daemon-reload
 systemctl enable wol-panel >/dev/null 2>&1
-systemctl restart wol-panel
+if [ -n "${WOL_DEFER_RESTART:-}" ]; then
+  systemd-run --quiet --on-active=5 --unit="wol-panel-restart-$(date +%s)" systemctl restart wol-panel
+  echo "Layanan WOL Panel dimulai ulang dalam 5 detik."
+else
+  systemctl restart wol-panel
+fi
 echo "Selesai. Buka http://$(hostname -I | awk '{print $1}'):8080"
