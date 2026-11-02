@@ -18,6 +18,7 @@ fi
 id wolpanel >/dev/null 2>&1 || useradd --system --home "$DIR" --shell /usr/sbin/nologin wolpanel
 mkdir -p "$DIR"
 install -m 755 "$(dirname "$0")/wol.py" "$DIR/wol.py"
+install -m 644 "$(dirname "$0")/windows-agent.ps1" "$DIR/windows-agent.ps1"
 
 if [ ! -f "$DIR/config.json" ]; then
   echo "== Buat akun admin WOL Panel =="

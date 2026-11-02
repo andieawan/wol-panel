@@ -57,7 +57,7 @@ Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layana
   (remotedesktop.google.com/access), linknya bisa diganti per komputer.
 - **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
   - *Admin*: bisa menyalakan komputer dan mengubah pengaturan.
-  - *Pengguna*: hanya bisa menyalakan komputer.
+  - *Pengguna*: hanya bisa menyalakan dan mematikan komputer.
 - **Umum**: mode reverse proxy (NPMplus) dan lama sesi login.
 
 Setiap akun bisa mengganti passwordnya sendiri di menu **Akun**. Riwayat login, perintah menyalakan,
@@ -68,6 +68,35 @@ Jika lupa password admin, jalankan di server:
 ```bash
 cd /opt/wol-panel && python3 wol.py resetpw admin && systemctl restart wol-panel
 ```
+
+### Mematikan komputer dari panel
+
+WOL hanya bisa menyalakan. Untuk tombol **Matikan**, komputer Windows perlu dipasangi agen kecil
+(script PowerShell bawaan Windows, tanpa instalasi program lain):
+
+1. Di panel: **Pengaturan**, lalu klik **Agen** pada komputer tujuan. Panel menampilkan satu baris perintah.
+2. Di komputer tujuan: klik kanan Start → **Terminal (Admin)**, tempel perintah tersebut, lalu Enter.
+3. Kalau muncul tulisan hijau *Berhasil*, klik **Tes** di panel. Hasil yang diharapkan: *Agen Matikan: aktif*.
+
+Setelah itu tombol **Matikan** muncul di Beranda. Komputer menampilkan peringatan dan mati 10 detik kemudian.
+Perintahnya berlaku 15 menit; kalau kedaluwarsa, klik **Agen** lagi.
+
+Keamanan agen:
+- Berjalan sebagai layanan Windows (Scheduled Task SYSTEM) di port 8765.
+- Firewall Windows hanya membuka port itu untuk IP panel.
+- Setiap perintah ditandatangani kunci rahasia, berlaku 2 menit, dan tidak bisa diulang.
+- Kunci disimpan di `C:\ProgramData\WOLPanelAgent`, yang hanya bisa dibaca Administrator.
+- Log agen ada di `C:\ProgramData\WOLPanelAgent\agent.log`.
+
+Menghapus agen dari Windows (PowerShell Admin):
+
+```powershell
+Unregister-ScheduledTask -TaskName 'WOL Panel Agent' -Confirm:$false
+Remove-NetFirewallRule -DisplayName 'WOL Panel Agent'
+Remove-Item "$env:ProgramData\WOLPanelAgent" -Recurse -Force
+```
+
+Lalu di panel klik **Agen** → **Lepas agen**.
 
 ## 4. Akses dari luar sekolah
 
@@ -94,6 +123,8 @@ buka panel dan remote desktop memakai IP lokal seperti di sekolah.
 | Tidak pernah bangun | MAC salah, atau desktop beda jaringan/VLAN dengan server |
 | Status selalu "Mati" padahal menyala | Klik **Tes** di Pengaturan. Jika "ARP: tidak ada jawaban", IP salah atau komputer beda jaringan dengan server. Jika arping/ping "tidak diizinkan", jalankan ulang `install.sh` |
 | Tes menulis "MAC TIDAK cocok" | IP yang diisi dipakai perangkat lain — cek IP & MAC dengan `ipconfig /all` di komputer tersebut |
+| Tombol Matikan gagal: *agen tidak merespons* | Agen belum terpasang, atau Windows belum selesai booting. Klik **Tes** untuk detail |
+| Tombol Matikan gagal: *menolak IP panel* / *kunci tidak cocok* | IP panel berubah atau kunci diganti — klik **Agen** lalu jalankan ulang perintahnya di komputer tujuan |
 | Status "Menyala" padahal komputer sedang Sleep | Kartu jaringan Intel dengan *ARP Offload* tetap menjawab ARP saat Sleep. Tombol Hidupkan tetap bisa dipakai |
 
 Status dicek berurutan: port (misalnya 3389), lalu ARP, lalu ping. ARP tetap dijawab Windows walau ping

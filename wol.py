@@ -29,6 +29,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +49,12 @@ WAKE_COOLDOWN = {}  # id perangkat -> waktu terakhir dikirim
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
 DEFAULT_REMOTE = "https://remotedesktop.google.com/access"
+AGENT_TEMPLATE = os.path.join(BASE, "windows-agent.ps1")
+AGENT_PORT = 8765
+AGENT_TOKENS = {}  # token sekali-pakai untuk unduh pemasang agen -> (id perangkat, kedaluwarsa)
+AGENT_TOKEN_TTL = 900
+SHUTDOWN_DELAY = 10  # detik peringatan di layar sebelum komputer mati
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # ---------------------------------------------------------------- konfigurasi
@@ -213,7 +221,72 @@ def diagnose(dev):
     pg = check_ping(ip)
     out.append("Ping: " + {True: "menjawab", False: "tidak menjawab (wajar jika diblokir Windows Firewall)",
                             None: "tidak diizinkan di server (jalankan ulang install.sh)"}[pg])
+    if dev.get("agent_secret"):
+        ok, why = agent_ping(dev)
+        out.append("Agen Matikan: " + ("aktif" if ok else why))
     return f"Tes {dev['name']} ({ip}) — " + " · ".join(out)
+
+
+# ------------------------------------------------------- agen Windows
+def local_ip_for(target):
+    """IP server ini yang dipakai untuk menjangkau target (dipakai agen sebagai IP panel yang diizinkan)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((target, 9))
+        return s.getsockname()[0]
+
+
+def agent_url(dev, path):
+    return f"http://{dev['ip']}:{int(dev.get('agent_port', AGENT_PORT))}{path}"
+
+
+def agent_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 403:
+            return "agen menolak IP panel (IP panel berubah?) — pasang ulang agen"
+        if e.code == 401:
+            body = e.read().decode("utf-8", "replace").strip()
+            if body == "clock":
+                return "jam panel dan komputer selisih lebih dari 2 menit — samakan jamnya"
+            return "kunci agen tidak cocok — pasang ulang agen"
+        return f"agen menjawab error {e.code}"
+    return "agen tidak merespons (komputer mati, atau agen belum terpasang)"
+
+
+def agent_ping(dev):
+    try:
+        with NO_PROXY.open(agent_url(dev, "/ping"), timeout=3) as r:
+            return r.read().strip() == b"ok", "jawaban tidak dikenal"
+    except Exception as e:
+        return False, agent_error(e)
+
+
+def agent_shutdown(dev, user, delay=SHUTDOWN_DELAY):
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    by = re.sub(r"[^A-Za-z0-9._-]", "", user)[:32]
+    msg = f"shutdown|{ts}|{nonce}|{delay}|{by}"
+    sig = hmac.new(dev["agent_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(agent_url(dev, "/shutdown"), data=b"", method="POST", headers={
+        "X-WOL-Time": ts, "X-WOL-Nonce": nonce, "X-WOL-Delay": str(delay), "X-WOL-User": by, "X-WOL-Signature": sig})
+    with NO_PROXY.open(req, timeout=5) as r:
+        return r.read().strip() == b"ok"
+
+
+def new_agent_token(dev_id):
+    now = time.time()
+    for t, (_, exp) in list(AGENT_TOKENS.items()):
+        if exp < now:
+            AGENT_TOKENS.pop(t, None)
+    tok = secrets.token_urlsafe(24)
+    AGENT_TOKENS[tok] = (dev_id, now + AGENT_TOKEN_TTL)
+    return tok
+
+
+def agent_script(dev):
+    with open(AGENT_TEMPLATE, encoding="utf-8") as f:
+        tpl = f.read()
+    return (tpl.replace("__SECRET__", dev["agent_secret"])
+               .replace("__PORT__", str(int(dev.get("agent_port", AGENT_PORT))))
+               .replace("__PANEL_IP__", local_ip_for(dev["ip"])))
 
 
 def all_status():
@@ -353,10 +426,11 @@ async function refresh(){
     const s=await r.json();
     for(const [id,v] of Object.entries(s)){
       const b=document.getElementById('st-'+id); if(!b) continue;
-      const waking=b.dataset.waking==='1' && v!==true;
-      const [cls,txt]=waking?['wait','Sedang dihidupkan…']:fmt[v];
+      let [cls,txt]=fmt[v];
+      const p=b.dataset.pending;
+      if(p==='wake'){ if(v===true) b.dataset.pending=''; else [cls,txt]=['wait','Sedang dihidupkan…']; }
+      if(p==='stop'){ if(v===false) b.dataset.pending=''; else [cls,txt]=['wait','Sedang dimatikan…']; }
       b.className='badge '+cls; b.lastElementChild.textContent=txt;
-      if(v===true) b.dataset.waking='0';
     }
   }catch(e){}
 }
@@ -409,15 +483,20 @@ def login_page(err=""):
 
 
 def home_page(user, csrf, q):
-    waking = q.get("waking", [""])[0]
+    waking, stopping = q.get("waking", [""])[0], q.get("stopping", [""])[0]
     cards = []
     for d in CFG.get("devices", []):
         did = E(d["id"])
+        pending = "wake" if d["id"] == waking else "stop" if d["id"] == stopping else ""
+        stop = ""
+        if d.get("agent_secret"):
+            stop = (f'<form method="post" action="/shutdown" {confirm(d["name"] + " akan dimatikan. Pekerjaan yang belum disimpan di komputer itu akan hilang. Lanjutkan?")}>'
+                    f'{hidden(csrf, id=d["id"])}<button class="danger">Matikan</button></form>')
         cards.append(f"""<div class="card dev"><div><h2>{E(d['name'])}</h2>
 <div class="mut">{E(d.get('ip') or '-')} · {E(d['mac'])}</div>
-<span id="st-{did}" class="badge off" data-waking="{'1' if d['id'] == waking else '0'}"><span class="dot"></span><span>Mengecek…</span></span></div>
+<span id="st-{did}" class="badge off" data-pending="{pending}"><span class="dot"></span><span>Mengecek…</span></span></div>
 <div class="acts"><a class="btn ghost" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote</a>
-<form method="post" action="/wake">{hidden(csrf, id=d['id'])}<button id="btn-{did}">Hidupkan</button></form></div></div>""")
+{stop}<form method="post" action="/wake">{hidden(csrf, id=d['id'])}<button id="btn-{did}">Hidupkan</button></form></div></div>""")
     if not cards:
         tip = 'Tambahkan lewat menu <a href="/settings">Pengaturan</a>.' if is_admin(user) else "Hubungi admin untuk menambahkan."
         cards.append(f'<div class="card mut">Belum ada komputer. {tip}</div>')
@@ -438,9 +517,12 @@ def settings_page(user, csrf, q):
     rows = []
     for d in CFG["devices"]:
         dl = (f'<form method="post" action="/devices/test">{hidden(csrf, id=d["id"])}'
-              f'<button class="ghost" title="Cek port, ARP, dan ping">Tes</button></form>'
+              f'<button class="ghost" title="Cek port, ARP, ping, dan agen">Tes</button></form>'
+              f'<form method="post" action="/devices/agent">{hidden(csrf, id=d["id"])}'
+              f'<button class="ghost" title="Pasang agen agar bisa dimatikan dari panel">Agen</button></form>'
               + del_form("/devices/delete", csrf, f"Hapus {d['name']}?", id=d["id"]))
-        rows.append(f"""<tr><td><b>{E(d['name'])}</b><div class="mut">{E(d['id'])}</div></td>
+        tag = ' <span class="mut">· bisa dimatikan</span>' if d.get("agent_secret") else ""
+        rows.append(f"""<tr><td><b>{E(d['name'])}</b><div class="mut">{E(d['id'])}{tag}</div></td>
 <td><code>{E(d['mac'])}</code></td><td>{E(d.get('ip') or '-')}</td>
 <td><div class="acts"><a class="btn ghost" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>{dl}</div></td></tr>""")
     rows = "".join(rows) or '<tr><td colspan="4" class="mut">Belum ada komputer.</td></tr>'
@@ -482,7 +564,7 @@ jadi tetap terdeteksi walau Remote Desktop tidak aktif. Pakai tombol <b>Tes</b> 
 <p class="mut" style="margin-top:0">Jika nama pengguna sudah ada, password dan perannya akan diganti.</p>
 <div class="grid">
 <label>Nama pengguna<input name="u" required pattern="[A-Za-z0-9._\\-]{{3,32}}" value="{val('u')}" autocomplete="off"></label>
-<label>Peran<select name="role"><option value="user">Pengguna – hanya bisa menyalakan</option>
+<label>Peran<select name="role"><option value="user">Pengguna – hanya menyalakan & mematikan</option>
 <option value="admin">Admin – bisa mengubah pengaturan</option></select></label>
 <label>Password (min. 8 karakter)<input name="p1" type="password" minlength="8" required autocomplete="new-password"></label>
 <label>Ulangi password<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
@@ -496,7 +578,28 @@ Panel diakses lewat reverse proxy (NPMplus / Nginx)</label>
 <label>Lama sesi login (jam)<input name="session_hours" type="number" min="1" max="720" value="{int(CFG.get('session_hours', 12))}" style="max-width:160px"></label>
 <button>Simpan</button></form>"""
 
-    body = f"""<div class="card"><h2>Komputer</h2><div class="tbl"><table>
+    agent_card = ""
+    aid, atok = q.get("agent", [""])[0], q.get("tok", [""])[0]
+    adev = next((d for d in CFG["devices"] if d["id"] == aid), None)
+    if adev and atok in AGENT_TOKENS and AGENT_TOKENS[atok][1] > time.time():
+        try:
+            panel = f"http://{local_ip_for(adev['ip'])}:{int(CFG.get('port', 8080))}"
+        except OSError:
+            panel = "http://IP-PANEL:8080"
+        cmd = f"irm {panel}/agent/{atok}.ps1 | iex"
+        remove = (f'<form method="post" action="/devices/agent-remove" {confirm("Lepas agen dari " + adev["name"] + "? Tombol Matikan akan hilang.")}>'
+                  f'{hidden(csrf, id=adev["id"])}<button class="danger">Lepas agen</button></form>')
+        agent_card = f"""<div class="card" id="agent"><h2>Pasang agen Matikan di {E(adev['name'])}</h2>
+<ol style="margin:0 0 12px;padding-left:20px">
+<li>Di komputer <b>{E(adev['name'])}</b>: klik kanan Start → <b>Terminal (Admin)</b> atau <b>Windows PowerShell (Admin)</b>.</li>
+<li>Tempel perintah ini lalu tekan Enter:</li></ol>
+<input readonly value="{E(cmd)}" onclick="this.select()" style="font-family:ui-monospace,Consolas,monospace">
+<p class="mut" style="margin-top:0">Perintah berlaku 15 menit. Jika muncul tulisan hijau <i>Berhasil</i>, klik <b>Tes</b> pada komputer ini
+untuk memastikan panel bisa menjangkau agen. Tombol <b>Matikan</b> sudah muncul di Beranda.
+Agen hanya menerima perintah dari panel ini dan setiap perintah ditandatangani kunci rahasia.</p>
+<div class="acts" style="justify-content:flex-start"><a class="btn ghost" href="/settings">Tutup</a>{remove}</div></div>"""
+
+    body = f"""{agent_card}<div class="card"><h2>Komputer</h2><div class="tbl"><table>
 <tr><th>Nama</th><th>MAC</th><th>IP</th><th></th></tr>{rows}</table></div></div>
 <div class="card">{dev_form}</div>
 <div class="card"><h2>Pengguna</h2><div class="tbl"><table><tr><th>Nama</th><th>Peran</th><th></th></tr>{urows}</table></div></div>
@@ -579,6 +682,15 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/login":
             return self._send(200, login_page())
+        m = re.fullmatch(r"/agent/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
+        if m:  # unduh pemasang agen memakai token sementara (tanpa login, diambil dari komputer tujuan)
+            ent = AGENT_TOKENS.get(m.group(1))
+            dev = ent and ent[1] > time.time() and next((d for d in CFG["devices"] if d["id"] == ent[0]), None)
+            if not dev or not dev.get("agent_secret"):
+                return self._send(200, "Write-Host 'Perintah sudah kedaluwarsa. Buat ulang dari WOL Panel: Pengaturan -> Agen.' -ForegroundColor Red\n",
+                                  "text/plain; charset=utf-8")
+            write_log("-", "unduh-agen", dev["id"], self.client_ip())
+            return self._send(200, agent_script(dev), "text/plain; charset=utf-8")
         user, tok = self.session()
         if not user:
             if url.path.startswith("/api/"):
@@ -620,6 +732,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/login", [self.cookie_header("", 0)])
         if path == "/wake":
             return self.do_wake(form, user, ip)
+        if path == "/shutdown":
+            return self.do_shutdown(form, user, ip)
         if path == "/account":
             return self.do_account(form, user, ip)
 
@@ -635,6 +749,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_device_save(form, user, ip)
             if path == "/devices/delete":
                 return self.do_device_delete(form, user, ip)
+            if path == "/devices/agent":
+                return self.do_agent(form, user, ip)
+            if path == "/devices/agent-remove":
+                return self.do_agent_remove(form, user, ip)
             if path == "/users/save":
                 return self.do_user_save(form, user, ip)
             if path == "/users/delete":
@@ -673,6 +791,49 @@ class Handler(BaseHTTPRequestHandler):
         write_log(user, "nyalakan", dev["id"], ip)
         return self.back("/", f"Perintah menyalakan dikirim ke {dev['name']}.", waking=dev["id"])
 
+    def do_shutdown(self, form, user, ip):
+        dev = next((d for d in CFG.get("devices", []) if d["id"] == form.get("id")), None)
+        if not dev or not dev.get("agent_secret") or not dev.get("ip"):
+            return self.back("/", "Komputer ini belum dipasangi agen Matikan.", True)
+        key = "stop:" + dev["id"]
+        if time.time() - WAKE_COOLDOWN.get(key, 0) < 10:
+            return self.back("/", "Perintah baru saja dikirim, tunggu sebentar.", stopping=dev["id"])
+        try:
+            agent_shutdown(dev, user)
+        except Exception as e:
+            return self.back("/", f"Gagal mematikan {dev['name']}: {agent_error(e)}.", True)
+        WAKE_COOLDOWN[key] = time.time()
+        write_log(user, "matikan", dev["id"], ip)
+        return self.back("/", f"{dev['name']} akan mati dalam {SHUTDOWN_DELAY} detik.", stopping=dev["id"])
+
+    def do_agent(self, form, user, ip):
+        dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
+        if not dev:
+            return self.back("/settings", "Komputer tidak ditemukan.", True)
+        if not dev.get("ip"):
+            return self.back("/settings", "Isi dulu IP komputer (Ubah) sebelum memasang agen.", True)
+        if not os.path.exists(AGENT_TEMPLATE):
+            return self.back("/settings", "File windows-agent.ps1 tidak ada di server — jalankan ulang install.sh.", True)
+        if not dev.get("agent_secret"):
+            dev["agent_secret"] = secrets.token_hex(32)
+            dev.setdefault("agent_port", AGENT_PORT)
+            save_config(CFG)
+        write_log(user, "token-agen", dev["id"], ip)
+        self.redirect("/settings?" + urlencode({"agent": dev["id"], "tok": new_agent_token(dev["id"])}) + "#agent")
+
+    def do_agent_remove(self, form, user, ip):
+        dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
+        if not dev:
+            return self.back("/settings", "Komputer tidak ditemukan.", True)
+        dev.pop("agent_secret", None)
+        dev.pop("agent_port", None)
+        for t, (did, _) in list(AGENT_TOKENS.items()):
+            if did == dev["id"]:
+                AGENT_TOKENS.pop(t, None)
+        save_config(CFG)
+        write_log(user, "lepas-agen", dev["id"], ip)
+        return self.back("/settings", f"Agen dilepas dari {dev['name']}. Untuk menghapus dari Windows, lihat README.")
+
     def do_account(self, form, user, ip):
         rec = CFG["users"][user]
         if not check_password(form.get("old", ""), rec["hash"]):
@@ -698,7 +859,15 @@ class Handler(BaseHTTPRequestHandler):
             if orig:
                 keep["edit"] = orig
             return self.back("/settings", err, True, **keep)
-        if orig and any(d["id"] == orig for d in CFG["devices"]):
+        old = next((d for d in CFG["devices"] if d["id"] == orig), None) if orig else None
+        if old:
+            for k in ("agent_secret", "agent_port"):  # kunci agen tetap dipakai saat data komputer diubah
+                if k in old:
+                    dev[k] = old[k]
+            if old["id"] != dev["id"]:
+                for t, (did, exp) in list(AGENT_TOKENS.items()):
+                    if did == old["id"]:
+                        AGENT_TOKENS[t] = (dev["id"], exp)
             CFG["devices"] = [dev if d["id"] == orig else d for d in CFG["devices"]]
             msg = f"{dev['name']} berhasil diperbarui."
         else:
