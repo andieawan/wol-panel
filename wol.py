@@ -387,61 +387,271 @@ def csrf_for(token):
 E = html.escape
 
 CSS = """
-:root{--bg:#f4f6f8;--card:#fff;--fg:#1d2733;--mut:#6b7785;--line:#e3e8ee;--acc:#1f6feb;--ok:#1a7f37;--off:#8c959f;--warn:#bf8700;--err:#cf222e}
-@media (prefers-color-scheme:dark){:root{--bg:#0f141a;--card:#171e26;--fg:#e6edf3;--mut:#8b98a5;--line:#2a333d;--acc:#4493f8;--ok:#3fb950;--off:#6e7681;--warn:#d29922;--err:#f85149}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-.wrap{max-width:760px;margin:0 auto;padding:20px 16px 40px}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
-h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}.mut{color:var(--mut);font-size:13px}
-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-nav a{color:var(--mut);text-decoration:none;padding:6px 10px;border-radius:8px}nav a.on{color:var(--fg);background:var(--card);border:1px solid var(--line)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px}
-.dev{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
-.dev h2{margin:0 0 2px}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--off)}
-.on .dot{background:var(--ok)}.badge.on{color:var(--ok)}.badge.off{color:var(--off)}.wait .dot{background:var(--warn)}.wait{color:var(--warn)}
-button,.btn{font:inherit;border:0;border-radius:8px;padding:9px 16px;cursor:pointer;background:var(--acc);color:#fff;font-weight:600;text-decoration:none;display:inline-block}
-button:disabled{opacity:.5;cursor:default}
-button.ghost,.btn.ghost{background:transparent;color:var(--mut);border:1px solid var(--line);padding:6px 12px;font-weight:500}
-button.danger{background:transparent;color:var(--err);border:1px solid var(--line);padding:6px 12px;font-weight:500}
-.msg{padding:10px 14px;border-radius:8px;margin-bottom:12px;border:1px solid var(--ok);background:var(--card)}
-.msg.err{border-color:var(--err);color:var(--err)}
-label{display:block;font-size:13px;color:var(--mut)}
-input,select{font:inherit;width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);margin:4px 0 12px}
-input[type=checkbox]{width:auto;margin:0 8px 0 0;vertical-align:middle}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}@media(max-width:560px){.grid{grid-template-columns:1fr}}
-table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px 4px;border-top:1px solid var(--line);text-align:left;vertical-align:middle}
-th{font-size:12px;color:var(--mut);font-weight:600;border-top:0}
-.acts{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.acts form{margin:0}
-.tbl{overflow-x:auto}.login{max-width:360px;margin:12vh auto}code{font-size:13px}
+:root{color-scheme:light dark;
+--bg:#f3f5f7;--card:#fff;--field:#fff;--fg:#17202a;--mut:#56616d;--faint:#8a95a1;--line:#e1e6eb;--line2:#cfd6dd;
+--acc:#1f6feb;--acc-soft:#e9f1fe;--ok:#1a7f37;--ok-soft:#e7f5ea;--off:#7d8791;--off-soft:#eef1f4;
+--warn:#8a5d00;--warn-soft:#fff3d1;--err:#c62430;--err-soft:#fdecee;--ring:rgba(31,111,235,.35);--shadow:0 1px 2px rgba(16,24,40,.06)}
+@media (prefers-color-scheme:dark){:root{
+--bg:#0e1319;--card:#161d25;--field:#10161d;--fg:#e6edf3;--mut:#a0acb8;--faint:#6f7b87;--line:#28313b;--line2:#36404b;
+--acc:#4493f8;--acc-soft:#132438;--ok:#3fb950;--ok-soft:#11261a;--off:#7d8791;--off-soft:#1c242d;
+--warn:#d9a227;--warn-soft:#2a2210;--err:#f85149;--err-soft:#2c1517;--ring:rgba(68,147,248,.45);--shadow:none}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--acc)}
+.wrap{max-width:760px;margin:0 auto;padding:16px 16px 48px}
+.mono{font-family:ui-monospace,"Cascadia Mono",Consolas,monospace;font-size:.92em}
+.mut{color:var(--mut)}.small{font-size:13px}
+h1,h2,h3{margin:0;line-height:1.3}h2{font-size:16px}h3{font-size:15px}
+svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* header */
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:6px 0 16px}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--fg)}
+.logo{width:34px;height:34px;border-radius:10px;background:var(--acc);color:#fff;display:grid;place-items:center}
+.brand b{font-size:17px}.brand small{display:block;color:var(--mut);font-size:12px;font-weight:400}
+.nav{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.nav a{color:var(--mut);text-decoration:none;padding:8px 12px;border-radius:8px;font-weight:500}
+.nav a:hover{color:var(--fg);background:var(--off-soft)}
+.nav a[aria-current=page]{color:var(--fg);background:var(--card);box-shadow:inset 0 0 0 1px var(--line)}
+.nav form{margin:0}
+
+/* card & layout */
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
+.card>h2{margin-bottom:12px}
+.sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:22px 0 10px}
+.sec-head:first-child{margin-top:4px}
+.sec-head h2{font-size:15px;color:var(--mut);font-weight:600}
+
+/* buttons */
+.btn{font:inherit;font-weight:600;font-size:14px;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:40px;
+padding:0 16px;border-radius:9px;border:1px solid var(--line2);background:var(--card);color:var(--fg);cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{background:var(--off-soft)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:var(--err);border-color:var(--line2)}.btn.danger:hover{background:var(--err-soft);border-color:var(--err)}
+.btn.danger-solid{background:var(--err);border-color:var(--err);color:#fff}
+.btn.quiet{border-color:transparent;background:transparent;color:var(--mut);padding:0 10px}
+.btn.quiet:hover{color:var(--fg);background:var(--off-soft)}
+.btn.quiet.danger{color:var(--err)}.btn.quiet.danger:hover{background:var(--err-soft)}
+.btn.sm{min-height:34px;padding:0 12px;font-size:13px}
+.btn:disabled,.btn[aria-disabled=true]{opacity:.55;cursor:default;filter:none}
+.btn:focus-visible,.nav a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:none;box-shadow:0 0 0 3px var(--ring)}
+@media (pointer:coarse){.btn{min-height:44px}.btn.sm{min-height:40px}}
+.spin{width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin,.pill.wait .dot{animation:none}}
+.acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.acts form{margin:0}
+
+/* status pill */
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;padding:3px 10px 3px 8px;border-radius:99px;
+background:var(--off-soft);color:var(--mut);white-space:nowrap}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--off)}
+.pill.on{background:var(--ok-soft);color:var(--ok)}.pill.on .dot{background:var(--ok)}
+.pill.wait{background:var(--warn-soft);color:var(--warn)}.pill.wait .dot{background:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+.pill.bad{background:var(--err-soft);color:var(--err)}.pill.bad .dot{background:var(--err)}
+@keyframes pulse{50%{opacity:.3}}
+.tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:99px;background:var(--off-soft);color:var(--mut);vertical-align:2px}
+.tag.ok{background:var(--ok-soft);color:var(--ok)}.tag.acc{background:var(--acc-soft);color:var(--acc)}
+
+/* device card */
+.dev{display:grid;gap:14px}
+.dev-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.dev-head h2{font-size:17px}
+.meta{color:var(--mut);font-size:13px;display:flex;gap:4px 12px;flex-wrap:wrap;margin-top:2px}
+.dev-acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--line);padding-top:14px}
+.dev-acts form{margin:0}.dev-acts .push{margin-left:auto}
+.dev .a-stop{display:none}
+.dev[data-state=on] .a-wake{display:none}
+.dev[data-state=on] .a-stop{display:block}
+.dev[data-state=on] .a-remote{background:var(--acc);border-color:var(--acc);color:#fff}
+.dev[data-state=stop] .a-stop{display:none}
+.dev-note{font-size:13px;color:var(--mut);margin:-4px 0 0}
+.dev-note:empty{display:none}
+@media (max-width:520px){.dev-acts>*{flex:1 1 100%}.dev-acts .btn{width:100%}.dev-acts .push{margin:6px 0 0}}
+
+/* list rows (settings, users, log) */
+.list{display:grid}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px 16px;flex-wrap:wrap;padding:12px 0;border-top:1px solid var(--line)}
+.row:first-child{border-top:0;padding-top:0}.row:last-child{padding-bottom:0}
+.row-main{min-width:0}.row-main b{font-weight:600}
+.log .row{padding:9px 0;align-items:baseline;flex-wrap:nowrap}.log .row-main{flex:1}
+.log time{color:var(--mut);font-size:13px;white-space:nowrap}
+
+/* flash */
+.flash{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:12px;margin-bottom:14px;
+background:var(--ok-soft);color:var(--fg);border:1px solid color-mix(in srgb,var(--ok) 35%,transparent)}
+.flash.err{background:var(--err-soft);border-color:color-mix(in srgb,var(--err) 35%,transparent)}
+.flash.info{background:var(--acc-soft);border-color:color-mix(in srgb,var(--acc) 30%,transparent)}
+.flash .i{margin-top:2px}.flash.err .i{color:var(--err)}.flash .i{color:var(--ok)}.flash.info .i{color:var(--acc)}
+.flash div{flex:1}.flash ul{margin:6px 0 0;padding-left:18px}.flash li{margin:2px 0}
+.flash .x{background:none;border:0;color:var(--mut);cursor:pointer;font-size:20px;line-height:1;padding:0 4px}
+
+/* tabs */
+.tabs{display:flex;gap:4px;background:var(--off-soft);padding:4px;border-radius:11px;margin-bottom:16px;overflow-x:auto}
+.tabs a{flex:1;text-align:center;padding:8px 12px;border-radius:8px;text-decoration:none;color:var(--mut);font-weight:600;font-size:14px;white-space:nowrap}
+.tabs a[aria-current=page]{background:var(--card);color:var(--fg);box-shadow:var(--shadow),inset 0 0 0 1px var(--line)}
+
+/* forms */
+label{display:block;font-size:13px;font-weight:600;color:var(--fg);margin-bottom:14px}
+label .hint{display:block;font-weight:400;color:var(--mut);margin-top:4px}
+input,select{font:inherit;font-weight:400;width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line2);background:var(--field);color:var(--fg);margin-top:6px}
+input::placeholder{color:var(--faint)}
+input[readonly]{background:var(--off-soft)}
+.check{display:flex;gap:10px;align-items:flex-start;font-weight:600}
+.check input{width:18px;height:18px;margin:2px 0 0;flex:none;accent-color:var(--acc)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}@media(max-width:560px){.grid{grid-template-columns:1fr}}
+details.more{border-top:1px solid var(--line);margin:4px 0 16px;padding-top:12px}
+details.more summary{cursor:pointer;font-weight:600;font-size:14px;color:var(--mut);list-style:none;display:flex;align-items:center;gap:6px}
+details.more summary::-webkit-details-marker{display:none}
+details.more summary::before{content:"▸";transition:transform .15s}
+details.more[open] summary::before{transform:rotate(90deg)}
+details.more[open] summary{margin-bottom:14px}
+.cmd{display:flex;gap:8px}.cmd input{margin:0;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+ol.steps{margin:0 0 14px;padding-left:20px}ol.steps li{margin:4px 0}
+.empty{text-align:center;padding:28px 16px;color:var(--mut)}
+.empty .i{width:28px;height:28px;color:var(--faint)}
+.foot{color:var(--mut);font-size:13px;margin-top:6px}
+
+/* dialog */
+dialog{border:1px solid var(--line);border-radius:14px;padding:20px;max-width:400px;width:calc(100% - 32px);background:var(--card);color:var(--fg);box-shadow:0 20px 50px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(10,15,20,.5)}
+dialog h3{margin-bottom:6px}dialog p{margin:0 0 18px;color:var(--mut)}
+dialog .acts{justify-content:flex-end}
+
+/* login */
+.login{max-width:380px;margin:10vh auto 0}
+.login .logo{width:44px;height:44px;border-radius:12px;margin-bottom:14px}
+.login h1{font-size:20px;margin-bottom:4px}.login p{margin:0 0 18px}
+"""
+
+ICONS = {
+    "power": '<path d="M12 3v9"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>',
+    "ext": '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
+    "check": '<path d="M20 6 9 17l-5-5"/>',
+    "alert": '<circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16.5v.01"/>',
+    "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.5v.01"/>',
+    "plus": '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    "monitor": '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/><path d="M12 16v4"/>',
+    "copy": '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a1 1 0 0 1 1-1h10"/>',
+}
+
+
+def icon(name):
+    return f'<svg class="i" viewBox="0 0 24 24" aria-hidden="true">{ICONS[name]}</svg>'
+
+
+JS_BASE = """
+(function(){
+  // bersihkan pesan dari URL agar tidak muncul lagi saat halaman dimuat ulang
+  var u=new URL(location.href),keep=['tab','edit','agent','tok','reset','new'],dirty=false;
+  ['msg','err','waking','stopping'].forEach(function(k){if(u.searchParams.has(k)){u.searchParams.delete(k);dirty=true}});
+  for(var k of Array.from(u.searchParams.keys())){if(k.indexOf('f_')===0){u.searchParams.delete(k);dirty=true}}
+  if(dirty)history.replaceState(null,'',u.pathname+(u.search||'')+u.hash);
+  document.querySelectorAll('.flash .x').forEach(function(b){b.onclick=function(){b.closest('.flash').remove()}});
+  var ok=document.querySelector('.flash:not(.err):not(.info)');
+  if(ok&&!ok.querySelector('ul'))setTimeout(function(){ok.remove()},6000);
+
+  var dlg=document.getElementById('dlg');
+  document.addEventListener('submit',function(e){
+    var f=e.target;
+    if(f.dataset.confirm&&f.dataset.confirmed!=='1'){
+      e.preventDefault();
+      if(!dlg||!dlg.showModal){ if(confirm(f.dataset.confirm)){f.dataset.confirmed='1';f.submit()} return; }
+      dlg.querySelector('h3').textContent=f.dataset.title||'Yakin?';
+      dlg.querySelector('p').textContent=f.dataset.confirm;
+      var okb=dlg.querySelector('[value=ok]');okb.textContent=f.dataset.ok||'Ya';
+      dlg.onclose=function(){ if(dlg.returnValue==='ok'){f.dataset.confirmed='1';
+        if(f.requestSubmit)f.requestSubmit();else f.submit();} };
+      dlg.returnValue='';dlg.showModal();okb.focus();return;
+    }
+    var b=f.querySelector('button[data-busy]');
+    if(b)setTimeout(function(){b.disabled=true;b.innerHTML='<span class="spin"></span>'+b.dataset.busy},0);
+  });
+
+  document.querySelectorAll('[data-copy]').forEach(function(b){
+    b.onclick=function(){var i=document.getElementById(b.dataset.copy);i.select();
+      var done=function(){var t=b.innerHTML;b.textContent='Tersalin';setTimeout(function(){b.innerHTML=t},1500)};
+      if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(i.value).then(done);
+      else{try{document.execCommand('copy');done()}catch(e){}}};
+  });
+})();
 """
 
 JS_STATUS = """
-const fmt={true:['on','Menyala'],false:['off','Mati'],null:['off','Tidak dicek']};
-async function refresh(){
-  try{
-    const r=await fetch('/api/status',{cache:'no-store'});
-    if(r.status===401){location='/login';return}
-    const s=await r.json();
-    for(const [id,v] of Object.entries(s)){
-      const b=document.getElementById('st-'+id); if(!b) continue;
-      let [cls,txt]=fmt[v];
-      const p=b.dataset.pending;
-      if(p==='wake'){ if(v===true) b.dataset.pending=''; else [cls,txt]=['wait','Sedang dihidupkan…']; }
-      if(p==='stop'){ if(v===false) b.dataset.pending=''; else [cls,txt]=['wait','Sedang dimatikan…']; }
-      b.className='badge '+cls; b.lastElementChild.textContent=txt;
-    }
-  }catch(e){}
-}
-refresh(); setInterval(refresh,5000);
+(function(){
+  var T={on:'Menyala',off:'Mati',unknown:'Status tidak dicek',checking:'Mengecek…',
+         wake:'Sedang dihidupkan…',stop:'Sedang dimatikan…',slow:'Belum merespons'};
+  var C={on:'on',off:'',unknown:'',checking:'',wake:'wait',stop:'wait',slow:'bad'};
+  var N={wake:'Biasanya butuh 30–90 detik sampai Windows siap.',stop:'Windows sedang menutup aplikasi lalu mati.',
+         slow:'Sudah lebih dari 3 menit. Cek kabel LAN dan pengaturan Wake-on-LAN di BIOS komputer ini.',
+         unknown:'Isi IP komputer di Pengaturan agar statusnya bisa dicek.'};
+  var t0=Date.now();
+  function apply(card,s){
+    var p=card.dataset.pending,st;
+    if(p==='wake'){ if(s===true){card.dataset.pending='';st='on'} else st=(Date.now()-t0>180000)?'slow':'wake'; }
+    else if(p==='stop'){ if(s===false){card.dataset.pending='';st='off'} else st='stop'; }
+    else st= s===true?'on':s===false?'off':'unknown';
+    card.dataset.state=st==='slow'?'off':st;
+    var pill=card.querySelector('.pill');pill.className='pill '+C[st];pill.lastChild.textContent=T[st];
+    card.querySelector('.dev-note').textContent=N[st]||'';
+    var w=card.querySelector('.a-wake button');
+    if(w){var busy=st==='wake'||st==='stop';w.disabled=busy;
+      w.innerHTML=st==='wake'?'<span class="spin"></span>Menyalakan…':w.dataset.label;}
+  }
+  document.querySelectorAll('.dev').forEach(function(c){
+    var w=c.querySelector('.a-wake button');if(w)w.dataset.label=w.innerHTML;
+    if(c.dataset.pending)apply(c,null);
+  });
+  async function refresh(){
+    try{
+      var r=await fetch('/api/status',{cache:'no-store'});
+      if(r.status===401){location='/login';return}
+      var s=await r.json();
+      for(var id in s){var c=document.getElementById('dev-'+id);if(c)apply(c,s[id]);}
+    }catch(e){}
+  }
+  refresh();setInterval(refresh,5000);
+})();
 """
+
+LOG_LABELS = {
+    "login": "Masuk ke panel", "nyalakan": "Menyalakan", "matikan": "Mematikan",
+    "simpan-perangkat": "Menyimpan data komputer", "hapus-perangkat": "Menghapus komputer",
+    "simpan-pengguna": "Menyimpan pengguna", "hapus-pengguna": "Menghapus pengguna",
+    "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
+    "token-agen": "Membuat perintah pasang agen", "unduh-agen": "Pemasang agen diunduh",
+    "lepas-agen": "Melepas agen",
+}
 
 
 def page(title, body, script=""):
     return f"""<!doctype html><html lang="id"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{E(title)}</title>
-<style>{CSS}</style></head><body><div class="wrap">{body}</div>{f'<script>{script}</script>' if script else ''}</body></html>"""
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>{E(title)}</title><style>{CSS}</style></head><body><div class="wrap">{body}</div>
+<dialog id="dlg" aria-labelledby="dlg-t"><form method="dialog"><h3 id="dlg-t">Yakin?</h3><p></p>
+<div class="acts"><button class="btn" value="cancel">Batal</button><button class="btn danger-solid" value="ok">Ya</button></div></form></dialog>
+<script>{JS_BASE}{script}</script></body></html>"""
+
+
+def flash(q):
+    msg = q.get("msg", [""])[0]
+    if not msg:
+        return ""
+    err = bool(q.get("err"))
+    parts = msg.split(" · ")
+    if len(parts) > 1:  # hasil Tes: judul + daftar
+        head, *items = parts
+        if " — " in head:
+            head, first = head.split(" — ", 1)
+            items.insert(0, first)
+        body = f"<b>{E(head)}</b><ul>{''.join(f'<li>{E(i)}</li>' for i in items)}</ul>"
+        kind = "info"
+    else:
+        body = E(msg)
+        kind = "err" if err else ""
+    role = "alert" if err else "status"
+    ic = "alert" if err else "info" if kind == "info" else "check"
+    return (f'<div class="flash {kind}" role="{role}">{icon(ic)}<div>{body}</div>'
+            f'<button class="x" type="button" aria-label="Tutup">×</button></div>')
 
 
 def shell(user, csrf, active, content, q, script=""):
@@ -449,13 +659,13 @@ def shell(user, csrf, active, content, q, script=""):
     if is_admin(user):
         links.append(("/settings", "Pengaturan"))
     links.append(("/account", "Akun"))
-    nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{t}</a>' for h, t in links)
-    msg = q.get("msg", [""])[0]
-    m = f'<div class="msg{" err" if q.get("err") else ""}">{E(msg)}</div>' if msg else ""
-    return page("WOL Panel", f"""<header><div><h1>WOL Panel</h1><div class="mut">Masuk sebagai {E(user)}
-({'admin' if is_admin(user) else 'pengguna'})</div></div><nav>{nav}
-<form method="post" action="/logout" style="margin:0"><input type="hidden" name="csrf" value="{csrf}">
-<button class="ghost">Keluar</button></form></nav></header>{m}{content}""", script)
+    nav = "".join(f'<a href="{h}"{" aria-current=page" if h == active else ""}>{t}</a>' for h, t in links)
+    return page("WOL Panel", f"""<header class="top">
+<a class="brand" href="/"><span class="logo">{icon('power')}</span><span><b>WOL Panel</b>
+<small>{E(user)} · {'admin' if is_admin(user) else 'pengguna'}</small></span></a>
+<nav class="nav" aria-label="Menu">{nav}<form method="post" action="/logout">{hidden(csrf)}
+<button class="btn quiet sm">Keluar</button></form></nav></header>
+<main>{flash(q)}{content}</main>""", script)
 
 
 def hidden(csrf, **kw):
@@ -463,23 +673,56 @@ def hidden(csrf, **kw):
         f'<input type="hidden" name="{k}" value="{E(str(v))}">' for k, v in kw.items())
 
 
-def confirm(text):
-    # json.dumps -> string JS yang aman, lalu di-escape untuk atribut HTML
-    return 'onsubmit="return confirm(' + E(json.dumps(text)) + ')"'
+def confirm(text, ok="Ya", title="Yakin?"):
+    return f'data-confirm="{E(text)}" data-ok="{E(ok)}" data-title="{E(title)}"'
 
 
-def del_form(action, csrf, text, **fields):
-    return (f'<form method="post" action="{action}" {confirm(text)}>'
-            f'{hidden(csrf, **fields)}<button class="danger">Hapus</button></form>')
+def del_form(action, csrf, text, title="Hapus?", **fields):
+    return (f'<form method="post" action="{action}" {confirm(text, "Hapus", title)}>'
+            f'{hidden(csrf, **fields)}<button class="btn quiet danger sm">Hapus</button></form>')
 
 
 def login_page(err=""):
-    e = f'<div class="msg err">{E(err)}</div>' if err else ""
-    return page("Masuk – WOL Panel", f"""<div class="login card"><h1>WOL Panel</h1>
-<p class="mut">Masuk untuk menghidupkan komputer.</p>{e}
-<form method="post" action="/login"><label>Nama pengguna<input name="u" autocomplete="username" required autofocus></label>
+    e = (f'<div class="flash err" role="alert">{icon("alert")}<div>{E(err)}</div></div>') if err else ""
+    return page("Masuk – WOL Panel", f"""<main class="login"><div class="card" style="padding:24px">
+<span class="logo">{icon('power')}</span><h1>WOL Panel</h1>
+<p class="mut">Masuk untuk menyalakan atau mematikan komputer.</p>{e}
+<form method="post" action="/login"><label>Nama pengguna<input name="u" autocomplete="username" autocapitalize="none" required autofocus></label>
 <label>Password<input name="p" type="password" autocomplete="current-password" required></label>
-<button style="width:100%">Masuk</button></form></div>""")
+<button class="btn primary" style="width:100%" data-busy="Memeriksa…">Masuk</button></form></div></main>""")
+
+
+def fmt_time(ts):
+    try:
+        d, t = ts.split(" ")
+    except ValueError:
+        return ts
+    today = time.strftime("%Y-%m-%d")
+    yest = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    if d == today:
+        return t[:5]
+    if d == yest:
+        return "Kemarin " + t[:5]
+    y, m, dd = d.split("-")
+    return f"{int(dd)}/{int(m)} {t[:5]}"
+
+
+def log_list(n=8):
+    names = {d["id"]: d["name"] for d in CFG.get("devices", [])}
+    rows = []
+    for r in read_log(n):
+        if len(r) < 5:
+            continue
+        ts, who, act, target, ip = r[:5]
+        label = LOG_LABELS.get(act, act)
+        if target not in ("-", "") and act not in ("simpan-pengguna", "hapus-pengguna", "ganti-password"):
+            label += f" {names.get(target, target)}"
+        elif act in ("simpan-pengguna", "hapus-pengguna"):
+            label += f" {target}"
+        who = "Sistem" if who in ("-", "cli") else who
+        rows.append(f'<div class="row"><div class="row-main"><b>{E(who)}</b> <span class="mut">{E(label)}</span>'
+                    f'<div class="mut small mono">{E(ip)}</div></div><time>{E(fmt_time(ts))}</time></div>')
+    return "".join(rows)
 
 
 def home_page(user, csrf, q):
@@ -490,94 +733,53 @@ def home_page(user, csrf, q):
         pending = "wake" if d["id"] == waking else "stop" if d["id"] == stopping else ""
         stop = ""
         if d.get("agent_secret"):
-            stop = (f'<form method="post" action="/shutdown" {confirm(d["name"] + " akan dimatikan. Pekerjaan yang belum disimpan di komputer itu akan hilang. Lanjutkan?")}>'
-                    f'{hidden(csrf, id=d["id"])}<button class="danger">Matikan</button></form>')
-        cards.append(f"""<div class="card dev"><div><h2>{E(d['name'])}</h2>
-<div class="mut">{E(d.get('ip') or '-')} · {E(d['mac'])}</div>
-<span id="st-{did}" class="badge off" data-pending="{pending}"><span class="dot"></span><span>Mengecek…</span></span></div>
-<div class="acts"><a class="btn ghost" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote</a>
-{stop}<form method="post" action="/wake">{hidden(csrf, id=d['id'])}<button id="btn-{did}">Hidupkan</button></form></div></div>""")
+            stop = (f'<form class="a-stop push" method="post" action="/shutdown" '
+                    f'{confirm(d["name"] + " akan mati 10 detik setelah ini. Pekerjaan yang belum disimpan di komputer itu akan hilang.", "Matikan", "Matikan " + d["name"] + "?")}>'
+                    f'{hidden(csrf, id=d["id"])}<button class="btn danger" data-busy="Mengirim…">{icon("power")}Matikan</button></form>')
+        cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
+<div class="dev-head"><div><h2>{E(d['name'])}</h2>
+<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div></div>
+<span class="pill"><span class="dot"></span><span>Mengecek…</span></span></div>
+<p class="dev-note" aria-live="polite"></p>
+<div class="dev-acts">
+<form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="btn primary" data-busy="Mengirim…">{icon('power')}Hidupkan</button></form>
+<a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote {icon('ext')}</a>
+{stop}</div></article>""")
     if not cards:
-        tip = 'Tambahkan lewat menu <a href="/settings">Pengaturan</a>.' if is_admin(user) else "Hubungi admin untuk menambahkan."
-        cards.append(f'<div class="card mut">Belum ada komputer. {tip}</div>')
-    rows = "".join(f"<tr><td>{E(r[0])}</td><td>{E(r[1])}</td><td>{E(r[2])}</td><td>{E(r[3])}</td><td class='mut'>{E(r[4])}</td></tr>"
-                   for r in read_log() if len(r) >= 5)
-    log = f'<div class="card"><h2>Riwayat</h2><div class="tbl"><table>{rows}</table></div></div>' if rows and is_admin(user) else ""
-    body = "".join(cards) + log + '<p class="mut">Status diperbarui otomatis tiap 5 detik. Komputer biasanya butuh 30–90 detik sampai siap di-remote.</p>'
+        tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
+            else '<p class="small">Hubungi admin untuk menambahkan komputer.</p>'
+        cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada komputer</h3>'
+                     f'<p class="small" style="margin:0 0 14px">Tambahkan komputer yang ingin dinyalakan lewat panel ini.</p>{tip}</div>')
+    log = ""
+    if is_admin(user):
+        rows = log_list()
+        if rows:
+            log = f'<div class="sec-head"><h2>Aktivitas terakhir</h2></div><div class="card log"><div class="list">{rows}</div></div>'
+    body = ('<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + log
+            + '<p class="foot">Status diperbarui otomatis setiap 5 detik.</p>')
     return shell(user, csrf, "/", body, q, JS_STATUS)
 
 
 def settings_page(user, csrf, q):
+    tab = q.get("tab", [""])[0]
+    if any(k in q for k in ("edit", "agent", "new")) or any(k.startswith("f_") and k != "f_u" for k in q):
+        tab = "komputer"
+    if "reset" in q or "f_u" in q:
+        tab = "pengguna"
+    if tab not in ("komputer", "pengguna", "umum"):
+        tab = "komputer"
+    tabs = "".join(f'<a href="/settings?tab={k}"{" aria-current=page" if k == tab else ""}>{t}</a>'
+                   for k, t in (("komputer", "Komputer"), ("pengguna", "Pengguna"), ("umum", "Umum")))
+    body = {"komputer": settings_devices, "pengguna": settings_users, "umum": settings_general}[tab](user, csrf, q)
+    return shell(user, csrf, "/settings", f'<nav class="tabs" aria-label="Bagian pengaturan">{tabs}</nav>{body}', q)
+
+
+def settings_devices(user, csrf, q):
     edit_id = q.get("edit", [""])[0]
     ed = next((d for d in CFG["devices"] if d["id"] == edit_id), None)
-    # isian form dikembalikan saat ada error
     f = {k: v[0] for k, v in q.items() if k.startswith("f_")}
-    val = lambda k, dflt="": E(f.get("f_" + k, dflt))
 
-    rows = []
-    for d in CFG["devices"]:
-        dl = (f'<form method="post" action="/devices/test">{hidden(csrf, id=d["id"])}'
-              f'<button class="ghost" title="Cek port, ARP, ping, dan agen">Tes</button></form>'
-              f'<form method="post" action="/devices/agent">{hidden(csrf, id=d["id"])}'
-              f'<button class="ghost" title="Pasang agen agar bisa dimatikan dari panel">Agen</button></form>'
-              + del_form("/devices/delete", csrf, f"Hapus {d['name']}?", id=d["id"]))
-        tag = ' <span class="mut">· bisa dimatikan</span>' if d.get("agent_secret") else ""
-        rows.append(f"""<tr><td><b>{E(d['name'])}</b><div class="mut">{E(d['id'])}{tag}</div></td>
-<td><code>{E(d['mac'])}</code></td><td>{E(d.get('ip') or '-')}</td>
-<td><div class="acts"><a class="btn ghost" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>{dl}</div></td></tr>""")
-    rows = "".join(rows) or '<tr><td colspan="4" class="mut">Belum ada komputer.</td></tr>'
-
-    src = ed or {}
-    def dv(k, dflt=""):
-        if f:
-            return val(k, dflt)
-        v = src.get(k, dflt)
-        return E(", ".join(map(str, v)) if isinstance(v, list) else str(v))
-
-    dev_form = f"""<form method="post" action="/devices/save" id="form-dev">{hidden(csrf, orig=ed['id'] if ed else '')}
-<h2>{'Ubah: ' + E(ed['name']) if ed else 'Tambah komputer'}</h2>
-<div class="grid">
-<label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="Desktop Kantor"></label>
-<label>ID singkat (kosongkan = otomatis)<input name="id" value="{dv('id')}" maxlength="32" placeholder="desktop-kantor"></label>
-<label>MAC address<input name="mac" value="{dv('mac')}" required placeholder="3C:7C:3F:12:34:56"></label>
-<label>IP komputer (untuk cek status)<input name="ip" value="{dv('ip')}" placeholder="192.168.10.50"></label>
-<label>Alamat broadcast (kosongkan = otomatis)<input name="broadcast" value="{dv('broadcast')}" placeholder="192.168.10.255"></label>
-<label>Port WOL<input name="port" type="number" min="1" max="65535" value="{dv('port', '9')}"></label>
-<label>Port untuk cek status (pisahkan koma)<input name="check_ports" value="{dv('check_ports', '')}" placeholder="kosongkan jika tidak pakai RDP"></label>
-<label>Link tombol "Buka Remote" (kosongkan = Chrome Remote Desktop)<input name="remote_url" value="{'' if dv('remote_url') == E(DEFAULT_REMOTE) else dv('remote_url')}" placeholder="{DEFAULT_REMOTE}"></label>
-</div>
-<p class="mut" style="margin-top:0">3389 = Remote Desktop, 22 = SSH (boleh dikosongkan). Status juga dicek lewat ARP dan ping,
-jadi tetap terdeteksi walau Remote Desktop tidak aktif. Pakai tombol <b>Tes</b> untuk melihat hasil tiap cara cek.</p>
-<button>{'Simpan perubahan' if ed else 'Tambah komputer'}</button>
-{'<a class="btn ghost" href="/settings">Batal</a>' if ed else ''}</form>"""
-
-    urows = []
-    for u, v in sorted(CFG["users"].items()):
-        me = ' <span class="mut">(Anda)</span>' if u == user else ""
-        dl = "" if u == user else del_form("/users/delete", csrf, f"Hapus pengguna {u}?", u=u)
-        role = "Admin" if v.get("role") == "admin" else "Pengguna"
-        urows.append(f'<tr><td><b>{E(u)}</b>{me}</td><td>{role}</td><td><div class="acts">{dl}</div></td></tr>')
-    urows = "".join(urows)
-
-    user_form = f"""<form method="post" action="/users/save">{hidden(csrf)}
-<h2>Tambah pengguna / reset password</h2>
-<p class="mut" style="margin-top:0">Jika nama pengguna sudah ada, password dan perannya akan diganti.</p>
-<div class="grid">
-<label>Nama pengguna<input name="u" required pattern="[A-Za-z0-9._\\-]{{3,32}}" value="{val('u')}" autocomplete="off"></label>
-<label>Peran<select name="role"><option value="user">Pengguna – hanya menyalakan & mematikan</option>
-<option value="admin">Admin – bisa mengubah pengaturan</option></select></label>
-<label>Password (min. 8 karakter)<input name="p1" type="password" minlength="8" required autocomplete="new-password"></label>
-<label>Ulangi password<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
-</div><button>Simpan pengguna</button></form>"""
-
-    general = f"""<form method="post" action="/settings/general">{hidden(csrf)}
-<h2>Umum</h2>
-<label style="margin-bottom:12px;color:var(--fg)"><input type="checkbox" name="trust_proxy" value="1" {'checked' if CFG.get('trust_proxy') else ''}>
-Panel diakses lewat reverse proxy (NPMplus / Nginx)</label>
-<p class="mut" style="margin-top:-6px">Centang hanya jika panel dibuka lewat subdomain di NPMplus, agar IP asli pengunjung tercatat dan pembatasan login bekerja benar.</p>
-<label>Lama sesi login (jam)<input name="session_hours" type="number" min="1" max="720" value="{int(CFG.get('session_hours', 12))}" style="max-width:160px"></label>
-<button>Simpan</button></form>"""
-
+    # ---- kartu pasang agen
     agent_card = ""
     aid, atok = q.get("agent", [""])[0], q.get("tok", [""])[0]
     adev = next((d for d in CFG["devices"] if d["id"] == aid), None)
@@ -587,35 +789,120 @@ Panel diakses lewat reverse proxy (NPMplus / Nginx)</label>
         except OSError:
             panel = "http://IP-PANEL:8080"
         cmd = f"irm {panel}/agent/{atok}.ps1 | iex"
-        remove = (f'<form method="post" action="/devices/agent-remove" {confirm("Lepas agen dari " + adev["name"] + "? Tombol Matikan akan hilang.")}>'
-                  f'{hidden(csrf, id=adev["id"])}<button class="danger">Lepas agen</button></form>')
-        agent_card = f"""<div class="card" id="agent"><h2>Pasang agen Matikan di {E(adev['name'])}</h2>
-<ol style="margin:0 0 12px;padding-left:20px">
-<li>Di komputer <b>{E(adev['name'])}</b>: klik kanan Start → <b>Terminal (Admin)</b> atau <b>Windows PowerShell (Admin)</b>.</li>
-<li>Tempel perintah ini lalu tekan Enter:</li></ol>
-<input readonly value="{E(cmd)}" onclick="this.select()" style="font-family:ui-monospace,Consolas,monospace">
-<p class="mut" style="margin-top:0">Perintah berlaku 15 menit. Jika muncul tulisan hijau <i>Berhasil</i>, klik <b>Tes</b> pada komputer ini
-untuk memastikan panel bisa menjangkau agen. Tombol <b>Matikan</b> sudah muncul di Beranda.
-Agen hanya menerima perintah dari panel ini dan setiap perintah ditandatangani kunci rahasia.</p>
-<div class="acts" style="justify-content:flex-start"><a class="btn ghost" href="/settings">Tutup</a>{remove}</div></div>"""
+        remove = (f'<form method="post" action="/devices/agent-remove" '
+                  f'{confirm("Tombol Matikan untuk " + adev["name"] + " akan hilang. Agen di Windows tetap terpasang sampai dihapus manual (lihat README).", "Lepas agen", "Lepas agen?")}>'
+                  f'{hidden(csrf, id=adev["id"])}<button class="btn quiet danger sm">Lepas agen</button></form>')
+        agent_card = f"""<section class="card" id="agent" style="border-color:var(--acc)">
+<h2>Pasang agen Matikan di {E(adev['name'])}</h2>
+<ol class="steps"><li>Di komputer <b>{E(adev['name'])}</b>, klik kanan tombol Start lalu pilih <b>Terminal (Admin)</b>.</li>
+<li>Salin perintah di bawah, tempel di Terminal, lalu tekan Enter.</li>
+<li>Setelah muncul tulisan hijau <b>Berhasil</b>, klik <b>Tes</b> pada komputer ini.</li></ol>
+<div class="cmd"><input id="agentcmd" readonly value="{E(cmd)}" aria-label="Perintah pasang agen">
+<button class="btn" type="button" data-copy="agentcmd">{icon('copy')}Salin</button></div>
+<p class="mut small" style="margin:10px 0 12px">Perintah berlaku 15 menit. Agen hanya menerima perintah dari panel ini, dan setiap perintah ditandatangani kunci rahasia.</p>
+<div class="acts"><a class="btn sm" href="/settings">Selesai</a>{remove}</div></section>"""
 
-    body = f"""{agent_card}<div class="card"><h2>Komputer</h2><div class="tbl"><table>
-<tr><th>Nama</th><th>MAC</th><th>IP</th><th></th></tr>{rows}</table></div></div>
-<div class="card">{dev_form}</div>
-<div class="card"><h2>Pengguna</h2><div class="tbl"><table><tr><th>Nama</th><th>Peran</th><th></th></tr>{urows}</table></div></div>
-<div class="card">{user_form}</div>
-<div class="card">{general}</div>"""
-    return shell(user, csrf, "/settings", body, q)
+    # ---- daftar komputer
+    rows = []
+    for d in CFG["devices"]:
+        has_agent = bool(d.get("agent_secret"))
+        tag = ' <span class="tag ok">Bisa dimatikan</span>' if has_agent else ""
+        rows.append(f"""<div class="row"><div class="row-main"><b>{E(d['name'])}</b>{tag}
+<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div></div>
+<div class="acts"><a class="btn sm" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>
+<form method="post" action="/devices/test">{hidden(csrf, id=d['id'])}<button class="btn sm" data-busy="Mengetes…" title="Cek ARP, ping, port, dan agen">Tes</button></form>
+<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Agar komputer bisa dimatikan dari panel">{'Agen' if has_agent else 'Pasang agen'}</button></form>
+{del_form('/devices/delete', csrf, d['name'] + ' akan dihapus dari panel. Data di komputer itu tidak terpengaruh.', 'Hapus ' + d['name'] + '?', id=d['id'])}</div></div>""")
+    listing = (f'<div class="card"><div class="list">{"".join(rows)}</div></div>' if rows else
+               f'<div class="card empty">{icon("monitor")}<p class="small" style="margin:8px 0 0">Belum ada komputer.</p></div>')
+
+    # ---- form tambah / ubah
+    src = ed or {}
+    def dv(k, dflt=""):
+        if f:
+            return E(f.get("f_" + k, dflt))
+        v = src.get(k, dflt)
+        return E(", ".join(map(str, v)) if isinstance(v, list) else str(v))
+    remote = dv("remote_url")
+    remote = "" if remote == E(DEFAULT_REMOTE) else remote
+    adv_open = " open" if (f and any(f.get("f_" + k) for k in ("id", "broadcast", "check_ports", "remote_url"))) else ""
+    open_form = " open" if (ed or f or "new" in q or not CFG["devices"]) else ""
+    title = f"Ubah {E(ed['name'])}" if ed else "Tambah komputer"
+    form = f"""<form method="post" action="/devices/save">{hidden(csrf, orig=ed['id'] if ed else '')}
+<label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="mis. Komputer Lab 1"></label>
+<div class="grid">
+<label>MAC address<input name="mac" value="{dv('mac')}" required class="mono" placeholder="mis. 3C:7C:3F:12:34:56" autocapitalize="characters" spellcheck="false">
+<span class="hint">Dari <span class="mono">ipconfig /all</span>, bagian Ethernet → Physical Address.</span></label>
+<label>IP komputer<input name="ip" value="{dv('ip')}" inputmode="decimal" placeholder="mis. 192.168.10.50" spellcheck="false">
+<span class="hint">Untuk cek status & agen Matikan. Sebaiknya IP tetap.</span></label>
+</div>
+<details class="more"{adv_open}><summary>Pengaturan lanjutan</summary>
+<div class="grid">
+<label>ID singkat<input name="id" value="{dv('id')}" maxlength="32" placeholder="otomatis dari nama" spellcheck="false"></label>
+<label>Alamat broadcast<input name="broadcast" value="{dv('broadcast')}" placeholder="otomatis dari IP" spellcheck="false"></label>
+<label>Port WOL<input name="port" type="number" min="1" max="65535" value="{dv('port', '9')}"></label>
+<label>Port untuk cek status<input name="check_ports" value="{dv('check_ports', '')}" placeholder="mis. 3389 (boleh kosong)">
+<span class="hint">Status sudah dicek lewat ARP & ping.</span></label>
+</div>
+<label>Link tombol Buka Remote<input name="remote_url" value="{remote}" placeholder="{DEFAULT_REMOTE}" spellcheck="false">
+<span class="hint">Kosongkan untuk memakai Chrome Remote Desktop.</span></label>
+</details>
+<div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if ed else 'Tambah komputer'}</button>
+{'<a class="btn quiet" href="/settings">Batal</a>' if (ed or f) else ''}</div></form>"""
+    form_card = f"""<details class="card" id="form-dev"{open_form} style="padding:0">
+<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}{title}</summary>
+<div style="padding:0 16px 16px">{form}</div></details>"""
+
+    return (agent_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + form_card)
+
+
+def settings_users(user, csrf, q):
+    reset = q.get("reset", [""])[0] or q.get("f_u", [""])[0]
+    target = reset if reset in CFG["users"] else ""
+    rows = []
+    for u, v in sorted(CFG["users"].items()):
+        me = ' <span class="tag acc">Anda</span>' if u == user else ""
+        role = "Admin" if v.get("role") == "admin" else "Pengguna"
+        dl = "" if u == user else del_form("/users/delete", csrf, f"{u} tidak bisa masuk ke panel lagi.", f"Hapus pengguna {u}?", u=u)
+        rows.append(f"""<div class="row"><div class="row-main"><b>{E(u)}</b>{me}<div class="mut small">{role}</div></div>
+<div class="acts"><a class="btn sm" href="/settings?tab=pengguna&reset={quote(u)}#form-user">Ubah</a>{dl}</div></div>""")
+    sel = lambda r: " selected" if target and CFG["users"][target].get("role") == r else ""
+    uname = (f'<label>Nama pengguna<input value="{E(target)}" readonly><input type="hidden" name="u" value="{E(target)}"></label>' if target else
+             f'<label>Nama pengguna<input name="u" required pattern="[A-Za-z0-9._\\-]{{3,32}}" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="mis. guru.tik">'
+             f'<span class="hint">3–32 karakter: huruf, angka, titik, minus.</span></label>')
+    form = f"""<section class="card" id="form-user"><h2>{('Ubah ' + E(target)) if target else 'Tambah pengguna'}</h2>
+<form method="post" action="/users/save">{hidden(csrf)}
+<div class="grid">{uname}
+<label>Peran<select name="role"><option value="user"{sel('user')}>Pengguna</option><option value="admin"{sel('admin')}>Admin</option></select>
+<span class="hint">Pengguna: menyalakan & mematikan. Admin: juga mengubah pengaturan.</span></label>
+<label>{'Password baru' if target else 'Password'}<input name="p1" type="password" minlength="8" required autocomplete="new-password">
+<span class="hint">Minimal 8 karakter.</span></label>
+<label>Ulangi password<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
+</div><div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if target else 'Tambah pengguna'}</button>
+{'<a class="btn quiet" href="/settings?tab=pengguna">Batal</a>' if target else ''}</div></form></section>"""
+    return f'<div class="sec-head"><h2>Daftar pengguna</h2></div><div class="card"><div class="list">{"".join(rows)}</div></div>{form}'
+
+
+def settings_general(user, csrf, q):
+    return f"""<section class="card"><h2>Umum</h2><form method="post" action="/settings/general">{hidden(csrf)}
+<label class="check"><input type="checkbox" name="trust_proxy" value="1" {'checked' if CFG.get('trust_proxy') else ''}>
+<span>Panel diakses lewat reverse proxy (NPMplus / Nginx)
+<span class="hint">Centang jika panel dibuka lewat subdomain di NPMplus, agar IP asli pengunjung tercatat dan pembatasan login bekerja benar.</span></span></label>
+<label style="max-width:220px">Lama sesi login<input name="session_hours" type="number" min="1" max="720" value="{int(CFG.get('session_hours', 12))}">
+<span class="hint">Dalam jam (1–720).</span></label>
+<button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
 
 
 def account_page(user, csrf, q):
-    body = f"""<div class="card"><form method="post" action="/account">{hidden(csrf)}
-<h2>Ganti password</h2>
+    body = f"""<div class="sec-head"><h2>Akun</h2></div><section class="card"><h2>Ganti password</h2>
+<form method="post" action="/account">{hidden(csrf)}
+<input type="text" name="username" value="{E(user)}" autocomplete="username" hidden>
 <label>Password lama<input name="old" type="password" required autocomplete="current-password"></label>
-<label>Password baru (min. 8 karakter)<input name="p1" type="password" minlength="8" required autocomplete="new-password"></label>
-<label>Ulangi password baru<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
-<button>Ganti password</button></form>
-<p class="mut">Setelah password diganti, sesi login di perangkat lain otomatis keluar.</p></div>"""
+<div class="grid"><label>Password baru<input name="p1" type="password" minlength="8" required autocomplete="new-password">
+<span class="hint">Minimal 8 karakter.</span></label>
+<label>Ulangi password baru<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label></div>
+<button class="btn primary" data-busy="Menyimpan…">Ganti password</button></form>
+<p class="mut small" style="margin:12px 0 0">Setelah password diganti, sesi di perangkat lain otomatis keluar.</p></section>"""
     return shell(user, csrf, "/account", body, q)
 
 
@@ -892,34 +1179,34 @@ class Handler(BaseHTTPRequestHandler):
         role = "admin" if form.get("role") == "admin" else "user"
         p1, p2 = form.get("p1", ""), form.get("p2", "")
         if not USER_RE.match(u):
-            return self.back("/settings", "Nama pengguna 3–32 karakter: huruf, angka, titik, minus, garis bawah.", True, f_u=u)
+            return self.back("/settings", "Nama pengguna 3–32 karakter: huruf, angka, titik, minus, garis bawah.", True, f_u=u, tab="pengguna")
         if len(p1) < 8 or p1 != p2:
-            return self.back("/settings", "Password minimal 8 karakter dan harus sama di kedua kolom.", True, f_u=u)
+            return self.back("/settings", "Password minimal 8 karakter dan harus sama di kedua kolom.", True, f_u=u, tab="pengguna")
         rec = CFG["users"].get(u)
         if rec and rec.get("role") == "admin" and role != "admin" and admin_count() <= 1:
-            return self.back("/settings", "Harus ada minimal satu admin.", True, f_u=u)
+            return self.back("/settings", "Harus ada minimal satu admin.", True, f_u=u, tab="pengguna")
         existed = rec is not None
         CFG["users"][u] = {"hash": hash_password(p1), "role": role, "sv": (rec or {}).get("sv", 0) + (1 if existed else 0)}
         save_config(CFG)
         write_log(user, "simpan-pengguna", u, ip)
         if u == user:  # mengubah akun sendiri -> perbarui sesi
-            return self.redirect("/settings?" + urlencode({"msg": "Akun Anda diperbarui."}),
+            return self.redirect("/settings?" + urlencode({"msg": "Akun Anda diperbarui.", "tab": "pengguna"}),
                                  [self.cookie_header(make_session(u), int(CFG.get("session_hours", 12)) * 3600)])
-        return self.back("/settings", f"Pengguna {u} {'diperbarui' if existed else 'ditambahkan'}.")
+        return self.back("/settings", f"Pengguna {u} {'diperbarui' if existed else 'ditambahkan'}.", tab="pengguna")
 
     def do_user_delete(self, form, user, ip):
         u = form.get("u", "")
         if u == user:
-            return self.back("/settings", "Tidak bisa menghapus akun sendiri.", True)
+            return self.back("/settings", "Tidak bisa menghapus akun sendiri.", True, tab="pengguna")
         rec = CFG["users"].get(u)
         if not rec:
-            return self.back("/settings", "Pengguna tidak ditemukan.", True)
+            return self.back("/settings", "Pengguna tidak ditemukan.", True, tab="pengguna")
         if rec.get("role") == "admin" and admin_count() <= 1:
-            return self.back("/settings", "Harus ada minimal satu admin.", True)
+            return self.back("/settings", "Harus ada minimal satu admin.", True, tab="pengguna")
         del CFG["users"][u]
         save_config(CFG)
         write_log(user, "hapus-pengguna", u, ip)
-        return self.back("/settings", f"Pengguna {u} dihapus.")
+        return self.back("/settings", f"Pengguna {u} dihapus.", tab="pengguna")
 
     def do_general(self, form, user, ip):
         try:
@@ -927,12 +1214,12 @@ class Handler(BaseHTTPRequestHandler):
             if not 1 <= hours <= 720:
                 raise ValueError
         except ValueError:
-            return self.back("/settings", "Lama sesi harus 1–720 jam.", True)
+            return self.back("/settings", "Lama sesi harus 1–720 jam.", True, tab="umum")
         CFG["trust_proxy"] = form.get("trust_proxy") == "1"
         CFG["session_hours"] = hours
         save_config(CFG)
         write_log(user, "pengaturan-umum", "-", ip)
-        return self.back("/settings", "Pengaturan umum disimpan.")
+        return self.back("/settings", "Pengaturan umum disimpan.", tab="umum")
 
 
 # -------------------------------------------------------------------- CLI
