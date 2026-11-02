@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 4
+$AgentVersion = 5
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -263,6 +263,31 @@ function Invoke-Uninstall([string]$id) {
     }
 }
 
+# ---------------------------------------------------------------- relay Wake-on-LAN
+# Panel di subnet lain tidak bisa mengirim broadcast ke subnet ini; agen yang hidup di subnet ini mengirimkannya.
+function Send-Wol([string]$mac, $targets, [int]$port) {
+    if ($mac -notmatch '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$') { return @{ ok = $false; msg = 'MAC tidak valid' } }
+    $m = [byte[]]($mac -split ':' | ForEach-Object { [Convert]::ToByte($_, 16) })
+    $pkt = New-Object byte[] 102
+    for ($i = 0; $i -lt 6; $i++) { $pkt[$i] = 255 }
+    for ($i = 1; $i -le 16; $i++) { [Array]::Copy($m, 0, $pkt, $i * 6, 6) }
+    $ports = @($port); if ($port -eq 9) { $ports += 7 }
+    $udp = New-Object Net.Sockets.UdpClient
+    $udp.EnableBroadcast = $true
+    $sent = 0
+    try {
+        for ($r = 0; $r -lt 3; $r++) {
+            foreach ($t in @($targets)) {
+                $ip = $null
+                if (-not [Net.IPAddress]::TryParse([string]$t, [ref]$ip) -or $ip.AddressFamily -ne 'InterNetwork') { continue }
+                foreach ($p in $ports) { try { [void]$udp.Send($pkt, $pkt.Length, (New-Object Net.IPEndPoint($ip, $p))); $sent++ } catch {} }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } finally { $udp.Close() }
+    return @{ ok = ($sent -gt 0); msg = "$sent paket dikirim" }
+}
+
 # ---------------------------------------------------------------- permintaan dari panel
 function Test-Signed($ctx, [string]$kind, [string]$extra) {
     $req   = $ctx.Request
@@ -325,6 +350,11 @@ function Handle($ctx) {
             'uninstall' {
                 $r = Invoke-Uninstall ([string]$c.id)
                 Write-Log "Uninstall diminta $script:By : $($r.msg)"
+                Send-Json $ctx 200 $r
+            }
+            'wol' {
+                $r = Send-Wol ([string]$c.mac) $c.targets ([int]$c.port)
+                Write-Log "Relay WOL ke $($c.mac) diminta $script:By : $($r.msg)"
                 Send-Json $ctx 200 $r
             }
             'info' {

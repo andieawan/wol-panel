@@ -59,6 +59,9 @@ AGENT_TEMPLATE = os.path.join(BASE, "windows-agent.ps1")
 AGENT_PORT = 8765
 AGENT_TOKENS = {}  # token sekali-pakai untuk unduh pemasang agen -> (id perangkat, kedaluwarsa)
 AGENT_TOKEN_TTL = 900
+JOIN_TEMPLATE = os.path.join(BASE, "windows-join.ps1")
+JOIN_TTL = 24 * 3600   # perintah "Tambah lewat skrip" berlaku 24 jam, boleh dipakai di banyak komputer
+PENDING_MAX = 300
 SHUTDOWN_DELAY = 10  # detik peringatan di layar sebelum komputer mati
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -76,6 +79,7 @@ def migrate(cfg):
     cfg.setdefault("scan_minutes", 60)
     cfg.setdefault("vms", [])
     cfg.setdefault("vm_check_hours", 6)
+    cfg.setdefault("pending", [])   # komputer yang mendaftar lewat skrip, menunggu ditambahkan admin
     return cfg
 
 
@@ -133,6 +137,56 @@ def admin_count():
 
 
 # ------------------------------------------------------------- wake-on-lan
+def parse_prefix(text):
+    """'24', '/24', atau '255.255.254.0' -> 24. ValueError bila tidak valid."""
+    t = (text or "").strip().lstrip("/")
+    if not t:
+        return 24
+    if "." in t:
+        n = ipaddress.IPv4Network(f"0.0.0.0/{t}").prefixlen
+    else:
+        n = int(t)
+    if not 8 <= n <= 30:
+        raise ValueError
+    return n
+
+
+def dev_network(dev):
+    """Jaringan (subnet) komputer, mis. 192.168.20.0/23; None bila IP belum diisi."""
+    if not dev.get("ip"):
+        return None
+    try:
+        return ipaddress.IPv4Network(f"{dev['ip']}/{int(dev.get('prefix') or 24)}", strict=False)
+    except ValueError:
+        return None
+
+
+def wol_relays(dev, targets):
+    """Minta agen di komputer lain yang hidup di subnet yang sama untuk mengirim magic packet.
+    Dipakai bila panel ada di subnet lain (router tidak meneruskan broadcast antar subnet)."""
+    net = dev_network(dev)
+    if not net:
+        return []
+    try:
+        if ipaddress.IPv4Address(local_ip_for(dev["ip"])) in net:
+            return []  # panel satu subnet: broadcast biasa sudah sampai
+    except (OSError, ValueError):
+        pass
+    cands = [d for d in list(CFG.get("devices", [])) if d is not dev and d.get("agent_secret") and d.get("ip")
+             and (d.get("agent_version") or 5) >= 5 and ipaddress.IPv4Address(d["ip"]) in net]
+    if not cands:
+        return []
+    payload = {"action": "wol", "mac": normalize_mac(dev["mac"]), "targets": targets, "port": int(dev.get("port", 9))}
+
+    def one(d):
+        try:
+            return d["name"] if agent_cmd(d, "panel", payload, timeout=3).get("ok") else None
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=min(8, len(cands))) as ex:
+        return [n for n in ex.map(one, cands[:16]) if n]
+
+
 def magic_packet(mac):
     return b"\xff" * 6 + bytes.fromhex(normalize_mac(mac).replace(":", "")) * 16
 
@@ -142,7 +196,8 @@ def send_wol(dev):
     # kirim ke broadcast subnet DAN broadcast umum: jika netmask server berbeda,
     # broadcast subnet bisa dianggap alamat biasa dan paket tidak pernah keluar
     targets = []
-    for t in (dev.get("broadcast"), "255.255.255.255"):
+    net = dev_network(dev)
+    for t in (dev.get("broadcast"), str(net.broadcast_address) if net else None, "255.255.255.255"):
         if t and t not in targets:
             targets.append(t)
     ports = [int(dev.get("port", 9))]
@@ -160,9 +215,10 @@ def send_wol(dev):
                     except OSError as e:
                         errors.append(f"{t}: {e.strerror or e}")
             time.sleep(0.1)
-    if not sent:
+    relays = wol_relays(dev, targets)
+    if not sent and not relays:
         raise OSError("; ".join(sorted(set(errors))))
-    return targets
+    return {"targets": targets, "relays": relays}
 
 
 MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -1150,6 +1206,69 @@ def agent_script(dev):
                .replace("__PANEL_IP__", local_ip_for(dev["ip"])))
 
 
+# ------------------------------------------------------- tambah komputer lewat skrip
+def join_active():
+    j = CFG.get("join") or {}
+    return j if j.get("tok") and j.get("exp", 0) > time.time() else None
+
+
+def panel_lan_ip():
+    try:
+        return local_ip_for("192.0.2.1")  # IP panel di jaringan sekolah (tidak ada paket yang dikirim)
+    except OSError:
+        return "IP-PANEL"
+
+
+def join_script(panel_ip, tok):
+    with open(JOIN_TEMPLATE, encoding="utf-8") as f:
+        tpl = f.read()
+    return (tpl.replace("__PANEL__", f"http://{panel_ip}:{int(CFG.get('port', 8080))}")
+               .replace("__PANEL_IP__", panel_ip).replace("__TOKEN__", tok))
+
+
+def register_pending(data, from_ip):
+    """Data dari skrip di komputer client -> daftar tunggu. Mengembalikan (entri, pesan_error)."""
+    try:
+        mac = normalize_mac(str(data.get("mac", "")))
+        ip = str(ipaddress.IPv4Address(str(data.get("ip", ""))))
+        prefix = parse_prefix(str(data.get("prefix", "")))
+    except (ValueError, TypeError):
+        return None, "data jaringan tidak valid"
+    host = re.sub(r"[^A-Za-z0-9._-]", "", str(data.get("host", "")))[:60] or ip
+    old = next((p for p in CFG["pending"] if p["mac"] == mac), None)
+    if not old and len(CFG["pending"]) >= PENDING_MAX:
+        return None, "daftar tunggu di panel penuh, tambahkan/abaikan dulu yang ada"
+    ent = {"mac": mac, "host": host, "ip": ip, "prefix": prefix, "adapter": str(data.get("adapter", ""))[:100],
+           "wifi": bool(data.get("wifi")), "wol": bool(data.get("wol")), "fast": bool(data.get("fast")),
+           "time": int(time.time()), "from": from_ip, "agent_secret": secrets.token_hex(32), "agent_port": AGENT_PORT}
+    CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != mac] + [ent]
+    save_config(CFG)
+    return ent, None
+
+
+def approve_pending(ent, name=""):
+    """Tambahkan komputer dari daftar tunggu; bila MAC sudah ada, perbarui IP/subnet/agennya. -> (perangkat, baru?)"""
+    net = ipaddress.IPv4Network(f"{ent['ip']}/{ent['prefix']}", strict=False)
+    upd = {"ip": ent["ip"], "prefix": ent["prefix"], "broadcast": str(net.broadcast_address),
+           "agent_secret": ent["agent_secret"], "agent_port": ent.get("agent_port", AGENT_PORT)}
+    dev = next((d for d in CFG["devices"] if d["mac"] == ent["mac"]), None)
+    if dev:
+        dev.update(upd)
+        dev.pop("agent_version", None)
+        new = False
+    else:
+        name = (name or ent["host"]).strip()[:60] or ent["host"]
+        base = slugify(name)[:28]
+        did, i = base, 2
+        while any(d["id"] == did for d in CFG["devices"]):
+            did, i = f"{base}-{i}", i + 1
+        dev = {"id": did, "name": name, "mac": ent["mac"], "port": 9, "check_ports": [], "remote_url": DEFAULT_REMOTE, **upd}
+        CFG["devices"].append(dev)
+        new = True
+    CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != ent["mac"]]
+    return dev, new
+
+
 def all_status():
     devs = list(CFG.get("devices", []))
     if not devs:
@@ -1196,9 +1315,13 @@ def build_device(form, others):
             ipaddress.IPv4Address(ip)
         except ValueError:
             return None, "IP komputer tidak valid."
+    try:
+        prefix = parse_prefix(form.get("subnet", ""))
+    except ValueError:
+        return None, "Subnet tidak valid. Contoh: 24 atau 255.255.255.0 (boleh 8–30)."
     bc = form.get("broadcast", "").strip()
     if not bc:
-        bc = str(ipaddress.ip_network(f"{ip}/24", strict=False).broadcast_address) if ip else "255.255.255.255"
+        bc = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False).broadcast_address) if ip else "255.255.255.255"
     try:
         ipaddress.IPv4Address(bc)
     except ValueError:
@@ -1213,7 +1336,7 @@ def build_device(form, others):
     remote = form.get("remote_url", "").strip() or DEFAULT_REMOTE
     if not re.match(r"^https?://[^\s\"'<>]+$", remote) or len(remote) > 300:
         return None, "Link remote harus diawali http:// atau https://"
-    return {"id": did, "name": name, "mac": mac, "ip": ip, "broadcast": bc,
+    return {"id": did, "name": name, "mac": mac, "ip": ip, "prefix": prefix, "broadcast": bc,
             "port": port, "check_ports": checks, "remote_url": remote}, None
 
 
@@ -1663,6 +1786,11 @@ def home_page(user, csrf, q):
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada komputer</h3>'
                      f'<p class="small" style="margin:0 0 14px">Tambahkan komputer yang ingin dinyalakan lewat panel ini.</p>{tip}</div>')
     attention = ""
+    if is_admin(user) and CFG.get("pending"):
+        n = len(CFG["pending"])
+        attention += (f'<div class="card" style="border-color:var(--acc);display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+                      f'<span><b>{n} komputer</b> mendaftar lewat skrip dan menunggu ditambahkan.</span>'
+                      f'<a class="btn sm primary" href="/settings?tab=komputer#pending">Lihat</a></div>')
     if is_admin(user):
         fl = failures()
         if fl:
@@ -1678,7 +1806,7 @@ def home_page(user, csrf, q):
                             f'<div class="mut small">Gagal {who} · {E(t)}</div></div>'
                             f'<div class="acts">{dismiss}{uninstall_form(csrf, d, a, back="home", label="Coba lagi")}</div></div>')
             more = f'<p class="foot" style="margin-top:10px">dan {len(fl) - 10} lainnya di menu Aplikasi.</p>' if len(fl) > 10 else ""
-            attention = (f'<div class="sec-head"><h2>Perlu ditangani manual <span class="tag bad">{len(fl)}</span></h2>'
+            attention += (f'<div class="sec-head"><h2>Perlu ditangani manual <span class="tag bad">{len(fl)}</span></h2>'
                          f'<a class="small" href="/apps">Buka Aplikasi</a></div>'
                          f'<div class="card" style="border-color:color-mix(in srgb,var(--err) 40%,var(--line))"><div class="list">{"".join(rows)}</div>'
                          f'<p class="mut small" style="margin:12px 0 0">Uninstall manual lewat Settings → Apps di komputer tersebut, lalu klik Pindai di menu Aplikasi. '
@@ -1745,7 +1873,7 @@ def settings_devices(user, csrf, q):
                f'<button class="btn sm primary" data-busy="Memperbarui…">Perbarui agen</button></form>'
                if v and MIN_UPDATABLE <= v < template_version() else "")
         rows.append(f"""<div class="row"><div class="row-main"><b>{E(d['name'])}</b>{tag}
-<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div></div>
+<div class="meta"><span>{E(d['ip'] + '/' + str(d.get('prefix') or 24)) if d.get('ip') else 'IP belum diisi'}</span><span class="mono">{E(d['mac'])}</span></div></div>
 <div class="acts"><a class="btn sm" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>
 <form method="post" action="/devices/test">{hidden(csrf, id=d['id'])}<button class="btn sm" data-busy="Mengetes…" title="Cek ARP, ping, port, dan agen">Tes</button></form>
 {upd}<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Pasang / pasang ulang agen di komputer ini">{'Pasang ulang' if has_agent else 'Pasang agen'}</button></form>
@@ -1762,9 +1890,14 @@ def settings_devices(user, csrf, q):
         return E(", ".join(map(str, v)) if isinstance(v, list) else str(v))
     remote = dv("remote_url")
     remote = "" if remote == E(DEFAULT_REMOTE) else remote
+    subnet = E(f.get("f_subnet", "")) if f else str(src.get("prefix") or 24) if src else ""
+    bcast = dv("broadcast")
+    net = dev_network(src) if src and not f else None
+    if net and bcast == str(net.broadcast_address):
+        bcast = ""  # sama dengan hasil otomatis dari IP + subnet
     adv_open = " open" if (f and any(f.get("f_" + k) for k in ("id", "broadcast", "check_ports", "remote_url"))) else ""
     open_form = " open" if (ed or f or "new" in q or not CFG["devices"]) else ""
-    title = f"Ubah {E(ed['name'])}" if ed else "Tambah komputer"
+    title = f"Ubah {E(ed['name'])}" if ed else "Tambah komputer manual"
     form = f"""<form method="post" action="/devices/save">{hidden(csrf, orig=ed['id'] if ed else '')}
 <label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="mis. Komputer Lab 1"></label>
 <div class="grid">
@@ -1772,11 +1905,14 @@ def settings_devices(user, csrf, q):
 <span class="hint">Dari <span class="mono">ipconfig /all</span>, bagian Ethernet → Physical Address.</span></label>
 <label>IP komputer<input name="ip" value="{dv('ip')}" inputmode="decimal" placeholder="mis. 192.168.10.50" spellcheck="false">
 <span class="hint">Untuk cek status & agen Matikan. Sebaiknya IP tetap.</span></label>
+<label>Subnet<input name="subnet" value="{subnet}" placeholder="24" spellcheck="false">
+<span class="hint">Prefix (24) atau netmask (255.255.255.0). Boleh beda subnet dengan panel.</span></label>
 </div>
 <details class="more"{adv_open}><summary>Pengaturan lanjutan</summary>
 <div class="grid">
 <label>ID singkat<input name="id" value="{dv('id')}" maxlength="32" placeholder="otomatis dari nama" spellcheck="false"></label>
-<label>Alamat broadcast<input name="broadcast" value="{dv('broadcast')}" placeholder="otomatis dari IP" spellcheck="false"></label>
+<label>Alamat WOL tambahan<input name="broadcast" value="{bcast}" placeholder="otomatis dari IP + subnet" spellcheck="false">
+<span class="hint">Untuk beda subnet tanpa agen yang hidup, mis. IP ARP-broadcast di MikroTik (lihat README).</span></label>
 <label>Port WOL<input name="port" type="number" min="1" max="65535" value="{dv('port', '9')}"></label>
 <label>Port untuk cek status<input name="check_ports" value="{dv('check_ports', '')}" placeholder="mis. 3389 (boleh kosong)">
 <span class="hint">Status sudah dicek lewat ARP & ping.</span></label>
@@ -1790,7 +1926,58 @@ def settings_devices(user, csrf, q):
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}{title}</summary>
 <div style="padding:0 16px 16px">{form}</div></details>"""
 
-    return (agent_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + form_card)
+    # ---- daftar tunggu & tambah lewat skrip
+    pend = CFG.get("pending", [])
+    prow = []
+    for p in sorted(pend, key=lambda x: x["host"].lower()):
+        same = next((d for d in CFG["devices"] if d["mac"] == p["mac"]), None)
+        notes = []
+        if same:
+            notes.append(f'<span class="tag">sudah ada sebagai {E(same["name"])} — data diperbarui</span>')
+        if p.get("wifi"):
+            notes.append('<span class="tag warn" title="Wake-on-LAN biasanya hanya lewat kabel LAN">Wi-Fi</span>')
+        if not p.get("wol"):
+            notes.append('<span class="tag warn" title="Aktifkan Wake on Magic Packet manual di Device Manager">WOL Windows belum aktif</span>')
+        if not p.get("fast"):
+            notes.append('<span class="tag warn">Fast Startup masih aktif</span>')
+        t = time.strftime("%d/%m %H:%M", time.localtime(p["time"]))
+        name_in = "" if same else (f'<input name="name" value="{E(p["host"])}" maxlength="60" aria-label="Nama komputer" '
+                                   f'style="width:180px;padding:6px 8px">')
+        prow.append(f"""<div class="row"><div class="row-main"><b>{E(p['host'])}</b> {''.join(notes)}
+<div class="meta"><span>{E(p['ip'])}/{p['prefix']}</span><span class="mono">{E(p['mac'])}</span><span>{E(p.get('adapter', ''))}</span><span>daftar {E(t)}</span></div></div>
+<div class="acts" style="align-items:center"><form method="post" action="/devices/pending-add" style="display:flex;align-items:center;gap:6px;margin:0">{hidden(csrf, mac=p['mac'])}{name_in}
+<button class="btn sm primary">{'Perbarui' if same else 'Tambahkan'}</button></form>
+<form method="post" action="/devices/pending-ignore">{hidden(csrf, mac=p['mac'])}<button class="btn sm quiet">Abaikan</button></form></div></div>""")
+    pending_card = ""
+    if prow:
+        all_btn = (f'<form method="post" action="/devices/pending-add">{hidden(csrf, mac="semua")}'
+                   f'<button class="btn sm primary">Tambahkan semua ({len(prow)})</button></form>') if len(prow) > 1 else ""
+        pending_card = (f'<div class="sec-head" id="pending"><h2>Menunggu ditambahkan <span class="tag warn">{len(prow)}</span></h2>{all_btn}</div>'
+                        f'<div class="card" style="border-color:var(--acc)"><div class="list">{"".join(prow)}</div>'
+                        f'<p class="mut small" style="margin:12px 0 0">Komputer ini menjalankan skrip pendaftaran. Agennya sudah terpasang dan langsung '
+                        f'aktif setelah ditambahkan.</p></div>')
+    j = join_active()
+    if j:
+        cmd = f"irm http://{panel_lan_ip()}:{int(CFG.get('port', 8080))}/join/{j['tok']}.ps1 | iex"
+        until = time.strftime("%d/%m/%Y %H:%M", time.localtime(j["exp"]))
+        join_body = f"""<ol class="steps"><li>Di komputer client, klik kanan Start lalu pilih <b>Terminal (Admin)</b> / <b>PowerShell (Admin)</b>.</li>
+<li>Tempel perintah di bawah lalu tekan Enter.</li>
+<li>Komputer muncul di <b>Menunggu ditambahkan</b> di halaman ini; klik <b>Tambahkan</b>.</li></ol>
+<div class="cmd"><input id="joincmd" readonly value="{E(cmd)}" aria-label="Perintah daftar komputer">
+<button class="btn" type="button" data-copy="joincmd">{icon('copy')}Salin</button></div>
+<p class="mut small" style="margin:10px 0 12px">Bisa dipakai di banyak komputer sampai {E(until)}. Skrip mendeteksi nama, IP, subnet dan MAC, menyalakan
+pengaturan Wake-on-LAN di Windows, memasang agen, lalu mendaftar ke panel. Komputer baru masuk panel setelah Anda klik Tambahkan.
+Wake-on-LAN di BIOS tetap perlu diaktifkan manual.</p>
+<div class="acts"><form method="post" action="/devices/join-revoke">{hidden(csrf)}<button class="btn sm quiet danger">Cabut perintah</button></form></div>"""
+    else:
+        join_body = f"""<p class="small" style="margin:0 0 12px">Jalankan satu perintah di komputer client: nama, IP, subnet dan MAC terdeteksi otomatis,
+pengaturan Wake-on-LAN di Windows dinyalakan, agen terpasang, lalu komputer muncul di sini tinggal ditambahkan.</p>
+<form method="post" action="/devices/join-new">{hidden(csrf)}<button class="btn primary">Buat perintah</button></form>"""
+    join_card = f"""<details class="card" id="join"{' open' if j else ''} style="padding:0">
+<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah lewat skrip (otomatis)</summary>
+<div style="padding:0 16px 16px">{join_body}</div></details>"""
+
+    return (agent_card + pending_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + join_card + form_card)
 
 
 def settings_users(user, csrf, q):
@@ -2433,6 +2620,14 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/plain; charset=utf-8")
             write_log("-", "unduh-vm", vm["id"], self.client_ip())
             return self._send(200, vm_install_script(vm), "text/plain; charset=utf-8")
+        m = re.fullmatch(r"/join/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
+        if m:  # skrip daftar komputer (tanpa login, memakai token Tambah lewat skrip)
+            j = join_active()
+            if not j or not hmac.compare_digest(j["tok"], m.group(1)) or not self.lan_direct():
+                return self._send(200, "Write-Host 'Perintah sudah kedaluwarsa atau dicabut. Buat ulang di panel: Pengaturan -> Komputer -> Tambah lewat skrip.' -ForegroundColor Red\n",
+                                  "text/plain; charset=utf-8")
+            write_log("-", "unduh-skrip-daftar", "-", self.client_ip())
+            return self._send(200, join_script(self.request.getsockname()[0], j["tok"]), "text/plain; charset=utf-8")
         m = re.fullmatch(r"/agent/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
         if m:  # unduh pemasang agen memakai token sementara (tanpa login, diambil dari komputer tujuan)
             ent = AGENT_TOKENS.get(m.group(1))
@@ -2515,6 +2710,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/login":
             return self.do_login(form, ip)
+        m = re.fullmatch(r"/join/([A-Za-z0-9_-]{20,64})", path)
+        if m:
+            return self.do_join(m.group(1), raw, ip)
 
         user, tok = self.session()
         if path.startswith("/terminal/") and path != "/terminal/unlock":
@@ -2616,6 +2814,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_agent(form, user, ip)
             if path == "/devices/agent-remove":
                 return self.do_agent_remove(form, user, ip)
+            if path == "/devices/join-new":
+                CFG["join"] = {"tok": secrets.token_urlsafe(24), "exp": int(time.time()) + JOIN_TTL, "by": user}
+                save_config(CFG)
+                write_log(user, "buat-perintah-daftar", "-", ip)
+                return self.redirect("/settings?tab=komputer#join")
+            if path == "/devices/join-revoke":
+                CFG.pop("join", None)
+                save_config(CFG)
+                write_log(user, "cabut-perintah-daftar", "-", ip)
+                return self.back("/settings", "Perintah daftar dicabut. Komputer yang sudah mendaftar tetap ada di daftar tunggu.")
+            if path == "/devices/pending-add":
+                return self.do_pending_add(form, user, ip)
+            if path == "/devices/pending-ignore":
+                CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != form.get("mac")]
+                save_config(CFG)
+                return self.back("/settings", "Dihapus dari daftar tunggu. Agen di komputer itu tidak dipakai panel.")
             if path == "/users/save":
                 return self.do_user_save(form, user, ip)
             if path == "/users/delete":
@@ -2647,12 +2861,13 @@ class Handler(BaseHTTPRequestHandler):
         if time.time() - WAKE_COOLDOWN.get(dev["id"], 0) < 10:
             return self.back("/", "Perintah baru saja dikirim, tunggu sebentar.", waking=dev["id"])
         try:
-            send_wol(dev)
+            res = send_wol(dev)
         except Exception as e:
             return self.back("/", f"Gagal mengirim: {e}", True)
         WAKE_COOLDOWN[dev["id"]] = time.time()
-        write_log(user, "nyalakan", dev["id"], ip)
-        return self.back("/", f"Perintah menyalakan dikirim ke {dev['name']}.", waking=dev["id"])
+        via = f" (juga lewat agen {', '.join(res['relays'][:3])})" if res["relays"] else ""
+        write_log(user, "nyalakan", dev["id"] + via, ip)
+        return self.back("/", f"Perintah menyalakan dikirim ke {dev['name']}{via}.", waking=dev["id"])
 
     def do_shutdown(self, form, user, ip):
         dev = next((d for d in CFG.get("devices", []) if d["id"] == form.get("id")), None)
@@ -3018,12 +3233,46 @@ class Handler(BaseHTTPRequestHandler):
         return self.redirect("/account?" + urlencode({"msg": "Password berhasil diganti."}),
                              [self.cookie_header(make_session(user), int(CFG.get("session_hours", 12)) * 3600)])
 
+    def do_join(self, tok, raw, ip):
+        reply = lambda t: self._send(200, t, "text/plain; charset=utf-8")
+        j = join_active()
+        if not j or not hmac.compare_digest(j["tok"], tok):
+            return reply("Perintah sudah kedaluwarsa atau dicabut. Buat ulang di panel.")
+        if not self.lan_direct():
+            return reply("Pendaftaran hanya dari jaringan sekolah.")
+        if not os.path.exists(AGENT_TEMPLATE):
+            return reply("File windows-agent.ps1 tidak ada di panel. Jalankan ulang install.sh.")
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+            assert isinstance(data, dict)
+        except Exception:
+            return reply("Data pendaftaran tidak valid.")
+        with CFG_LOCK:
+            ent, err = register_pending(data, ip)
+        if err:
+            return reply(f"Gagal: {err}.")
+        write_log("-", "daftar-komputer", f"{ent['host']} {ent['ip']}", ip)
+        return reply(agent_script(ent))
+
+    def do_pending_add(self, form, user, ip):
+        mac = form.get("mac", "")
+        ents = list(CFG["pending"]) if mac == "semua" else [p for p in CFG["pending"] if p["mac"] == mac]
+        if not ents:
+            return self.back("/settings", "Komputer tidak ada di daftar tunggu.", True)
+        names = []
+        for e in ents:
+            dev, new = approve_pending(e, form.get("name", "") if mac != "semua" else "")
+            names.append(dev["name"] + ("" if new else " (diperbarui)"))
+            write_log(user, "tambah-dari-skrip" if new else "perbarui-dari-skrip", dev["id"], ip)
+        save_config(CFG)
+        return self.back("/settings", "Ditambahkan: " + ", ".join(names) + ".")
+
     def do_device_save(self, form, user, ip):
         orig = form.get("orig", "")
         others = [d for d in CFG["devices"] if d["id"] != orig]
         dev, err = build_device(form, others)
         if err:
-            keep = {f"f_{k}": form.get(k, "") for k in ("name", "id", "mac", "ip", "broadcast", "port", "check_ports", "remote_url")}
+            keep = {f"f_{k}": form.get(k, "") for k in ("name", "id", "mac", "ip", "subnet", "broadcast", "port", "check_ports", "remote_url")}
             if orig:
                 keep["edit"] = orig
             return self.back("/settings", err, True, **keep)

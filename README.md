@@ -52,7 +52,9 @@ masuk sebagai admin, lalu buka menu **Pengaturan**.
 
 Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layanan:
 
-- **Komputer**: tambah, ubah, hapus. Isi nama, MAC address, dan IP. Alamat broadcast dan ID dibuat otomatis jika dikosongkan.
+- **Komputer**: tambah, ubah, hapus. Isi nama, MAC address, IP, dan subnet (`24` atau `255.255.255.0`). ID dibuat otomatis
+  jika dikosongkan. Komputer boleh berada di subnet lain dari panel (lihat *Komputer di subnet lain* di bawah). Cara
+  paling cepat: **Tambah lewat skrip** (di bawah).
   Setiap komputer punya tombol **Buka Remote** di Beranda; bawaannya membuka Chrome Remote Desktop
   (remotedesktop.google.com/access), linknya bisa diganti per komputer.
 - **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
@@ -71,6 +73,50 @@ python3 wol.py users                 # lihat nama akun yang ada
 python3 wol.py resetpw andi          # ganti 'andi' dengan nama akun admin Anda
 systemctl restart wol-panel
 ```
+
+### Tambah komputer lewat skrip
+
+Cocok untuk lab yang komputernya banyak. Di **Pengaturan → Komputer → Tambah lewat skrip**, klik **Buat perintah**,
+lalu di tiap komputer client buka **Terminal (Admin)** dan tempel perintahnya:
+
+```powershell
+irm http://IP-PANEL:8080/join/<token>.ps1 | iex
+```
+
+Skrip itu:
+1. mendeteksi nama komputer, IP, subnet, dan MAC kartu jaringan kabel yang dipakai ke panel (bila tersambung lewat
+   Wi-Fi, kartu kabel dipakai bila ada);
+2. menyalakan pengaturan Wake-on-LAN di Windows: *Wake on Magic Packet*, izin kartu jaringan membangunkan komputer,
+   dan mematikan *Fast Startup*;
+3. memasang agen (tombol Matikan, pemindai aplikasi, relay WOL);
+4. mendaftar ke panel.
+
+Komputer lalu muncul di **Menunggu ditambahkan** (Beranda juga memberi tahu). Klik **Tambahkan** (nama bisa diganti dulu)
+atau **Tambahkan semua**. Komputer yang MAC-nya sudah ada di panel cukup **Perbarui**: IP, subnet, dan agennya
+diperbarui, sedangkan nama dan pengaturan lainnya tetap.
+
+Perintahnya berlaku 24 jam, bisa dipakai di banyak komputer, dan bisa dicabut kapan saja. Komputer tidak masuk panel
+sebelum admin mengklik Tambahkan. Wake-on-LAN di **BIOS** tetap harus diaktifkan manual di tiap komputer.
+
+### Komputer di subnet lain
+
+Panel bisa menyalakan komputer di subnet lain selama masih satu jaringan sekolah (dirutekan router, tanpa NAT di
+antaranya), misalnya panel di `192.168.10.x` dan lab di `192.168.20.x/23`. Saat **Hidupkan** diklik, magic packet dikirim:
+- ke alamat broadcast subnet komputer itu (dihitung dari IP + subnet);
+- **lewat agen**: bila ada komputer lain yang hidup dan beragen (versi 5) di subnet yang sama, panel menyuruh agen itu
+  mengirim magic packet dari dalam subnetnya. Cara ini selalu berhasil karena tidak bergantung pada router. Pesan di
+  Beranda menyebut agen yang dipakai.
+
+Bila tidak ada komputer lain yang hidup di subnet itu, paket harus diteruskan router. Router (termasuk MikroTik)
+biasanya tidak meneruskan broadcast antar subnet. Di MikroTik, buat satu IP yang tidak dipakai di subnet lab
+sebagai alamat broadcast:
+
+```
+/ip arp add address=192.168.20.254 mac-address=FF:FF:FF:FF:FF:FF interface=<interface/bridge lab>
+```
+
+Lalu di panel, **Ubah** komputer → **Pengaturan lanjutan** → **Alamat WOL tambahan**: `192.168.20.254`. Paket yang
+dikirim ke IP itu diteruskan MikroTik sebagai broadcast di subnet lab.
 
 ### Mematikan komputer dari panel
 
