@@ -1017,19 +1017,30 @@ command -v sshd >/dev/null 2>&1 || {{ apt-get update -qq && DEBIAN_FRONTEND=noni
 install -d -m 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
 grep -v -e 'wol-panel-update$' -e 'wol-panel-terminal$' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
 echo "restrict,from=\\"$PANEL_IP\\",command=\\"/usr/local/sbin/wol-update\\" $PUBKEY wol-panel-update" >> /root/.ssh/authorized_keys.tmp
+mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+
+# Terminal web masuk sebagai user biasa (root lewat sudo -i). User: yang menjalankan sudo, atau user biasa pertama.
+TU="${{SUDO_USER:-}}"
+[ "$TU" = root ] && TU=""
+[ -n "$TU" ] || TU="$(awk -F: '$3>=1000 && $3<60000 && $7 !~ /(nologin|false)$/ {{print $1; exit}}' /etc/passwd)"
+[ -n "$TU" ] || TU=root
+for f in /home/*/.ssh/authorized_keys; do [ -f "$f" ] && sed -i '/wol-panel-terminal$/d' "$f"; done
+sed -i '/^TERM_USER=/d' /etc/wol-update.conf; echo "TERM_USER=\\"$TU\\"" >> /etc/wol-update.conf
 if [ -n "$TERM_PUBKEY" ]; then
-  # terminal web: shell root, hanya dari IP panel
-  echo "from=\\"$PANEL_IP\\",no-agent-forwarding,no-port-forwarding,no-X11-forwarding $TERM_PUBKEY wol-panel-terminal" >> /root/.ssh/authorized_keys.tmp
-  echo "==> Terminal web DIIZINKAN untuk VM ini (hanya dari $PANEL_IP)"
+  TH="$(getent passwd "$TU" | cut -d: -f6)"
+  install -d -m 700 -o "$TU" -g "$(id -gn "$TU")" "$TH/.ssh"
+  touch "$TH/.ssh/authorized_keys"
+  echo "from=\\"$PANEL_IP\\",no-agent-forwarding,no-port-forwarding,no-X11-forwarding $TERM_PUBKEY wol-panel-terminal" >> "$TH/.ssh/authorized_keys"
+  chown "$TU":"$(id -gn "$TU")" "$TH/.ssh/authorized_keys"; chmod 600 "$TH/.ssh/authorized_keys"
+  echo "==> Terminal web DIIZINKAN: masuk sebagai $TU (hanya dari $PANEL_IP)$([ "$TU" != root ] && echo ', root lewat sudo -i')"
 else
   echo "==> Terminal web tidak diizinkan untuk VM ini"
 fi
-mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
 
 # Izin login root khusus IP panel bila sshd menolak root secara umum
 sed -i '/^# >>> WOL Panel/,/^# <<< WOL Panel/d; /^# WOL Panel: root hanya/,+2d' /etc/ssh/sshd_config
 if [ "$(sshd -T -C user=root,host=x,addr=203.0.113.1 2>/dev/null | awk '/^permitrootlogin/{{print $2}}')" = "no" ]; then
-  MODE=forced-commands-only; [ -n "$TERM_PUBKEY" ] && MODE=prohibit-password
+  MODE=forced-commands-only; [ -n "$TERM_PUBKEY" ] && [ "$TU" = root ] && MODE=prohibit-password
   printf '\\n# >>> WOL Panel (dikelola otomatis)\\nMatch Address %s\\n    PermitRootLogin %s\\n# <<< WOL Panel\\n' "$PANEL_IP" "$MODE" >> /etc/ssh/sshd_config
   echo "    sshd_config: root dari $PANEL_IP diizinkan ($MODE)"
 fi
@@ -2242,14 +2253,15 @@ def terminal_page(user, csrf, q, lan_ok, unlocked, panel_url=""):
                 '<a class="btn primary" href="/servers">Buka Server</a></div>')
         return shell(user, csrf, "/terminal", body, q)
     pre = q.get("vm", [""])[0]
-    opts = "".join(f'<option value="{E(v["id"])}"{" selected" if v["id"] == pre else ""}>{E(v["name"])} ({E(v["host"])})</option>' for v in vms)
+    tuser = lambda v: ((VMSTATE.get(v["id"]) or {}).get("data") or {}).get("term_user") or "?"
+    opts = "".join(f'<option value="{E(v["id"])}"{" selected" if v["id"] == pre else ""}>{E(v["name"])} ({E(tuser(v))}@{E(v["host"])})</option>' for v in vms)
     body = f"""<link rel="stylesheet" href="/static/xterm.css">
 <div class="sec-head"><h2>Terminal</h2><span id="tstat" class="pill">{'Masuk sebagai ' + E(unlocked) if unlocked else 'Belum login'}</span></div>
 <div class="card" style="padding:12px">
 <div class="inline" style="margin-bottom:10px"><label style="flex:1 1 220px;margin:0">VM<select id="tvm" style="margin-top:4px">{opts}</select></label>
 <button class="btn primary" id="topen" type="button">Buka</button><button class="btn" id="tclose" type="button" disabled>Putuskan</button></div>
 <div id="term" data-csrf="{csrf}" data-who="{E(unlocked or '')}" style="height:min(70vh,560px);background:#0d1117;border-radius:9px;padding:6px;overflow:hidden"></div>
-<p class="mut small" style="margin:10px 0 0">Login dengan akun admin WOL Panel, lalu pilih VM. Di VM Anda masuk sebagai root. Semua tampilan sesi direkam di panel (<span class="mono">vmlogs/terminal/</span>).
+<p class="mut small" style="margin:10px 0 0">Login dengan akun admin WOL Panel, lalu pilih VM. Di VM Anda masuk sebagai user biasa (tertera di pilihan VM); untuk root ketik <span class="mono">sudo -i</span>. Semua tampilan sesi direkam di panel (<span class="mono">vmlogs/terminal/</span>).
 Salin: pilih teks · Tempel: Ctrl+Shift+V / klik kanan.</p></div>
 <script src="/static/xterm.js"></script><script src="/static/xterm-addon-fit.js"></script>"""
     return shell(user, csrf, "/terminal", body.replace('"wrap"', '"wrap"'), q, TERM_JS)
@@ -2695,6 +2707,11 @@ class Handler(BaseHTTPRequestHandler):
             vm = next((v for v in CFG["vms"] if v["id"] == form.get("vm") and v.get("terminal")), None)
             if not vm:
                 return self._send(200, json.dumps({"error": "VM ini belum diizinkan terminal."}), "application/json")
+            tu = ((VMSTATE.get(vm["id"]) or {}).get("data") or {}).get("term_user")
+            if not tu:
+                return self._send(200, json.dumps({"error": "User terminal VM ini belum diketahui. Di menu Server: Lainnya → Pasang ulang, "
+                                                             "jalankan perintahnya di VM (lewat sudo -i dari user Anda), lalu klik Cek."}), "application/json")
+            vm = {**vm, "user": tu}  # masuk sebagai user biasa di VM, bukan root
             try:
                 ensure_term_key()
                 who = term_unlocked(tok)

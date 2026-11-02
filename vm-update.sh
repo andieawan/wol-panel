@@ -11,11 +11,12 @@
 #   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=3
+WOL_UPDATE_VERSION=4
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 APP_DIR=""
+TERM_USER=""
 WOL_UPDATE_SRC="https://raw.githubusercontent.com/andieawan/wol-panel/main/vm-update.sh"
 [ -f /etc/wol-update.conf ] && . /etc/wol-update.conf
 CMD="${SSH_ORIGINAL_COMMAND:-${1:-status}}"
@@ -35,6 +36,7 @@ as_owner() {  # git sebagai pemilik folder aplikasi (hindari 'dubious ownership'
 os_info() {
   . /etc/os-release
   echo "version=$WOL_UPDATE_VERSION"
+  echo "term_user=$TERM_USER"
   echo "host=$(hostname)"
   echo "os=${PRETTY_NAME:-Linux}"
   echo "kernel=$(uname -r)"

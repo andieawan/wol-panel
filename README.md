@@ -220,6 +220,11 @@ terminal dibatasi ketat:
 - **Semua tampilan sesi direkam** di `/opt/wol-panel/vmlogs/terminal/`.
 - **Ditutup otomatis** setelah 30 menit tanpa aktivitas.
 
+Terminal **masuk sebagai user biasa di VM, bukan root**. Usernya adalah user yang menjalankan perintah pasang lewat
+`sudo -i` (mis. `andi`), atau user biasa pertama di VM bila perintah itu dijalankan langsung sebagai root. Untuk menjadi
+root, ketik `sudo -i` di terminal; sudo akan meminta password user tersebut di VM. Root hanya dipakai langsung bila VM
+tidak punya user biasa. User yang dipakai tampil di pilihan VM, misalnya `absensi (andi@192.168.10.22)`.
+
 Untuk mencabut izin, klik **Cabut terminal** di Server, lalu jalankan perintah pasang yang muncul di VM itu.
 Kunci terminalnya akan dihapus dari VM.
 
