@@ -45,27 +45,36 @@ Untuk memperbarui di kemudian hari (konfigurasi di `/opt/wol-panel/config.json` 
 cd wol-panel && git pull && bash install.sh
 ```
 
-Skrip akan meminta nama pengguna + password admin, lalu data komputer (nama, MAC, IP).
-Setelah selesai, buka `http://192.168.10.20:8080`.
+Skrip hanya meminta nama pengguna + password admin. Setelah selesai, buka `http://192.168.10.20:8080`,
+masuk sebagai admin, lalu buka menu **Pengaturan**.
 
-Perintah lain (jalankan di `/opt/wol-panel` sebagai root):
+## 3. Pengaturan lewat web
+
+Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layanan:
+
+- **Komputer**: tambah, ubah, hapus. Isi nama, MAC address, dan IP. Alamat broadcast dan ID dibuat otomatis jika dikosongkan.
+- **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
+  - *Admin*: bisa menyalakan komputer dan mengubah pengaturan.
+  - *Pengguna*: hanya bisa menyalakan komputer.
+- **Umum**: mode reverse proxy (NPMplus) dan lama sesi login.
+
+Setiap akun bisa mengganti passwordnya sendiri di menu **Akun**. Riwayat login, perintah menyalakan,
+dan perubahan pengaturan tampil di Beranda untuk admin.
+
+Jika lupa password admin, jalankan di server:
 
 ```bash
-python3 wol.py adddevice      # tambah komputer lain
-python3 wol.py adduser        # tambah pengguna / ganti password
-python3 wol.py list           # lihat daftar + status
-python3 wol.py wake desktop   # hidupkan dari terminal
-systemctl restart wol-panel   # wajib setelah menambah komputer/pengguna
+cd /opt/wol-panel && python3 wol.py resetpw admin && systemctl restart wol-panel
 ```
 
-## 3. Akses dari luar sekolah
+## 4. Akses dari luar sekolah
 
 Pilih salah satu:
 
 **A. Lewat subdomain + NPMplus (paling praktis)**
 1. Cloudflare: buat record `wol.smkibupakusari.sch.id` → IP publik sekolah.
 2. NPMplus: Proxy Host baru → forward ke `192.168.10.20:8080`, aktifkan SSL (Let's Encrypt) + *Force SSL*.
-3. Edit `/opt/wol-panel/config.json`, ubah `"trust_proxy": true`, lalu `systemctl restart wol-panel`.
+3. Di panel: **Pengaturan → Umum**, centang *Panel diakses lewat reverse proxy*, lalu Simpan.
 4. Disarankan tambah lapisan kedua: *Access List* di NPMplus (basic auth atau batasi IP).
 
 **B. Lewat VPN (paling aman)** — WireGuard di MikroTik atau Tailscale. Setelah tersambung VPN,
@@ -74,7 +83,7 @@ buka panel dan remote desktop memakai IP lokal seperti di sekolah.
 > Jangan membuka port RDP 3389 langsung ke internet. Untuk remote desktop dari luar, pakai VPN atau
 > aplikasi seperti AnyDesk/RustDesk.
 
-## 4. Kalau desktop tidak mau menyala
+## 5. Kalau desktop tidak mau menyala
 
 | Gejala | Penyebab umum |
 |---|---|
@@ -88,5 +97,5 @@ paket broadcast tidak menyeberang router. Solusinya pasang interface tambahan co
 atau kirim langsung dari MikroTik: `/tool wol mac=AA:BB:CC:DD:EE:FF interface=bridge-lab`.
 
 ## Keamanan bawaan
-Password disimpan ter-hash (PBKDF2), sesi ditandatangani, proteksi CSRF pada tombol,
+Password disimpan ter-hash (PBKDF2), sesi ditandatangani (otomatis batal saat password diganti), peran admin/pengguna, proteksi CSRF pada tombol,
 login diblokir 10 menit setelah 5 kali salah, dan setiap login/perintah menyalakan dicatat di `wol.log`.

@@ -10,7 +10,8 @@ mkdir -p "$DIR"
 install -m 755 "$(dirname "$0")/wol.py" "$DIR/wol.py"
 
 if [ ! -f "$DIR/config.json" ]; then
-  (cd "$DIR" && python3 wol.py init && python3 wol.py adddevice)
+  echo "== Buat akun admin WOL Panel =="
+  (cd "$DIR" && python3 wol.py init)
 fi
 chown -R wolpanel:wolpanel "$DIR"; chmod 600 "$DIR/config.json"
 
