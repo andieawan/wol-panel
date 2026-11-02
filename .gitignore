@@ -1,0 +1,4 @@
+config.json
+config.json.tmp
+wol.log
+__pycache__/
