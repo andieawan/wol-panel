@@ -69,6 +69,8 @@ def migrate(cfg):
     cfg.setdefault("session_hours", 12)
     cfg.setdefault("app_rules", [])
     cfg.setdefault("scan_minutes", 60)
+    cfg.setdefault("vms", [])
+    cfg.setdefault("vm_check_hours", 6)
     return cfg
 
 
@@ -516,6 +518,10 @@ def scanner_loop():
         except Exception as e:
             print("pembaruan agen:", e, file=sys.stderr)
         try:
+            check_all_vms()
+        except Exception as e:
+            print("cek VM:", e, file=sys.stderr)
+        try:
             if int(CFG.get("scan_minutes", 60)) > 0:
                 scan_all(only_due=True)
         except Exception as e:
@@ -635,6 +641,221 @@ def agent_badge(dev):
     if v < t:
         return f' <span class="tag warn">Agen v{v} · ada versi {t}</span>'
     return f' <span class="tag ok">Agen v{v}</span>'
+
+
+# ------------------------------------------------------- update VM (SSH terkunci)
+VM_TEMPLATE = os.path.join(BASE, "vm-update.sh")
+SSH_DIR = os.path.join(BASE, "ssh")
+SSH_KEY = os.path.join(SSH_DIR, "id_ed25519")
+VM_STATE_PATH = os.environ.get("WOL_VMSTATE", os.path.join(BASE, "vm.json"))
+VM_LOG_DIR = os.path.join(BASE, "vmlogs")
+VMSTATE = {}          # id VM -> {"checked", "data", "error"}
+VM_LOCK = threading.Lock()
+VM_JOBS = {}          # id VM -> {"action", "start", "end", "rc", "by"}
+VM_TOKENS = {}        # token pasang -> (id VM, kedaluwarsa)
+VM_ACTIONS = {"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot"}
+
+
+def load_vmstate():
+    global VMSTATE
+    try:
+        with open(VM_STATE_PATH, encoding="utf-8") as f:
+            VMSTATE = json.load(f)
+    except (FileNotFoundError, ValueError):
+        VMSTATE = {}
+
+
+def save_vmstate():
+    tmp = VM_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(VMSTATE, f, ensure_ascii=False)
+    os.replace(tmp, VM_STATE_PATH)
+
+
+def ensure_ssh_key():
+    if not os.path.exists(SSH_KEY):
+        os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "wol-panel", "-f", SSH_KEY], check=True)
+    with open(SSH_KEY + ".pub", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def ssh_cmd(vm, action):
+    return ["ssh", "-i", SSH_KEY, "-p", str(int(vm.get("port", 22))),
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={os.path.join(SSH_DIR, 'known_hosts')}",
+            "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=30", "-o", "LogLevel=ERROR",
+            f"{vm.get('user', 'root')}@{vm['host']}", action]
+
+
+def ssh_error(text, rc):
+    t = (text or "").strip().splitlines()
+    last = t[-1] if t else ""
+    if "Permission denied" in last:
+        return "Kunci panel ditolak VM — jalankan perintah pasang di VM ini."
+    if "Host key verification failed" in last or "REMOTE HOST IDENTIFICATION" in (text or ""):
+        return "Kunci host VM berubah (VM dipasang ulang?). Hapus lalu tambahkan lagi VM ini di panel."
+    if "timed out" in last or "No route" in last or "Connection refused" in last:
+        return "VM tidak terjangkau lewat SSH (mati, IP salah, atau SSH belum aktif)."
+    if last.startswith("error="):
+        return last[6:]
+    return last or f"SSH gagal (kode {rc})."
+
+
+def parse_kv(text):
+    d = {"pkgs": [], "commits": []}
+    for line in (text or "").splitlines():
+        k, sep, v = line.partition("=")
+        if not sep:
+            continue
+        if k == "pkg":
+            p = v.split("|")
+            if len(p) >= 4:
+                d["pkgs"].append({"name": p[0], "from": p[1], "to": p[2], "src": p[3], "sec": "-security" in p[3]})
+        elif k == "commit":
+            p = v.split("|", 2)
+            if len(p) == 3:
+                d["commits"].append({"hash": p[0], "time": int(p[1] or 0), "msg": p[2]})
+        elif k == "app_head":
+            p = v.split("|", 2)
+            d["app_head"] = {"hash": p[0], "time": int(p[1] or 0) if len(p) > 1 and p[1].isdigit() else 0,
+                             "msg": p[2] if len(p) > 2 else ""} if v else None
+        else:
+            d[k] = v
+    return d
+
+
+def vm_check(vm, user="otomatis"):
+    try:
+        r = subprocess.run(ssh_cmd(vm, "check"), capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        err, data = "Cek melebihi 5 menit.", None
+    else:
+        data = parse_kv(r.stdout)
+        err = None if r.returncode == 0 and data.get("host") else ssh_error(r.stderr + r.stdout, r.returncode)
+    with VM_LOCK:
+        st = VMSTATE.setdefault(vm["id"], {})
+        st["checked"] = int(time.time())
+        st["error"] = err
+        if data and not err:
+            st["data"] = data
+        save_vmstate()
+    return err
+
+
+def vm_job_running(vm_id):
+    j = VM_JOBS.get(vm_id)
+    return bool(j and j.get("end") is None)
+
+
+def vm_log_path(vm_id):
+    return os.path.join(VM_LOG_DIR, f"{vm_id}.log")
+
+
+def run_vm_job(vm, action, user):
+    """Jalankan aksi di VM di latar belakang; keluaran ditulis ke log agar bisa dipantau langsung."""
+    os.makedirs(VM_LOG_DIR, exist_ok=True)
+    job = {"action": action, "start": int(time.time()), "end": None, "rc": None, "by": user}
+    VM_JOBS[vm["id"]] = job
+
+    def work():
+        path = vm_log_path(vm["id"])
+        with open(path, "w", encoding="utf-8") as log:
+            log.write(f"# {VM_ACTIONS.get(action, action)} di {vm['name']} oleh {user} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            log.flush()
+            try:
+                p = subprocess.Popen(ssh_cmd(vm, action), stdout=log, stderr=subprocess.STDOUT, text=True)
+                rc = p.wait(timeout=3600)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                rc = -1
+                log.write("\n[panel] Dihentikan: melebihi 60 menit.\n")
+            except Exception as e:
+                rc = -1
+                log.write(f"\n[panel] Gagal menjalankan SSH: {e}\n")
+            log.write(f"\n[panel] Selesai dengan kode {rc}.\n")
+        job["rc"], job["end"] = rc, int(time.time())
+        write_log(user, "vm-" + action + ("" if rc == 0 else "-gagal"), f"{vm['id']}:{vm['name']}", "-")
+        with VM_LOCK:
+            st = VMSTATE.setdefault(vm["id"], {})
+            st["last_job"] = {k: job[k] for k in ("action", "start", "end", "rc", "by")}
+            save_vmstate()
+        if action != "reboot":
+            vm_check(vm, user)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def check_all_vms(only_due=True):
+    hours = float(CFG.get("vm_check_hours", 6))
+    for vm in list(CFG.get("vms", [])):
+        last = (VMSTATE.get(vm["id"]) or {}).get("checked", 0)
+        if only_due and (hours <= 0 or time.time() - last < hours * 3600):
+            continue
+        if vm_job_running(vm["id"]):
+            continue
+        try:
+            vm_check(vm)
+        except Exception as e:
+            print("cek VM gagal", vm["id"], e, file=sys.stderr)
+
+
+def vm_install_script(vm):
+    with open(VM_TEMPLATE, encoding="utf-8") as f:
+        helper = f.read()
+    pub = ensure_ssh_key()
+    panel_ip = local_ip_for(vm["host"])
+    if "WOLEOF" in helper:
+        raise ValueError("template vm-update.sh tidak valid")
+    return f"""#!/bin/bash
+# Pemasang akses update WOL Panel untuk VM "{vm['name']}". Jalankan sebagai root.
+set -e
+[ "$(id -u)" -eq 0 ] || {{ echo "Jalankan sebagai root: sudo -i lalu ulangi perintahnya."; exit 1; }}
+PANEL_IP='{panel_ip}'
+PUBKEY='{pub}'
+
+echo "==> Memasang /usr/local/sbin/wol-update"
+cat > /usr/local/sbin/wol-update <<'WOLEOF'
+{helper}
+WOLEOF
+chown root:root /usr/local/sbin/wol-update; chmod 755 /usr/local/sbin/wol-update
+
+if [ ! -f /etc/wol-update.conf ]; then
+  APP=""
+  for f in /var/www/*/deploy/update.sh /var/www/*/*/deploy/update.sh; do
+    [ -f "$f" ] && {{ APP="$(dirname "$(dirname "$f")")"; break; }}
+  done
+  echo "APP_DIR=\\"$APP\\"" > /etc/wol-update.conf
+fi
+. /etc/wol-update.conf
+echo "    Folder aplikasi: ${{APP_DIR:-(tidak ditemukan — hanya update OS)}}"
+
+echo "==> Memasang kunci SSH panel (hanya untuk wol-update, hanya dari $PANEL_IP)"
+command -v sshd >/dev/null 2>&1 || {{ apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null; }}
+install -d -m 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+grep -v 'wol-panel-update$' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
+echo "restrict,from=\\"$PANEL_IP\\",command=\\"/usr/local/sbin/wol-update\\" $PUBKEY wol-panel-update" >> /root/.ssh/authorized_keys.tmp
+mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+
+if [ "$(sshd -T 2>/dev/null | awk '/^permitrootlogin/{{print $2}}')" = "no" ] && ! grep -q 'WOL Panel' /etc/ssh/sshd_config; then
+  printf '\\n# WOL Panel: root hanya boleh menjalankan perintah terkunci, hanya dari IP panel\\nMatch Address %s\\n    PermitRootLogin forced-commands-only\\n' "$PANEL_IP" >> /etc/ssh/sshd_config
+  echo "    sshd_config: izin root terbatas untuk $PANEL_IP ditambahkan"
+fi
+systemctl enable ssh >/dev/null 2>&1 || true
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+/usr/local/sbin/wol-update status >/dev/null && echo "Berhasil. Kembali ke WOL Panel lalu klik Cek pada VM ini."
+"""
+
+
+def new_vm_token(vm_id):
+    now = time.time()
+    for t, (_, exp) in list(VM_TOKENS.items()):
+        if exp < now:
+            VM_TOKENS.pop(t, None)
+    tok = secrets.token_urlsafe(24)
+    VM_TOKENS[tok] = (vm_id, now + AGENT_TOKEN_TTL)
+    return tok
 
 
 def new_agent_token(dev_id):
@@ -824,6 +1045,10 @@ a.tag{text-decoration:none}
 .search{margin:0 0 12px}.search input{margin:0}
 .group+.group{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
 .group-head{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
+pre.log{background:#0d1117;color:#d1d9e0;font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px;border-radius:9px;
+max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0}
+.joblog{margin:0}
+@media (max-width:520px){.vm .dev-acts{display:grid;grid-template-columns:1fr 1fr;gap:8px}.vm .dev-acts>*{flex:none}}
 .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}.inline label{margin:0;flex:1 1 200px}
 
 /* device card */
@@ -997,6 +1222,9 @@ LOG_LABELS = {
     "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
+    "tambah-vm": "Menambah VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
+    "vm-os-upgrade": "Update OS", "vm-os-upgrade-gagal": "Update OS gagal", "vm-app-update": "Update aplikasi",
+    "vm-app-update-gagal": "Update aplikasi gagal", "vm-reboot": "Reboot", "vm-reboot-gagal": "Reboot gagal",
 }
 
 
@@ -1035,6 +1263,7 @@ def shell(user, csrf, active, content, q, script=""):
     links = [("/", "Beranda")]
     if is_admin(user):
         links.append(("/apps", "Aplikasi"))
+        links.append(("/servers", "Server"))
         links.append(("/settings", "Pengaturan"))
     links.append(("/account", "Akun"))
     nav = "".join(f'<a href="{h}"{" aria-current=page" if h == active else ""}>{t}</a>' for h, t in links)
@@ -1093,7 +1322,9 @@ def log_list(n=8):
             continue
         ts, who, act, target, ip = r[:5]
         label = LOG_LABELS.get(act, act)
-        if act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen")) and ":" in target:
+        if act.startswith("vm-") and ":" in target:
+            label += " " + target.split(":", 1)[1]
+        elif act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen")) and ":" in target:
             did, info = target.split(":", 1)
             label += f" di {names.get(did, did)} — {info}"
         elif act in ("pindai", "aturan-aplikasi"):
@@ -1501,6 +1732,177 @@ if(q)q.addEventListener('input',filter);})();"""
     return shell(user, csrf, "/apps", body, q, js)
 
 
+def fmt_age(ts):
+    if not ts:
+        return "belum pernah"
+    return fmt_time(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)))
+
+
+def fmt_uptime(sec):
+    try:
+        s = int(sec)
+    except (TypeError, ValueError):
+        return ""
+    d, h = s // 86400, s % 86400 // 3600
+    return f"menyala {d} hari {h} jam" if d else f"menyala {h} jam {s % 3600 // 60} menit"
+
+
+SEC_TAG = ' <span class="tag bad">keamanan</span>'
+
+
+def servers_page(user, csrf, q):
+    vms = CFG.get("vms", [])
+    install_card = ""
+    vid, vtok = q.get("install", [""])[0], q.get("tok", [""])[0]
+    ivm = next((v for v in vms if v["id"] == vid), None)
+    if ivm and vtok in VM_TOKENS and VM_TOKENS[vtok][1] > time.time():
+        try:
+            panel = f"http://{local_ip_for(ivm['host'])}:{int(CFG.get('port', 8080))}"
+        except OSError:
+            panel = "http://IP-PANEL:8080"
+        cmd = f"curl -fsSL {panel}/vm/{vtok}.sh | bash"
+        install_card = f"""<section class="card" id="install" style="border-color:var(--acc)">
+<h2>Sambungkan {E(ivm['name'])} ke panel</h2>
+<ol class="steps"><li>Buka konsol VM <b>{E(ivm['name'])}</b> (Proxmox → VM → Console, atau SSH) dan masuk sebagai <b>root</b> (<span class="mono">sudo -i</span>).</li>
+<li>Salin perintah di bawah, tempel, lalu tekan Enter.</li>
+<li>Setelah muncul <b>Berhasil</b>, klik <b>Cek</b> pada VM ini.</li></ol>
+<div class="cmd"><input id="vmcmd" readonly value="{E(cmd)}" aria-label="Perintah pasang"><button class="btn" type="button" data-copy="vmcmd">{icon('copy')}Salin</button></div>
+<p class="mut small" style="margin:10px 0 12px">Perintah berlaku 15 menit. Panel hanya bisa menjalankan <span class="mono">wol-update</span> (cek, update OS, update aplikasi, reboot)
+di VM ini, hanya dari IP panel. Folder aplikasi dideteksi otomatis dari <span class="mono">/var/www/*/deploy/update.sh</span>
+dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
+<a class="btn sm" href="/servers">Selesai</a></section>"""
+
+    cards = []
+    for vm in vms:
+        st = VMSTATE.get(vm["id"]) or {}
+        d = st.get("data") or {}
+        job = VM_JOBS.get(vm["id"])
+        running = vm_job_running(vm["id"])
+        vid_e = E(vm["id"])
+        # status ringkas
+        tags = []
+        if st.get("error"):
+            tags.append(f'<span class="tag bad">{E(st["error"])}</span>')
+        if d:
+            up = int(d.get("upgradable") or 0)
+            sec = int(d.get("security") or 0)
+            if up:
+                tags.append(f'<span class="tag {"bad" if sec else "warn"}">{up} pembaruan OS' + (f" · {sec} keamanan" if sec else "") + "</span>")
+            else:
+                tags.append('<span class="tag ok">OS terbaru</span>')
+            if d.get("app"):
+                b = d.get("app_behind", "?")
+                if b not in ("0", "?"):
+                    tags.append(f'<span class="tag warn">{E(b)} commit baru</span>')
+                elif b == "0":
+                    tags.append('<span class="tag ok">Kode terbaru</span>')
+            if d.get("reboot") == "1":
+                tags.append('<span class="tag bad">Perlu reboot</span>')
+            if d.get("apt_error"):
+                tags.append(f'<span class="tag bad" title="{E(d["apt_error"])}">apt gagal</span>')
+            if d.get("app_error"):
+                tags.append(f'<span class="tag bad" title="{E(d["app_error"])}">git fetch gagal</span>')
+        meta = [E(vm["host"])]
+        if d.get("os"):
+            meta.append(E(d["os"]))
+        if d.get("uptime"):
+            meta.append(fmt_uptime(d["uptime"]))
+        if d.get("disk"):
+            meta.append(f"disk {E(d['disk'])}")
+        app_line = ""
+        if d.get("app"):
+            h = d.get("app_head") or {}
+            app_line = (f'<div class="mut small">Aplikasi <span class="mono">{E(d["app"])}</span> · {E(d.get("app_branch", ""))} @ '
+                        f'<span class="mono">{E(h.get("hash", "?"))}</span> {E(h.get("msg", ""))[:70]}</div>')
+        elif d:
+            app_line = '<div class="mut small">Tidak ada aplikasi dengan deploy/update.sh — hanya update OS.</div>'
+
+        # tombol
+        def act(action, label, cls, text, title):
+            dis = " disabled" if running else ""
+            return (f'<form method="post" action="/servers/run" {confirm(text, label, title)}>{hidden(csrf, id=vm["id"], action=action)}'
+                    f'<button class="btn sm {cls}"{dis}>{label}</button></form>')
+        btns = [f'<form method="post" action="/servers/check">{hidden(csrf, id=vm["id"])}'
+                f'<button class="btn sm" data-busy="Mengecek…"{" disabled" if running else ""}>Cek</button></form>']
+        if d:
+            up = int(d.get("upgradable") or 0)
+            btns.append(act("os-upgrade", "Update OS", "primary" if up else "",
+                            f"apt-get upgrade akan dijalankan di {vm['name']}" + (f" ({up} paket)." if up else ".") +
+                            " Layanan yang paketnya diperbarui bisa restart sebentar.", f"Update OS {vm['name']}?"))
+            if d.get("app") and d.get("app_script") == "1":
+                b = d.get("app_behind", "?")
+                btns.append(act("app-update", "Update aplikasi", "primary" if b not in ("0", "?") else "",
+                                f"deploy/update.sh akan dijalankan: backup database, mode pemeliharaan, git pull, composer, migrasi, "
+                                f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit.", f"Update aplikasi di {vm['name']}?"))
+            btns.append(act("reboot", "Reboot", "danger" if d.get("reboot") == "1" else "quiet",
+                            f"{vm['name']} akan restart 1 menit lagi. Aplikasi di VM ini tidak bisa diakses selama restart.", f"Reboot {vm['name']}?"))
+        btns.append(f'<form method="post" action="/servers/install">{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Pasang ulang</button></form>')
+        btns.append(del_form("/servers/delete", csrf, f"{vm['name']} dihapus dari panel. Akses SSH panel di VM tetap ada sampai dihapus dari /root/.ssh/authorized_keys.",
+                             f"Hapus {vm['name']}?", id=vm["id"]))
+
+        # detail paket & commit
+        detail = ""
+        if d.get("pkgs") or d.get("commits"):
+            pk = "".join(f'<div class="row"><div class="row-main"><b class="mono">{E(p["name"])}</b>'
+                         f'{SEC_TAG if p["sec"] else ""}'
+                         f'<div class="mut small mono">{E(p["from"])} → {E(p["to"])}</div></div></div>' for p in d.get("pkgs", [])[:100])
+            cm = "".join(f'<div class="row"><div class="row-main"><span class="mono">{E(c["hash"])}</span> {E(c["msg"])}'
+                         f'<div class="mut small">{E(fmt_age(c["time"]))}</div></div></div>' for c in d.get("commits", []))
+            more = f'<p class="mut small">dan {len(d["pkgs"]) - 100} paket lainnya.</p>' if len(d.get("pkgs", [])) > 100 else ""
+            detail = (f'<details class="more" style="margin:0"><summary>Rincian pembaruan</summary>'
+                      + (f'<h3 style="margin:0 0 6px">Commit baru</h3><div class="list" style="margin-bottom:14px">{cm}</div>' if cm else "")
+                      + (f'<h3 style="margin:0 0 6px">Paket OS</h3><div class="list">{pk}</div>{more}' if pk else "")
+                      + '</details>')
+        # status / log pekerjaan
+        lj = st.get("last_job")
+        jobline = ""
+        if lj and not running:
+            ok = lj.get("rc") == 0
+            jobline = (f'<div class="small" style="color:var({"--ok" if ok else "--err"})">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} '
+                       f'{"berhasil" if ok else "gagal"} · {E(fmt_age(lj.get("end")))} oleh {E(lj.get("by", ""))} · '
+                       f'<a href="#" data-log="{vid_e}">lihat log</a></div>')
+        logbox = (f'<div class="joblog" id="job-{vid_e}" data-vm="{vid_e}" data-running="{"1" if running else "0"}"'
+                  f'{"" if running else " hidden"}><div class="small" style="margin-bottom:6px"><b class="jobtitle">'
+                  f'{E(VM_ACTIONS.get(job["action"], "") if job else "")}</b> <span class="mut jobstate">{"sedang berjalan…" if running else ""}</span></div>'
+                  f'<pre class="log"></pre></div>')
+        cards.append(f"""<article class="card dev vm" id="vm-{vid_e}">
+<div class="dev-head"><div><h2>{E(vm['name'])}</h2><div class="meta">{' · '.join(meta)}</div>{app_line}
+<div class="mut small">Dicek {E(fmt_age(st.get('checked')))}</div></div></div>
+<div class="acts">{''.join(tags) or '<span class="tag">Belum dicek</span>'}</div>
+{jobline}{logbox}{detail}
+<div class="dev-acts">{''.join(btns)}</div></article>""")
+
+    if not cards:
+        cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada VM</h3>'
+                     '<p class="small" style="margin:0">Tambahkan VM aplikasi (Pusat, Absensi, BK, …) di bawah.</p></div>')
+    add = f"""<details class="card" id="form-vm" style="padding:0"{" open" if not vms or q.get("f_name") else ""}>
+<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah VM</summary>
+<form method="post" action="/servers/add" style="padding:0 16px 16px">{hidden(csrf)}
+<div class="grid"><label>Nama<input name="name" required maxlength="60" placeholder="mis. VM Absensi" value="{E(q.get('f_name', [''])[0])}"></label>
+<label>IP / host<input name="host" required maxlength="100" placeholder="mis. 192.168.10.21" spellcheck="false" value="{E(q.get('f_host', [''])[0])}"></label>
+<label>Port SSH<input name="port" type="number" min="1" max="65535" value="{E(q.get('f_port', ['22'])[0])}"></label></div>
+<button class="btn primary" data-busy="Menyimpan…">Tambah VM</button></form></details>"""
+    interval = f"""<form method="post" action="/servers/interval" class="inline" style="margin-top:4px">{hidden(csrf)}
+<label style="flex:0 1 260px">Cek otomatis setiap (jam)<input name="hours" type="number" min="0" max="168" value="{E(str(CFG.get('vm_check_hours', 6)))}">
+<span class="hint">0 = hanya saat tombol Cek diklik. Update tetap dijalankan manual.</span></label><button class="btn" style="margin-bottom:23px">Simpan</button></form>"""
+    head = (f'<div class="sec-head"><h2>Server / VM</h2><form method="post" action="/servers/check">{hidden(csrf, id="semua")}'
+            f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
+    js = """(function(){
+function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.querySelector('.jobstate');
+ fetch('/api/vmjob?id='+encodeURIComponent(id),{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
+  var atBottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-20;pre.textContent=j.log||'';if(atBottom)pre.scrollTop=pre.scrollHeight;
+  if(j.title)box.querySelector('.jobtitle').textContent=j.title;
+  if(j.running){state.textContent='sedang berjalan…';setTimeout(function(){poll(box)},2000)}
+  else if(box.dataset.running==='1'){state.textContent=j.rc===0?'selesai':'gagal (kode '+j.rc+')';setTimeout(function(){location.reload()},2500)}
+ }).catch(function(){setTimeout(function(){poll(box)},4000)})}
+document.querySelectorAll('.joblog[data-running="1"]').forEach(poll);
+document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e){e.preventDefault();
+ var b=document.getElementById('job-'+a.dataset.log);b.hidden=!b.hidden;if(!b.hidden)poll(b)}});
+})();"""
+    body = install_card + head + "".join(cards) + add + f'<div class="card">{interval}</div>'
+    return shell(user, csrf, "/servers", body, q, js)
+
+
 def account_page(user, csrf, q):
     body = f"""<div class="sec-head"><h2>Akun</h2></div><section class="card"><h2>Ganti password</h2>
 <form method="post" action="/account">{hidden(csrf)}
@@ -1577,6 +1979,15 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/login":
             return self._send(200, login_page())
+        m = re.fullmatch(r"/vm/([A-Za-z0-9_-]{20,64})\.sh", url.path)
+        if m:  # skrip pasang akses update untuk VM (token sementara)
+            ent = VM_TOKENS.get(m.group(1))
+            vm = ent and ent[1] > time.time() and next((v for v in CFG["vms"] if v["id"] == ent[0]), None)
+            if not vm:
+                return self._send(200, "echo 'Perintah sudah kedaluwarsa. Buat ulang dari WOL Panel: Server -> Pasang ulang.'; exit 1\n",
+                                  "text/plain; charset=utf-8")
+            write_log("-", "unduh-vm", vm["id"], self.client_ip())
+            return self._send(200, vm_install_script(vm), "text/plain; charset=utf-8")
         m = re.fullmatch(r"/agent/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
         if m:  # unduh pemasang agen memakai token sementara (tanpa login, diambil dari komputer tujuan)
             ent = AGENT_TOKENS.get(m.group(1))
@@ -1607,6 +2018,22 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin(user):
                 return self.redirect("/")
             return self._send(200, apps_page(user, csrf, q))
+        if url.path == "/servers":
+            if not is_admin(user):
+                return self.redirect("/")
+            return self._send(200, servers_page(user, csrf, q))
+        if url.path == "/api/vmjob":
+            if not is_admin(user):
+                return self._send(403, "{}", "application/json")
+            vid = q.get("id", [""])[0]
+            job = VM_JOBS.get(vid) or (VMSTATE.get(vid) or {}).get("last_job") or {}
+            try:
+                with open(vm_log_path(vid), encoding="utf-8", errors="replace") as f:
+                    log = f.read()[-60000:]
+            except (OSError, ValueError):
+                log = ""
+            return self._send(200, json.dumps({"running": vm_job_running(vid), "rc": job.get("rc"),
+                                               "title": VM_ACTIONS.get(job.get("action"), ""), "log": log}), "application/json")
         self._send(404, page("Tidak ditemukan", '<p>Halaman tidak ditemukan. <a href="/">Kembali</a></p>'))
 
     # ---------------- POST
@@ -1645,6 +2072,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.back("/settings", diagnose(dev))
         if path == "/apps/scan":
             return self.do_apps_scan(form, user, ip)
+        if path == "/servers/check":
+            return self.do_vm_check(form, user, ip)
+        if path == "/servers/run":
+            return self.do_vm_run(form, user, ip)
         if path == "/devices/agent-update":
             dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
             if not dev or not dev.get("agent_secret"):
@@ -1662,6 +2093,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/apps/dismiss":
             return self.do_apps_dismiss(form, user, ip)
         with CFG_LOCK:
+            if path == "/servers/add":
+                return self.do_vm_add(form, user, ip)
+            if path == "/servers/delete":
+                return self.do_vm_delete(form, user, ip)
+            if path == "/servers/install":
+                return self.do_vm_install(form, user, ip)
+            if path == "/servers/interval":
+                return self.do_vm_interval(form, user, ip)
             if path == "/apps/rules/add":
                 return self.do_rule_add(form, user, ip)
             if path == "/apps/rules/toggle":
@@ -1730,6 +2169,96 @@ class Handler(BaseHTTPRequestHandler):
         WAKE_COOLDOWN[key] = time.time()
         write_log(user, "matikan", dev["id"], ip)
         return self.back("/", f"{dev['name']} akan mati dalam {SHUTDOWN_DELAY} detik.", stopping=dev["id"])
+
+    # ---------------- server / VM
+    def do_vm_add(self, form, user, ip):
+        name, host = form.get("name", "").strip(), form.get("host", "").strip()
+        keep = {"f_name": name, "f_host": host, "f_port": form.get("port", "22")}
+        try:
+            port = int(form.get("port") or 22)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            return self.back("/servers", "Port SSH harus angka 1–65535.", True, **keep)
+        if not name or len(name) > 60 or not re.fullmatch(r"[A-Za-z0-9.-]{1,100}", host):
+            return self.back("/servers", "Isi nama dan IP/host VM yang valid.", True, **keep)
+        vid = slugify(name)
+        base, i = vid, 2
+        while any(v["id"] == vid for v in CFG["vms"]):
+            vid, i = f"{base}-{i}", i + 1
+        CFG["vms"].append({"id": vid, "name": name, "host": host, "port": port, "user": "root"})
+        save_config(CFG)
+        write_log(user, "tambah-vm", vid, ip)
+        self.redirect("/servers?" + urlencode({"install": vid, "tok": new_vm_token(vid)}) + "#install")
+
+    def do_vm_install(self, form, user, ip):
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        if not vm:
+            return self.back("/servers", "VM tidak ditemukan.", True)
+        if not os.path.exists(VM_TEMPLATE):
+            return self.back("/servers", "File vm-update.sh tidak ada di server — jalankan ulang install.sh.", True)
+        try:
+            ensure_ssh_key()
+        except Exception as e:
+            return self.back("/servers", f"Gagal membuat kunci SSH panel: {e}. Pastikan openssh-client terpasang (jalankan ulang install.sh).", True)
+        self.redirect("/servers?" + urlencode({"install": vm["id"], "tok": new_vm_token(vm["id"])}) + "#install")
+
+    def do_vm_delete(self, form, user, ip):
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        if not vm:
+            return self.back("/servers", "VM tidak ditemukan.", True)
+        if vm_job_running(vm["id"]):
+            return self.back("/servers", "Tunggu proses di VM ini selesai dulu.", True)
+        CFG["vms"] = [v for v in CFG["vms"] if v["id"] != vm["id"]]
+        save_config(CFG)
+        with VM_LOCK:
+            VMSTATE.pop(vm["id"], None)
+            save_vmstate()
+        write_log(user, "hapus-vm", vm["id"], ip)
+        return self.back("/servers", f"{vm['name']} dihapus dari panel.")
+
+    def do_vm_interval(self, form, user, ip):
+        try:
+            h = float(form.get("hours") or 0)
+            if not 0 <= h <= 168:
+                raise ValueError
+        except ValueError:
+            return self.back("/servers", "Isi 0–168 jam.", True)
+        CFG["vm_check_hours"] = int(h) if h == int(h) else h
+        save_config(CFG)
+        return self.back("/servers", "Cek otomatis dimatikan." if h == 0 else f"VM dicek otomatis setiap {CFG['vm_check_hours']} jam.")
+
+    def do_vm_check(self, form, user, ip):
+        if form.get("id") == "semua":
+            threading.Thread(target=check_all_vms, kwargs={"only_due": False}, daemon=True).start()
+            return self.back("/servers", "Pengecekan semua VM berjalan di latar belakang. Muat ulang halaman ini dalam 1 menit.")
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        if not vm:
+            return self.back("/servers", "VM tidak ditemukan.", True)
+        if vm_job_running(vm["id"]):
+            return self.back("/servers", "Sedang ada proses di VM ini.", True)
+        try:
+            ensure_ssh_key()
+        except Exception as e:
+            return self.back("/servers", f"Gagal membuat kunci SSH panel: {e}", True)
+        err = vm_check(vm, user)
+        if err:
+            return self.back("/servers", f"{vm['name']}: {err}", True)
+        d = VMSTATE[vm["id"]].get("data", {})
+        parts = [f"{d.get('upgradable', 0)} pembaruan OS"]
+        if d.get("app"):
+            parts.append(f"{d.get('app_behind', '?')} commit baru")
+        return self.back("/servers", f"{vm['name']} dicek: " + ", ".join(parts) + ".")
+
+    def do_vm_run(self, form, user, ip):
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        action = form.get("action", "")
+        if not vm or action not in ("os-upgrade", "app-update", "reboot"):
+            return self.back("/servers", "Permintaan tidak valid.", True)
+        if vm_job_running(vm["id"]):
+            return self.back("/servers", "Sedang ada proses di VM ini.", True)
+        run_vm_job(vm, action, user)
+        return self.redirect(f"/servers#vm-{quote(vm['id'])}")
 
     # ---------------- aplikasi
     def apps_back(self, form, msg, err=False):
@@ -2042,6 +2571,7 @@ def main():
         addr = (CFG.get("listen", "0.0.0.0"), int(CFG.get("port", 8080)))
         print(f"WOL Panel berjalan di http://{addr[0]}:{addr[1]}")
         load_scans()
+        load_vmstate()
         threading.Thread(target=scanner_loop, daemon=True).start()
         ThreadingHTTPServer(addr, Handler).serve_forever()
         return

@@ -3,4 +3,8 @@ config.json
 config.json.tmp
 scan.json
 scan.json.tmp
+ssh/
+vm.json
+vm.json.tmp
+vmlogs/
 wol.log

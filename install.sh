@@ -6,7 +6,7 @@ DIR=/opt/wol-panel
 WOL_TZ=${WOL_TZ:-Asia/Jakarta}
 [ "$(id -u)" = 0 ] || { echo "Jalankan sebagai root: sudo bash install.sh"; exit 1; }
 
-apt-get update -qq && apt-get install -y -qq python3 iputils-ping iputils-arping tzdata >/dev/null
+apt-get update -qq && apt-get install -y -qq python3 iputils-ping iputils-arping tzdata openssh-client >/dev/null
 
 # Zona waktu agar jam di Riwayat sesuai (container baru biasanya masih UTC)
 if [ -f "/usr/share/zoneinfo/$WOL_TZ" ] && [ "$(readlink -f /etc/localtime)" != "/usr/share/zoneinfo/$WOL_TZ" ]; then
@@ -19,6 +19,7 @@ id wolpanel >/dev/null 2>&1 || useradd --system --home "$DIR" --shell /usr/sbin/
 mkdir -p "$DIR"
 install -m 755 "$(dirname "$0")/wol.py" "$DIR/wol.py"
 install -m 644 "$(dirname "$0")/windows-agent.ps1" "$DIR/windows-agent.ps1"
+install -m 644 "$(dirname "$0")/vm-update.sh" "$DIR/vm-update.sh"
 
 if [ ! -f "$DIR/config.json" ]; then
   echo "== Buat akun admin WOL Panel =="

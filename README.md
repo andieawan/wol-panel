@@ -156,6 +156,39 @@ Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge, Chrome Remote 
 > Agen yang dipasang sebelum fitur ini ada perlu dipasang ulang: **Pengaturan → Agen**, lalu jalankan
 > perintahnya lagi di komputer tersebut. Panel memberi tanda *Agen versi lama* bila belum.
 
+### Update VM aplikasi (menu Server)
+
+Menu **Server** dipakai untuk memperbarui VM aplikasi (Pusat, Absensi, BK, TU, PKL, Website, Jurnal). Ada dua jenis update:
+- **Update OS**: `apt-get upgrade`.
+- **Update aplikasi**: menjalankan `deploy/update.sh` milik aplikasi itu, yang berisi backup database, mode pemeliharaan,
+  `git pull`, `composer`, `migrate --force`, cache, dan reload PHP-FPM.
+
+Cara menyambungkan VM:
+1. **Server → Tambah VM**: isi nama dan IP VM. Panel menampilkan satu perintah.
+2. Di konsol VM (Proxmox → Console), masuk sebagai root, tempel perintah itu, lalu Enter.
+3. Klik **Cek** pada VM tersebut.
+
+Panel mengecek otomatis setiap 6 jam (bisa diubah). Yang ditampilkan:
+- jumlah paket OS yang bisa di-update, termasuk berapa yang update keamanan,
+- commit baru di repo aplikasi,
+- apakah VM perlu reboot.
+
+Update **tidak pernah berjalan sendiri**; Anda yang klik tombolnya, lalu log prosesnya tampil langsung di panel.
+
+Keamanan:
+- Di VM dipasang `/usr/local/sbin/wol-update`.
+- Kunci SSH panel di `/root/.ssh/authorized_keys` dikunci dengan `restrict`, `from="IP panel"`, dan
+  `command="/usr/local/sbin/wol-update"`. Panel hanya bisa menjalankan `check`, `os-upgrade`, `app-update`, dan
+  `reboot`, tanpa shell bebas.
+- Folder aplikasi dideteksi dari `/var/www/*/deploy/update.sh` dan bisa diubah di `/etc/wol-update.conf`.
+
+Mencabut akses panel dari sebuah VM:
+
+```bash
+sed -i '/wol-panel-update$/d' /root/.ssh/authorized_keys
+rm -f /usr/local/sbin/wol-update /etc/wol-update.conf
+```
+
 ## 4. Akses dari luar sekolah
 
 Pilih salah satu:
