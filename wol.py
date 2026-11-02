@@ -1424,7 +1424,7 @@ LOG_LABELS = {
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
     "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
-    "terminal-gagal": "Password terminal salah", "terminal-buka-kunci": "Membuka kunci terminal",
+    "terminal-gagal": "Gagal membuka kunci terminal", "terminal-buka-kunci": "Membuka kunci terminal",
     "tambah-vm": "Menambah VM", "ubah-vm": "Mengubah data VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
     "vm-os-upgrade": "Update OS", "vm-os-upgrade-gagal": "Update OS gagal", "vm-app-update": "Update aplikasi",
     "vm-app-update-gagal": "Update aplikasi gagal", "vm-reboot": "Reboot", "vm-reboot-gagal": "Reboot gagal",
@@ -2214,10 +2214,11 @@ def terminal_page(user, csrf, q, lan_ok, unlocked, panel_url=""):
                 '<a class="btn primary" href="/servers">Buka Server</a></div>')
         return shell(user, csrf, "/terminal", body, q)
     if not unlocked:
-        body = head + f"""<section class="card" style="max-width:420px"><h2>Konfirmasi password</h2>
-<p class="mut small" style="margin:0 0 12px">Terminal memberi akses root ke VM. Ketik ulang password akun <b>{E(user)}</b> untuk membukanya selama 30 menit.</p>
-<form method="post" action="/terminal/unlock">{hidden(csrf)}<input type="text" name="username" value="{E(user)}" autocomplete="username" hidden>
-<label>Password<input name="p" type="password" required autofocus autocomplete="current-password"></label>
+        body = head + f"""<section class="card" style="max-width:420px"><h2>Konfirmasi akun</h2>
+<p class="mut small" style="margin:0 0 12px">Terminal memberi akses root ke VM. Ketik ulang nama pengguna dan password akun yang sedang Anda pakai untuk membukanya selama 30 menit.</p>
+<form method="post" action="/terminal/unlock">{hidden(csrf)}
+<label>Nama pengguna<input name="u" required autofocus autocomplete="username" autocapitalize="none" spellcheck="false"></label>
+<label>Password<input name="p" type="password" required autocomplete="current-password"></label>
 <button class="btn primary" data-busy="Memeriksa…">Buka terminal</button></form></section>"""
         return shell(user, csrf, "/terminal", body, q)
     pre = q.get("vm", [""])[0]
@@ -2443,11 +2444,13 @@ class Handler(BaseHTTPRequestHandler):
             FAILS[ip] = recent
             if len(recent) >= FAIL_LIMIT:
                 return self.back("/terminal", "Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi.", True)
-            if not check_password(form.get("p", ""), CFG["users"][user]["hash"]):
+            # harus akun yang sedang login: nama dan password diketik ulang
+            name_ok = hmac.compare_digest(form.get("u", "").strip(), user)
+            if not (check_password(form.get("p", ""), CFG["users"][user]["hash"]) and name_ok):
                 FAILS[ip].append(now)
                 write_log(user, "terminal-gagal", "-", ip)
                 time.sleep(1)
-                return self.back("/terminal", "Password salah.", True)
+                return self.back("/terminal", "Nama pengguna atau password salah.", True)
             TERM_UNLOCK[tok_hash(tok)] = now + TERM_UNLOCK_TTL
             write_log(user, "terminal-buka-kunci", "-", ip)
             return self.redirect("/terminal")

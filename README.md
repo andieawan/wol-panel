@@ -213,7 +213,7 @@ terminal dibatasi ketat:
 - **Hanya admin.**
 - **Hanya dari jaringan sekolah.** Terminal ditolak bila panel dibuka lewat NPMplus/internet; buka panel langsung
   di `http://IP-container:8080`.
-- **Wajib mengetik ulang password** setiap 30 menit.
+- **Wajib mengetik ulang nama pengguna dan password** akun yang sedang login, setiap 30 menit.
 - **Izin per VM.** Di **Server**, klik **Izinkan terminal**, lalu jalankan perintah pasang yang muncul di VM itu.
   Kunci terminal terpisah dari kunci update dan hanya diterima dari IP panel.
 - **Semua tampilan sesi direkam** di `/opt/wol-panel/vmlogs/terminal/`.
