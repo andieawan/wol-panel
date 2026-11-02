@@ -793,8 +793,25 @@ def run_vm_job(vm, action, user):
             save_vmstate()
         if action != "reboot":
             vm_check(vm, user)
+        elif rc == 0:
+            wait_vm_back(vm)
 
     threading.Thread(target=work, daemon=True).start()
+
+
+def wait_vm_back(vm):
+    """Setelah reboot: tandai 'sedang restart', lalu cek berkala sampai VM bisa dijangkau lagi (maks. 10 menit)."""
+    with VM_LOCK:
+        VMSTATE.setdefault(vm["id"], {})["rebooting"] = int(time.time())
+        save_vmstate()
+    time.sleep(20)
+    for _ in range(20):
+        if vm_check(vm, "otomatis") is None:
+            break
+        time.sleep(30)
+    with VM_LOCK:
+        VMSTATE.setdefault(vm["id"], {}).pop("rebooting", None)
+        save_vmstate()
 
 
 def check_all_vms(only_due=True):
@@ -2012,7 +2029,9 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                     tags.append(f'<span class="tag warn">{E(b)} commit baru</span>')
                 elif b == "0":
                     tags.append('<span class="tag ok">Kode terbaru</span>')
-            if d.get("reboot") == "1":
+            if time.time() - st.get("rebooting", 0) < 900:
+                tags.insert(0, '<span class="pill wait"><span class="dot"></span><span>Sedang restart… menunggu VM kembali</span></span>')
+            elif d.get("reboot") == "1":
                 tags.append('<span class="tag bad">Perlu reboot</span>')
             if d.get("apt_error"):
                 tags.append(f'<span class="tag bad" title="{E(d["apt_error"])}">apt gagal</span>')
@@ -2131,6 +2150,7 @@ function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.
   else if(box.dataset.running==='1'){state.textContent=j.rc===0?'selesai':'gagal (kode '+j.rc+')';setTimeout(function(){location.reload()},2500)}
  }).catch(function(){setTimeout(function(){poll(box)},4000)})}
 document.querySelectorAll('.joblog[data-running="1"]').forEach(poll);
+if(document.querySelector('.vm .pill.wait'))setTimeout(function(){if(!document.querySelector('details.menu[open],dialog[open]'))location.reload()},15000);
 document.addEventListener('click',function(e){document.querySelectorAll('details.menu[open]').forEach(function(m){if(!m.contains(e.target))m.open=false})});
 document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e){e.preventDefault();
  var b=document.getElementById('job-'+a.dataset.log);b.hidden=!b.hidden;if(!b.hidden)poll(b)}});

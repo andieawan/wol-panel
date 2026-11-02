@@ -10,7 +10,7 @@
 #   reboot       restart VM dalam 1 menit
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=1
+WOL_UPDATE_VERSION=2
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -90,7 +90,14 @@ case "$CMD" in
     fi
     cd "$APP_DIR" && bash deploy/update.sh </dev/null ;;
   reboot)
-    echo "VM akan di-restart dalam 1 menit."; shutdown -r +1 "Restart dari WOL Panel" >/dev/null 2>&1 || reboot ;;
+    # ditunda 3 detik agar sesi SSH panel selesai rapi; berjalan di VM maupun container LXC
+    if systemd-run --quiet --on-active=3 --unit="wol-reboot-$(date +%s)" systemctl reboot; then
+      echo "VM restart dalam 3 detik."
+    else
+      echo "systemd-run gagal, memakai cara cadangan."
+      nohup setsid sh -c 'sleep 3; systemctl reboot || reboot' >/dev/null 2>&1 &
+      echo "VM restart dalam 3 detik."
+    fi ;;
   *)
     echo "error=Perintah tidak dikenal: $CMD"; exit 64 ;;
 esac
