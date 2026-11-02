@@ -1231,6 +1231,10 @@ a.tag{text-decoration:none}
 pre.log{background:#0d1117;color:#d1d9e0;font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px;border-radius:9px;
 max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0}
 .joblog{margin:0}
+details.menu{position:relative}details.menu summary{list-style:none}details.menu summary::-webkit-details-marker{display:none}
+.menu-pop{position:absolute;right:0;top:calc(100% + 4px);z-index:5;min-width:190px;background:var(--card);border:1px solid var(--line);
+border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;display:grid;gap:2px}
+.menu-pop form{margin:0}.menu-pop .btn{width:100%;justify-content:flex-start}
 @media (max-width:520px){.vm .dev-acts{display:grid;grid-template-columns:1fr 1fr;gap:8px}.vm .dev-acts>*{flex:none}}
 .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}.inline label{margin:0;flex:1 1 200px}
 
@@ -1942,6 +1946,26 @@ def fmt_uptime(sec):
 SEC_TAG = ' <span class="tag bad">keamanan</span>'
 
 
+def job_failure(vm_id, app_dir=""):
+    """Baris error pertama di log pekerjaan VM (+ baris lanjutannya) dan saran bila penyebabnya dikenali."""
+    try:
+        with open(vm_log_path(vm_id), encoding="utf-8", errors="replace") as f:
+            lines = f.read()[-60000:].splitlines()
+    except OSError:
+        return "", ""
+    for i, line in enumerate(lines):
+        if re.match(r"\s*(error|fatal|E)\s*:", line, re.I):
+            follow = [l.strip() for l in lines[i + 1:i + 4] if l.startswith(("\t", "  "))]
+            reason = " ".join([line.strip()] + follow)
+            hint = ""
+            if "would be overwritten by merge" in line:
+                hint = (f"File lokal di VM bentrok dengan versi baru di repo. Singkirkan dulu lewat Terminal: "
+                        f"cd {app_dir or '/var/www/APLIKASI'} && mv {' '.join(follow) or 'NAMA_FILE'} /root/ "
+                        f"— lalu klik Update aplikasi lagi.")
+            return reason[:300], hint
+    return "", ""
+
+
 def servers_page(user, csrf, q):
     vms = CFG.get("vms", [])
     install_card = ""
@@ -2026,19 +2050,23 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                 btns.append(act("app-update", "Update aplikasi", "primary" if b not in ("0", "?") else "",
                                 f"deploy/update.sh akan dijalankan: backup database, mode pemeliharaan, git pull, composer, migrasi, "
                                 f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit.", f"Update aplikasi di {vm['name']}?"))
-            btns.append(act("reboot", "Reboot", "danger" if d.get("reboot") == "1" else "quiet",
-                            f"{vm['name']} akan restart 1 menit lagi. Aplikasi di VM ini tidak bisa diakses selama restart.", f"Reboot {vm['name']}?"))
+        more_btns = []
+        if d:
+            (btns if d.get("reboot") == "1" else more_btns).append(
+                act("reboot", "Reboot", "danger" if d.get("reboot") == "1" else "quiet",
+                    f"{vm['name']} akan restart 1 menit lagi. Aplikasi di VM ini tidak bisa diakses selama restart.", f"Reboot {vm['name']}?"))
         if vm.get("terminal"):
             btns.insert(1, f'<a class="btn sm" href="/terminal?vm={quote(vm["id"])}">Terminal</a>')
-            btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel tidak lagi bisa membuka terminal ke " + vm["name"] + ". Jalankan perintah pasang yang muncul di VM itu untuk mencabut kunci terminalnya.", "Cabut", "Cabut izin terminal?")}>'
+            more_btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel tidak lagi bisa membuka terminal ke " + vm["name"] + ". Jalankan perintah pasang yang muncul di VM itu untuk mencabut kunci terminalnya.", "Cabut", "Cabut izin terminal?")}>'
                         f'{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Cabut terminal</button></form>')
         else:
-            btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel akan bisa membuka shell root ke " + vm["name"] + " dari jaringan sekolah. Setelah ini jalankan perintah pasang yang muncul di VM itu.", "Izinkan", "Izinkan terminal?")}>'
+            more_btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel akan bisa membuka shell root ke " + vm["name"] + " dari jaringan sekolah. Setelah ini jalankan perintah pasang yang muncul di VM itu.", "Izinkan", "Izinkan terminal?")}>'
                         f'{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Izinkan terminal</button></form>')
-        btns.append(f'<form method="post" action="/servers/install">{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Pasang ulang</button></form>')
-        btns.append(f'<a class="btn sm quiet" href="/servers?edit={quote(vm["id"])}#form-vm">Ubah</a>')
-        btns.append(del_form("/servers/delete", csrf, f"{vm['name']} dihapus dari panel. Akses SSH panel di VM tetap ada sampai dihapus dari /root/.ssh/authorized_keys.",
-                             f"Hapus {vm['name']}?", id=vm["id"]))
+        more_btns.append(f'<form method="post" action="/servers/install">{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Pasang ulang</button></form>')
+        more_btns.append(f'<a class="btn sm quiet" href="/servers?edit={quote(vm["id"])}#form-vm">Ubah</a>')
+        more_btns.append(del_form("/servers/delete", csrf, f"{vm['name']} dihapus dari panel. Akses SSH panel di VM tetap ada sampai dihapus dari /root/.ssh/authorized_keys.",
+                                  f"Hapus {vm['name']}?", id=vm["id"]))
+        btns.append(f'<details class="menu push"><summary class="btn sm quiet">Lainnya ▾</summary><div class="menu-pop">{"".join(more_btns)}</div></details>')
 
         # detail paket & commit
         detail = ""
@@ -2061,6 +2089,10 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
             jobline = (f'<div class="small" style="color:var({"--ok" if ok else "--err"})">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} '
                        f'{"berhasil" if ok else "gagal"} · {E(fmt_age(lj.get("end")))} oleh {E(lj.get("by", ""))} · '
                        f'<a href="#" data-log="{vid_e}">lihat log</a></div>')
+            reason, hint = ("", "") if ok else job_failure(vm["id"], d.get("app", ""))
+            if reason:
+                jobline += (f'<div class="flash err" style="margin:8px 0 0">{icon("alert")}<div><span class="mono small">{E(reason)}</span>'
+                            + (f'<div class="small" style="margin-top:4px;color:var(--fg)">{E(hint)}</div>' if hint else "") + '</div></div>')
         logbox = (f'<div class="joblog" id="job-{vid_e}" data-vm="{vid_e}" data-running="{"1" if running else "0"}"'
                   f'{"" if running else " hidden"}><div class="small" style="margin-bottom:6px"><b class="jobtitle">'
                   f'{E(VM_ACTIONS.get(job["action"], "") if job else "")}</b> <span class="mut jobstate">{"sedang berjalan…" if running else ""}</span></div>'
@@ -2099,6 +2131,7 @@ function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.
   else if(box.dataset.running==='1'){state.textContent=j.rc===0?'selesai':'gagal (kode '+j.rc+')';setTimeout(function(){location.reload()},2500)}
  }).catch(function(){setTimeout(function(){poll(box)},4000)})}
 document.querySelectorAll('.joblog[data-running="1"]').forEach(poll);
+document.addEventListener('click',function(e){document.querySelectorAll('details.menu[open]').forEach(function(m){if(!m.contains(e.target))m.open=false})});
 document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e){e.preventDefault();
  var b=document.getElementById('job-'+a.dataset.log);b.hidden=!b.hidden;if(!b.hidden)poll(b)}});
 })();"""
