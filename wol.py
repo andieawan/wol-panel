@@ -796,6 +796,20 @@ def run_vm_job(vm, action, user):
     threading.Thread(target=work, daemon=True).start()
 
 
+def vm_term_user(vm):
+    """Tanya user terminal ke VM lewat 'wol-update status' dan simpan; None bila VM belum versi 4+."""
+    try:
+        r = subprocess.run(ssh_cmd(vm, "status"), capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return None
+    tu = parse_kv(r.stdout).get("term_user") if r.returncode == 0 else None
+    if tu:
+        with VM_LOCK:
+            VMSTATE.setdefault(vm["id"], {}).setdefault("data", {})["term_user"] = tu
+            save_vmstate()
+    return tu or None
+
+
 def wait_vm_back(vm):
     """Setelah reboot: tandai 'sedang restart', lalu cek berkala sampai VM bisa dijangkau lagi (maks. 10 menit)."""
     with VM_LOCK:
@@ -2708,9 +2722,11 @@ class Handler(BaseHTTPRequestHandler):
             if not vm:
                 return self._send(200, json.dumps({"error": "VM ini belum diizinkan terminal."}), "application/json")
             tu = ((VMSTATE.get(vm["id"]) or {}).get("data") or {}).get("term_user")
+            if not tu:  # tanyakan langsung ke VM (cepat), tanpa harus klik Cek dulu
+                tu = vm_term_user(vm)
             if not tu:
-                return self._send(200, json.dumps({"error": "User terminal VM ini belum diketahui. Di menu Server: Lainnya → Pasang ulang, "
-                                                             "jalankan perintahnya di VM (lewat sudo -i dari user Anda), lalu klik Cek."}), "application/json")
+                return self._send(200, json.dumps({"error": "VM ini belum memakai versi terbaru. Di menu Server: Lainnya → Pasang ulang, "
+                                                             "lalu jalankan perintahnya di VM lewat sudo -i dari user Anda (mis. andi)."}), "application/json")
             vm = {**vm, "user": tu}  # masuk sebagai user biasa di VM, bukan root
             try:
                 ensure_term_key()
