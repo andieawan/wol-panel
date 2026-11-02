@@ -1033,6 +1033,12 @@ if [ "$(sshd -T -C user=root,host=x,addr=203.0.113.1 2>/dev/null | awk '/^permit
   printf '\\n# >>> WOL Panel (dikelola otomatis)\\nMatch Address %s\\n    PermitRootLogin %s\\n# <<< WOL Panel\\n' "$PANEL_IP" "$MODE" >> /etc/ssh/sshd_config
   echo "    sshd_config: root dari $PANEL_IP diizinkan ($MODE)"
 fi
+# OpenSSH 9.8+: IP panel jangan diblokir sementara (PerSourcePenalties) karena percobaan yang gagal
+if sshd -T 2>/dev/null | grep -qi '^persourcepenalties'; then
+  mkdir -p /etc/ssh/sshd_config.d
+  printf '# WOL Panel: IP panel tidak diblokir sementara oleh PerSourcePenalties\\nPerSourcePenaltyExemptList %s\\n' "$PANEL_IP" > /etc/ssh/sshd_config.d/wol-panel.conf
+  echo "    sshd: IP panel $PANEL_IP dikecualikan dari blokir sementara"
+fi
 sshd -t || {{ echo "Konfigurasi sshd tidak valid, dibatalkan."; exit 1; }}
 systemctl enable ssh >/dev/null 2>&1 || true
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
