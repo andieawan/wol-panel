@@ -828,7 +828,7 @@ def check_all_vms(only_due=True):
 # ------------------------------------------------------- terminal web (dibatasi)
 TERM_KEY = os.path.join(SSH_DIR, "terminal_ed25519")
 TERM_LOG_DIR = os.path.join(BASE, "vmlogs", "terminal")
-TERM_UNLOCK = {}      # hash token login -> kedaluwarsa (setelah ketik ulang password)
+TERM_UNLOCK = {}      # hash token login -> (kedaluwarsa, admin yang login di terminal)
 TERM_UNLOCK_TTL = 30 * 60
 TERM_IDLE = 30 * 60
 TERM_MAX_BUF = 1 << 20
@@ -849,12 +849,13 @@ def tok_hash(tok):
 
 
 def term_unlocked(tok):
-    exp = TERM_UNLOCK.get(tok_hash(tok), 0)
-    if exp > time.time():
-        TERM_UNLOCK[tok_hash(tok)] = time.time() + TERM_UNLOCK_TTL  # diperpanjang selama dipakai
-        return True
+    """Nama admin yang membuka kunci terminal di sesi login ini, atau None."""
+    exp, who = TERM_UNLOCK.get(tok_hash(tok), (0, None))
+    if exp > time.time() and who in CFG["users"] and CFG["users"][who].get("role") == "admin":
+        TERM_UNLOCK[tok_hash(tok)] = (time.time() + TERM_UNLOCK_TTL, who)  # diperpanjang selama dipakai
+        return who
     TERM_UNLOCK.pop(tok_hash(tok), None)
-    return False
+    return None
 
 
 class TermSession:
@@ -2172,8 +2173,19 @@ var stat=document.getElementById('tstat'),sel=document.getElementById('tvm'),ope
 var term=new Terminal({cursorBlink:true,fontSize:14,scrollback:5000,fontFamily:'ui-monospace,"Cascadia Mono",Consolas,monospace',
   theme:{background:'#0d1117',foreground:'#d1d9e0',cursor:'#d1d9e0',selectionBackground:'#264f78'}});
 var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);fit.fit();
-term.writeln('Pilih VM lalu klik Buka. Sesi direkam dan ditutup otomatis setelah 30 menit tanpa aktivitas.');
+var who=el.dataset.who,mode=null,buf='',uname='';
 function setStat(t,cls){stat.textContent=t;stat.className='pill '+(cls||'')}
+function controls(on){sel.disabled=!on;openBtn.disabled=!on}
+function ready(){term.writeln('Pilih VM lalu klik Buka. Sesi direkam dan ditutup otomatis setelah 30 menit tanpa aktivitas.')}
+function prompt(){mode='login';buf='';term.write('\\r\\nwol-panel login: ')}
+function relogin(msg){who='';sid=null;alive=false;controls(false);closeBtn.disabled=true;setStat('Belum login','');if(msg)term.writeln('\\r\\n'+msg);prompt();term.focus()}
+function unlock(u,p){mode='wait';
+ fetch('/terminal/unlock',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'csrf='+encodeURIComponent(csrf)+'&u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)}).then(function(r){return r.json()}).then(function(j){
+  if(j.ok){who=j.who;mode=null;term.writeln('Login berhasil. Selamat datang, '+who+'.');ready();controls(true);setStat('Masuk sebagai '+who,'on');sel.focus()}
+  else{term.writeln(j.error||'Login incorrect');prompt()}
+ }).catch(function(){term.writeln('Gagal menghubungi panel.');prompt()})}
+if(who){ready();controls(true)}else{controls(false);term.writeln('WOL Panel — terminal VM');term.writeln('Masuk dengan akun admin WOL Panel.');prompt();term.focus()}
 function post(url,body,type){return fetch(url,{method:'POST',headers:{'X-CSRF':csrf,'Content-Type':type||'application/x-www-form-urlencoded'},body:body})}
 function b64(s){var bin=atob(s),u=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u}
 function poll(){if(!sid)return;var my=sid;
@@ -2181,15 +2193,25 @@ function poll(){if(!sid)return;var my=sid;
   if(r.status===401||r.status===403){throw new Error('auth')}return r.json()}).then(function(j){
   if(my!==sid)return;if(j.d)term.write(b64(j.d));since=j.n;
   if(j.alive){poll()}else{alive=false;setStat('Terputus','');openBtn.disabled=false;closeBtn.disabled=true;sel.disabled=false}
- }).catch(function(e){if(e.message==='auth'){setStat('Sesi kunci habis — muat ulang halaman','bad');return}setTimeout(poll,2000)})}
+ }).catch(function(e){if(e.message==='auth'){relogin('Sesi login terminal habis. Silakan login lagi.');return}setTimeout(poll,2000)})}
 function flush(){if(sending||!q.length||!sid)return;sending=true;var data=q.join('');q=[];
  post('/terminal/in?sid='+encodeURIComponent(sid),data,'text/plain;charset=utf-8').finally(function(){sending=false;flush()})}
-term.onData(function(d){if(!alive)return;q.push(d);flush()});
+term.onData(function(d){
+ if(alive){q.push(d);flush();return}
+ if(mode!=='login'&&mode!=='pass')return;
+ for(var i=0;i<d.length;i++){var c=d[i];
+  if(c==='\\r'){if(mode==='login'){if(!buf)return prompt();uname=buf;buf='';mode='pass';term.write('\\r\\nPassword: ')}
+   else{var p=buf;buf='';term.write('\\r\\n');return unlock(uname,p)}}
+  else if(c==='\\x7f'||c==='\\b'){if(buf.length){buf=buf.slice(0,-1);if(mode==='login')term.write('\\b \\b')}}
+  else if(c==='\\x03'){term.write('^C');return prompt()}
+  else if(c>=' '){buf+=c;if(mode==='login')term.write(c)}}
+});
 var rt;function resize(){fit.fit();if(!sid)return;clearTimeout(rt);rt=setTimeout(function(){
  post('/terminal/resize','sid='+encodeURIComponent(sid)+'&rows='+term.rows+'&cols='+term.cols)},150)}
 window.addEventListener('resize',resize);
 openBtn.onclick=function(){openBtn.disabled=true;sel.disabled=true;setStat('Menyambungkan…','wait');term.reset();
  post('/terminal/open','vm='+encodeURIComponent(sel.value)+'&rows='+term.rows+'&cols='+term.cols).then(function(r){return r.json()}).then(function(j){
+  if(j.relogin){return relogin('Sesi login terminal habis. Silakan login lagi.')}
   if(!j.sid){term.writeln('\\r\\n'+(j.error||'Gagal membuka terminal.'));setStat('Gagal','bad');openBtn.disabled=false;sel.disabled=false;return}
   sid=j.sid;since=0;alive=true;closeBtn.disabled=false;setStat('Tersambung ke '+sel.options[sel.selectedIndex].text,'on');term.focus();poll();
  })};
@@ -2213,23 +2235,15 @@ def terminal_page(user, csrf, q, lan_ok, unlocked, panel_url=""):
                 '<p class="small" style="margin:0 0 14px">Di menu Server, klik <b>Izinkan terminal</b> pada VM, lalu jalankan perintah pasangnya di VM itu.</p>'
                 '<a class="btn primary" href="/servers">Buka Server</a></div>')
         return shell(user, csrf, "/terminal", body, q)
-    if not unlocked:
-        body = head + f"""<section class="card" style="max-width:420px"><h2>Konfirmasi akun</h2>
-<p class="mut small" style="margin:0 0 12px">Terminal memberi akses root ke VM. Ketik ulang nama pengguna dan password akun yang sedang Anda pakai untuk membukanya selama 30 menit.</p>
-<form method="post" action="/terminal/unlock">{hidden(csrf)}
-<label>Nama pengguna<input name="u" required autofocus autocomplete="username" autocapitalize="none" spellcheck="false"></label>
-<label>Password<input name="p" type="password" required autocomplete="current-password"></label>
-<button class="btn primary" data-busy="Memeriksa…">Buka terminal</button></form></section>"""
-        return shell(user, csrf, "/terminal", body, q)
     pre = q.get("vm", [""])[0]
     opts = "".join(f'<option value="{E(v["id"])}"{" selected" if v["id"] == pre else ""}>{E(v["name"])} ({E(v["host"])})</option>' for v in vms)
     body = f"""<link rel="stylesheet" href="/static/xterm.css">
-<div class="sec-head"><h2>Terminal</h2><span id="tstat" class="pill">Belum tersambung</span></div>
+<div class="sec-head"><h2>Terminal</h2><span id="tstat" class="pill">{'Masuk sebagai ' + E(unlocked) if unlocked else 'Belum login'}</span></div>
 <div class="card" style="padding:12px">
 <div class="inline" style="margin-bottom:10px"><label style="flex:1 1 220px;margin:0">VM<select id="tvm" style="margin-top:4px">{opts}</select></label>
 <button class="btn primary" id="topen" type="button">Buka</button><button class="btn" id="tclose" type="button" disabled>Putuskan</button></div>
-<div id="term" data-csrf="{csrf}" style="height:min(70vh,560px);background:#0d1117;border-radius:9px;padding:6px;overflow:hidden"></div>
-<p class="mut small" style="margin:10px 0 0">Masuk sebagai root. Semua tampilan sesi direkam di panel (<span class="mono">vmlogs/terminal/</span>).
+<div id="term" data-csrf="{csrf}" data-who="{E(unlocked or '')}" style="height:min(70vh,560px);background:#0d1117;border-radius:9px;padding:6px;overflow:hidden"></div>
+<p class="mut small" style="margin:10px 0 0">Login dengan akun admin WOL Panel, lalu pilih VM. Di VM Anda masuk sebagai root. Semua tampilan sesi direkam di panel (<span class="mono">vmlogs/terminal/</span>).
 Salin: pilih teks · Tempel: Ctrl+Shift+V / klik kanan.</p></div>
 <script src="/static/xterm.js"></script><script src="/static/xterm-addon-fit.js"></script>"""
     return shell(user, csrf, "/terminal", body.replace('"wrap"', '"wrap"'), q, TERM_JS)
@@ -2436,24 +2450,26 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_vm_check(form, user, ip)
         if path == "/servers/run":
             return self.do_vm_run(form, user, ip)
-        if path == "/terminal/unlock":
+        if path == "/terminal/unlock":  # dipanggil dari layar login di dalam terminal
+            reply = lambda d: self._send(200, json.dumps(d), "application/json")
             if not self.lan_direct():
-                return self.back("/terminal", "Terminal hanya bisa dibuka dari jaringan sekolah.", True)
+                return reply({"ok": False, "error": "Terminal hanya bisa dibuka dari jaringan sekolah."})
             now = time.time()
             recent = [t for t in FAILS.get(ip, []) if now - t < FAIL_WINDOW]
             FAILS[ip] = recent
             if len(recent) >= FAIL_LIMIT:
-                return self.back("/terminal", "Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi.", True)
-            # harus akun yang sedang login: nama dan password diketik ulang
-            name_ok = hmac.compare_digest(form.get("u", "").strip(), user)
-            if not (check_password(form.get("p", ""), CFG["users"][user]["hash"]) and name_ok):
+                return reply({"ok": False, "error": "Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi."})
+            # admin mana pun boleh membuka terminal dengan akunnya sendiri
+            who = form.get("u", "").strip()
+            rec = CFG["users"].get(who)
+            if not (rec and rec.get("role") == "admin" and check_password(form.get("p", ""), rec["hash"])):
                 FAILS[ip].append(now)
                 write_log(user, "terminal-gagal", "-", ip)
                 time.sleep(1)
-                return self.back("/terminal", "Nama pengguna atau password salah.", True)
-            TERM_UNLOCK[tok_hash(tok)] = now + TERM_UNLOCK_TTL
-            write_log(user, "terminal-buka-kunci", "-", ip)
-            return self.redirect("/terminal")
+                return reply({"ok": False, "error": "Login incorrect"})
+            TERM_UNLOCK[tok_hash(tok)] = (now + TERM_UNLOCK_TTL, who)
+            write_log(who, "terminal-buka-kunci", "-" if who == user else f"login panel {user}", ip)
+            return reply({"ok": True, "who": who})
         if path == "/devices/agent-update":
             dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
             if not dev or not dev.get("agent_secret"):
@@ -2666,7 +2682,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.lan_direct():
             return self._send(403, '{"error":"Terminal hanya dari jaringan sekolah."}', "application/json")
         if not term_unlocked(tok):
-            return self._send(403, '{"error":"Ketik ulang password (muat ulang halaman)."}', "application/json")
+            return self._send(200 if path == "/terminal/open" else 403,
+                              '{"relogin":true,"error":"Sesi login terminal habis."}', "application/json")
         q = parse_qs(urlparse(self.path).query)
         if path == "/terminal/open":
             vm = next((v for v in CFG["vms"] if v["id"] == form.get("vm") and v.get("terminal")), None)
@@ -2674,13 +2691,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"error": "VM ini belum diizinkan terminal."}), "application/json")
             try:
                 ensure_term_key()
-                t = TermSession(vm, user, tok)
+                who = term_unlocked(tok)
+                t = TermSession(vm, who, tok)
                 t.resize(int(form.get("rows") or 30), int(form.get("cols") or 100))
             except Exception as e:
                 return self._send(200, json.dumps({"error": f"Gagal membuka SSH: {e}"}), "application/json")
             with TERMS_LOCK:
                 TERMS[t.id] = t
-            write_log(user, "terminal", f"{vm['id']}:{vm['name']}", self.client_ip())
+            write_log(who, "terminal", f"{vm['id']}:{vm['name']}", self.client_ip())
             return self._send(200, json.dumps({"sid": t.id}), "application/json")
         sid = q.get("sid", [""])[0] or form.get("sid", "")
         t = self.term_session(user, tok, sid)
