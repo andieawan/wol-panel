@@ -1,4 +1,6 @@
+__pycache__/
 config.json
 config.json.tmp
+scan.json
+scan.json.tmp
 wol.log
-__pycache__/

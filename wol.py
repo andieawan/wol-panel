@@ -14,6 +14,7 @@ Perintah terminal:
   python3 wol.py serve             jalankan panel web
 """
 import base64
+import fnmatch
 import getpass
 import hashlib
 import hmac
@@ -66,6 +67,8 @@ def migrate(cfg):
     cfg.setdefault("devices", [])
     cfg.setdefault("trust_proxy", False)
     cfg.setdefault("session_hours", 12)
+    cfg.setdefault("app_rules", [])
+    cfg.setdefault("scan_minutes", 60)
     return cfg
 
 
@@ -271,6 +274,171 @@ def agent_shutdown(dev, user, delay=SHUTDOWN_DELAY):
         return r.read().strip() == b"ok"
 
 
+class AgentOld(Exception):
+    pass
+
+
+def agent_cmd(dev, user, payload, timeout=60):
+    """Perintah JSON bertanda tangan ke agen (pindai / uninstall). Agen v1 menjawab 404 -> AgentOld."""
+    body = json.dumps(payload, separators=(",", ":"))
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    by = re.sub(r"[^A-Za-z0-9._-]", "", user)[:32]
+    sig = hmac.new(dev["agent_secret"].encode(), f"cmd|{ts}|{nonce}|{hashlib.sha256(body.encode()).hexdigest()}|{by}".encode(),
+                   hashlib.sha256).hexdigest()
+    req = urllib.request.Request(agent_url(dev, "/cmd"), data=body.encode(), method="POST", headers={
+        "Content-Type": "application/json", "X-WOL-Time": ts, "X-WOL-Nonce": nonce, "X-WOL-User": by, "X-WOL-Signature": sig})
+    try:
+        with NO_PROXY.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8-sig"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise AgentOld() from e
+        raise
+
+
+# ------------------------------------------------------- pemindai aplikasi
+SCAN_PATH = os.environ.get("WOL_SCAN", os.path.join(BASE, "scan.json"))
+SCANS = {}            # id perangkat -> {"time", "apps", "error", "auto": [catatan hapus otomatis]}
+SCAN_LOCK = threading.Lock()
+SCAN_BUSY = set()     # perangkat yang sedang dipindai / di-uninstall
+AUTO_FAIL = {}        # (perangkat, id aplikasi) -> waktu gagal hapus otomatis terakhir
+AUTO_RETRY = 6 * 3600
+# tidak pernah dihapus otomatis walau cocok aturan (tetap bisa di-uninstall manual)
+PROTECTED = re.compile(r"wol panel|visual c\+\+|\.net|windows|driver|intel|nvidia|realtek|webview|microsoft edge|"
+                       r"microsoft office|microsoft 365|update health|chrome remote desktop", re.I)
+
+
+def load_scans():
+    global SCANS
+    try:
+        with open(SCAN_PATH, encoding="utf-8") as f:
+            SCANS = json.load(f)
+    except (FileNotFoundError, ValueError):
+        SCANS = {}
+
+
+def save_scans():
+    tmp = SCAN_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(SCANS, f, ensure_ascii=False)
+    os.replace(tmp, SCAN_PATH)
+
+
+def rule_regex(pattern):
+    p = pattern.strip().lower()
+    if "*" not in p and "?" not in p:
+        p = f"*{p}*"
+    return re.compile(fnmatch.translate(p), re.I)
+
+
+def match_rule(app):
+    for r in CFG.get("app_rules", []):
+        if rule_regex(r["pattern"]).match(app.get("name", "")):
+            return r
+    return None
+
+
+def flagged(dev_id):
+    s = SCANS.get(dev_id) or {}
+    return [(a, r) for a in s.get("apps", []) for r in [match_rule(a)] if r]
+
+
+def scan_device(dev, user="otomatis", auto=True):
+    """Pindai satu komputer, simpan hasilnya, lalu jalankan aturan hapus otomatis. Mengembalikan pesan ringkas."""
+    if dev["id"] in SCAN_BUSY:
+        return "Komputer ini sedang dipindai."
+    SCAN_BUSY.add(dev["id"])
+    try:
+        try:
+            res = agent_cmd(dev, user, {"action": "scan"}, timeout=90)
+            apps = sorted(res.get("apps") or [], key=lambda a: (a.get("name") or "").lower())
+            entry = {"time": int(time.time()), "apps": apps, "error": None, "auto": []}
+        except AgentOld:
+            entry = {"time": int(time.time()), "apps": (SCANS.get(dev["id"]) or {}).get("apps", []),
+                     "error": "Agen versi lama — klik Agen di Pengaturan lalu jalankan ulang perintahnya di komputer ini."}
+        except Exception as e:
+            entry = {"time": int(time.time()), "apps": (SCANS.get(dev["id"]) or {}).get("apps", []), "error": agent_error(e)}
+        with SCAN_LOCK:
+            SCANS[dev["id"]] = entry
+            save_scans()
+        if entry["error"]:
+            return f"Gagal memindai {dev['name']}: {entry['error']}"
+        n_flag = len(flagged(dev["id"]))
+        removed = run_auto_rules(dev) if auto else []
+        msg = f"{dev['name']}: {len(entry['apps'])} aplikasi, {n_flag} cocok aturan."
+        if removed:
+            msg += f" Dihapus otomatis: {', '.join(removed)}."
+        return msg
+    finally:
+        SCAN_BUSY.discard(dev["id"])
+
+
+def uninstall_app(dev, app_id, user, mode="uninstall"):
+    try:
+        r = agent_cmd(dev, user, {"action": "uninstall", "id": app_id}, timeout=240)
+    except AgentOld:
+        return False, "Agen versi lama — pasang ulang agen di komputer ini."
+    except Exception as e:
+        return False, agent_error(e)
+    ok, msg = bool(r.get("ok")), str(r.get("msg") or "")
+    write_log(user, mode if ok else mode + "-gagal", f"{dev['id']}:{msg[:80]}", "-")
+    if ok:  # hapus dari hasil pindai tanpa menunggu pindai ulang
+        with SCAN_LOCK:
+            s = SCANS.get(dev["id"])
+            if s:
+                s["apps"] = [a for a in s["apps"] if a.get("id") != app_id]
+                save_scans()
+    return ok, msg
+
+
+def run_auto_rules(dev):
+    removed = []
+    for app, rule in flagged(dev["id"]):
+        if not rule.get("auto") or PROTECTED.search(app.get("name", "")):
+            continue
+        key = (dev["id"], app["id"])
+        if time.time() - AUTO_FAIL.get(key, 0) < AUTO_RETRY:
+            continue
+        ok, msg = uninstall_app(dev, app["id"], "otomatis", "hapus-otomatis")
+        with SCAN_LOCK:
+            s = SCANS.get(dev["id"])
+            if s is not None:
+                s.setdefault("auto", []).append({"time": int(time.time()), "name": app["name"], "ok": ok, "msg": msg})
+                s["auto"] = s["auto"][-20:]
+                save_scans()
+        if ok:
+            removed.append(app["name"])
+        else:
+            AUTO_FAIL[key] = time.time()
+    return removed
+
+
+def scan_all(user="otomatis", only_due=False):
+    minutes = int(CFG.get("scan_minutes", 60))
+    for dev in list(CFG.get("devices", [])):
+        if not dev.get("agent_secret") or not dev.get("ip"):
+            continue
+        last = (SCANS.get(dev["id"]) or {}).get("time", 0)
+        if only_due and time.time() - last < minutes * 60:
+            continue
+        if not agent_ping(dev)[0]:  # komputer mati / agen belum jalan: lewati, coba lagi nanti
+            continue
+        try:
+            scan_device(dev, user)
+        except Exception as e:
+            print("pindai gagal", dev["id"], e, file=sys.stderr)
+
+
+def scanner_loop():
+    while True:
+        time.sleep(60)
+        try:
+            if int(CFG.get("scan_minutes", 60)) > 0:
+                scan_all(only_due=True)
+        except Exception as e:
+            print("pemindai otomatis:", e, file=sys.stderr)
+
+
 def new_agent_token(dev_id):
     now = time.time()
     for t, (_, exp) in list(AGENT_TOKENS.items()):
@@ -299,7 +467,8 @@ def all_status():
 
 
 def write_log(user, action, target, ip):
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{user}\t{action}\t{target}\t{ip}\n"
+    clean = lambda v: re.sub(r"[\t\r\n]+", " ", str(v))
+    line = "\t".join([time.strftime('%Y-%m-%d %H:%M:%S'), clean(user), clean(action), clean(target), clean(ip)]) + "\n"
     with LOG_LOCK, open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -414,6 +583,7 @@ svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-widt
 .nav a:hover{color:var(--fg);background:var(--off-soft)}
 .nav a[aria-current=page]{color:var(--fg);background:var(--card);box-shadow:inset 0 0 0 1px var(--line)}
 .nav form{margin:0}
+@media (max-width:420px){.nav a{padding:8px 9px}.nav .btn.quiet{padding:0 6px}}
 
 /* card & layout */
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
@@ -451,6 +621,12 @@ background:var(--off-soft);color:var(--mut);white-space:nowrap}
 @keyframes pulse{50%{opacity:.3}}
 .tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:99px;background:var(--off-soft);color:var(--mut);vertical-align:2px}
 .tag.ok{background:var(--ok-soft);color:var(--ok)}.tag.acc{background:var(--acc-soft);color:var(--acc)}
+.tag.warn{background:var(--warn-soft);color:var(--warn)}.tag.bad{background:var(--err-soft);color:var(--err)}
+a.tag{text-decoration:none}
+.search{margin:0 0 12px}.search input{margin:0}
+.group+.group{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.group-head{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
+.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}.inline label{margin:0;flex:1 1 200px}
 
 /* device card */
 .dev{display:grid;gap:14px}
@@ -620,6 +796,9 @@ LOG_LABELS = {
     "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
     "token-agen": "Membuat perintah pasang agen", "unduh-agen": "Pemasang agen diunduh",
     "lepas-agen": "Melepas agen",
+    "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
+    "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
+    "aturan-aplikasi": "Mengubah aturan aplikasi",
 }
 
 
@@ -657,6 +836,7 @@ def flash(q):
 def shell(user, csrf, active, content, q, script=""):
     links = [("/", "Beranda")]
     if is_admin(user):
+        links.append(("/apps", "Aplikasi"))
         links.append(("/settings", "Pengaturan"))
     links.append(("/account", "Akun"))
     nav = "".join(f'<a href="{h}"{" aria-current=page" if h == active else ""}>{t}</a>' for h, t in links)
@@ -715,7 +895,12 @@ def log_list(n=8):
             continue
         ts, who, act, target, ip = r[:5]
         label = LOG_LABELS.get(act, act)
-        if target not in ("-", "") and act not in ("simpan-pengguna", "hapus-pengguna", "ganti-password"):
+        if act.startswith(("uninstall", "hapus-otomatis")) and ":" in target:
+            did, info = target.split(":", 1)
+            label += f" di {names.get(did, did)} — {info}"
+        elif act in ("pindai", "aturan-aplikasi"):
+            label += f" {names.get(target, target)}" if target not in ("-", "", "semua") else (" semua komputer" if target == "semua" else "")
+        elif target not in ("-", "") and act not in ("simpan-pengguna", "hapus-pengguna", "ganti-password"):
             label += f" {names.get(target, target)}"
         elif act in ("simpan-pengguna", "hapus-pengguna"):
             label += f" {target}"
@@ -736,9 +921,14 @@ def home_page(user, csrf, q):
             stop = (f'<form class="a-stop push" method="post" action="/shutdown" '
                     f'{confirm(d["name"] + " akan mati 10 detik setelah ini. Pekerjaan yang belum disimpan di komputer itu akan hilang.", "Matikan", "Matikan " + d["name"] + "?")}>'
                     f'{hidden(csrf, id=d["id"])}<button class="btn danger" data-busy="Mengirim…">{icon("power")}Matikan</button></form>')
+        warn = ""
+        if is_admin(user):
+            nf = len(flagged(d["id"]))
+            if nf:
+                warn = f'<div style="margin-top:6px"><a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a></div>'
         cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
 <div class="dev-head"><div><h2>{E(d['name'])}</h2>
-<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div></div>
+<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}</div>
 <span class="pill"><span class="dot"></span><span>Mengecek…</span></span></div>
 <p class="dev-note" aria-live="polite"></p>
 <div class="dev-acts">
@@ -893,6 +1083,159 @@ def settings_general(user, csrf, q):
 <button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
 
 
+def app_meta(a):
+    bits = [a.get("version"), a.get("publisher"), a.get("scope")]
+    return " · ".join(E(b) for b in bits if b)
+
+
+def uninstall_form(csrf, dev, a, back=False):
+    return (f'<form method="post" action="/apps/uninstall" '
+            f'{confirm(a["name"] + " akan di-uninstall dari " + dev["name"] + ". Jika aplikasi sedang dibuka, aplikasi itu akan ditutup.", "Uninstall", "Uninstall " + a["name"] + "?")}>'
+            f'{hidden(csrf, dev=dev["id"], app=a["id"], **({"back": dev["id"]} if back else {}))}'
+            f'<button class="btn danger sm" data-busy="Menghapus…">Uninstall</button></form>')
+
+
+def scan_label(dev_id):
+    s = SCANS.get(dev_id)
+    if not s:
+        return '<span class="mut small">Belum dipindai</span>'
+    t = fmt_time(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s["time"])))
+    if s.get("error"):
+        return f'<span class="small" style="color:var(--err)">{E(s["error"])}</span> <span class="mut small">· {E(t)}</span>'
+    return f'<span class="mut small">Dipindai {E(t)} · {len(s.get("apps", []))} aplikasi</span>'
+
+
+def apps_page(user, csrf, q):
+    dev_id = q.get("dev", [""])[0]
+    if dev_id:
+        dev = next((d for d in CFG["devices"] if d["id"] == dev_id), None)
+        if dev:
+            return apps_device_page(user, csrf, q, dev)
+    agents = [d for d in CFG["devices"] if d.get("agent_secret")]
+    if not agents:
+        body = (f'<div class="sec-head"><h2>Aplikasi</h2></div><div class="card empty">{icon("monitor")}'
+                '<h3 style="margin:8px 0 4px">Belum ada komputer yang dipasangi agen</h3>'
+                '<p class="small" style="margin:0 0 14px">Pemindai aplikasi berjalan lewat agen yang sama dengan tombol Matikan.</p>'
+                '<a class="btn primary" href="/settings">Buka Pengaturan → Agen</a></div>')
+        return shell(user, csrf, "/apps", body, q)
+
+    # --- temuan
+    groups = []
+    for d in agents:
+        items = flagged(d["id"])
+        if not items:
+            continue
+        rows = []
+        for a, r in items:
+            mode = ('<span class="tag bad">Hapus otomatis</span>' if r.get("auto") else '<span class="tag warn">Dilaporkan</span>')
+            if r.get("auto") and PROTECTED.search(a.get("name", "")):
+                mode = '<span class="tag">Dilindungi — hapus manual</span>'
+            rows.append(f'<div class="row"><div class="row-main"><b>{E(a["name"])}</b> {mode}'
+                        f'<div class="mut small">{app_meta(a)}</div></div>{uninstall_form(csrf, d, a)}</div>')
+        groups.append(f'<div class="group"><div class="group-head"><h3>{E(d["name"])}</h3>{scan_label(d["id"])}</div>'
+                      f'<div class="list">{"".join(rows)}</div></div>')
+    if groups:
+        finds = f'<div class="card">{"".join(groups)}</div>'
+    elif CFG.get("app_rules"):
+        finds = (f'<div class="card empty">{icon("check")}<p class="small" style="margin:8px 0 0">'
+                 'Tidak ada aplikasi yang cocok dengan aturan di komputer yang sudah dipindai.</p></div>')
+    else:
+        finds = ('<div class="card empty"><p class="small" style="margin:0">Belum ada aturan. Tambahkan aturan di bawah, '
+                 'misalnya <b>roblox</b> atau <b>Google Play Games</b>, agar aplikasi itu ditandai di sini.</p></div>')
+
+    # --- riwayat hapus otomatis
+    autos = sorted(((e, d) for d in agents for e in (SCANS.get(d["id"]) or {}).get("auto", [])),
+                   key=lambda x: -x[0]["time"])[:8]
+    auto_card = ""
+    if autos:
+        rows = "".join(
+            f'<div class="row"><div class="row-main"><b>{E(e["name"])}</b> <span class="mut">di {E(d["name"])}</span>'
+            f'<div class="small" style="color:var({"--ok" if e["ok"] else "--err"})">{E(e["msg"])}</div></div>'
+            f'<time>{E(fmt_time(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["time"]))))}</time></div>' for e, d in autos)
+        auto_card = f'<div class="sec-head"><h2>Hapus otomatis terakhir</h2></div><div class="card log"><div class="list">{rows}</div></div>'
+
+    # --- komputer
+    drows = "".join(
+        f'<div class="row"><div class="row-main"><b>{E(d["name"])}</b><div>{scan_label(d["id"])}</div></div>'
+        f'<div class="acts"><a class="btn sm" href="/apps?dev={quote(d["id"])}">Lihat aplikasi</a>'
+        f'<form method="post" action="/apps/scan">{hidden(csrf, dev=d["id"])}<button class="btn sm" data-busy="Memindai…">Pindai</button></form></div></div>'
+        for d in agents)
+    others = len(CFG["devices"]) - len(agents)
+    note = f'<p class="foot">{others} komputer belum dipasangi agen sehingga tidak ikut dipindai.</p>' if others else ""
+
+    # --- aturan
+    counts = {}
+    for d in agents:
+        for a in (SCANS.get(d["id"]) or {}).get("apps", []):
+            r = match_rule(a)
+            if r:
+                c = counts.setdefault(r["id"], [0, set()])
+                c[0] += 1
+                c[1].add(d["id"])
+    rrows = []
+    for r in CFG.get("app_rules", []):
+        c = counts.get(r["id"], [0, set()])
+        mode = '<span class="tag bad">Hapus otomatis</span>' if r.get("auto") else '<span class="tag warn">Dilaporkan</span>'
+        toggle = "Jadikan laporan saja" if r.get("auto") else "Jadikan hapus otomatis"
+        tform = (f'<form method="post" action="/apps/rules/toggle" '
+                 + ("" if r.get("auto") else confirm(f"Aplikasi yang cocok dengan '{r['pattern']}' akan langsung di-uninstall setiap kali komputer dipindai, tanpa konfirmasi.", "Aktifkan", "Hapus otomatis?"))
+                 + f'>{hidden(csrf, rid=r["id"])}<button class="btn sm">{toggle}</button></form>')
+        rrows.append(f'<div class="row"><div class="row-main"><b class="mono">{E(r["pattern"])}</b> {mode}'
+                     f'<div class="mut small">Cocok {c[0]} aplikasi di {len(c[1])} komputer</div></div>'
+                     f'<div class="acts">{tform}{del_form("/apps/rules/delete", csrf, "Aturan " + r["pattern"] + " akan dihapus. Aplikasi yang sudah terpasang tidak terpengaruh.", "Hapus aturan?", rid=r["id"])}</div></div>')
+    rules_list = f'<div class="list">{"".join(rrows)}</div>' if rrows else '<p class="mut small" style="margin:0">Belum ada aturan.</p>'
+    rule_form = f"""<form method="post" action="/apps/rules/add" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">{hidden(csrf)}
+<div class="inline"><label>Nama aplikasi<input name="pattern" required maxlength="80" placeholder="mis. roblox" spellcheck="false"></label>
+<label style="flex:0 1 220px">Tindakan<select name="mode"><option value="report">Laporkan saja</option><option value="auto">Hapus otomatis</option></select></label>
+<button class="btn primary" style="margin-bottom:1px">Tambah aturan</button></div>
+<p class="mut small" style="margin:8px 0 0">Tanpa tanda <span class="mono">*</span> berarti "nama mengandung". Huruf besar/kecil tidak dibedakan.
+Contoh: <span class="mono">roblox</span>, <span class="mono">Google Play Games</span>, <span class="mono">*minecraft*</span>.
+Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge) tidak pernah dihapus otomatis.</p></form>"""
+    interval = f"""<form method="post" action="/apps/interval" class="inline" style="margin-top:14px">{hidden(csrf)}
+<label style="flex:0 1 260px">Pindai otomatis setiap (menit)<input name="minutes" type="number" min="0" max="1440" value="{int(CFG.get('scan_minutes', 60))}">
+<span class="hint">0 = hanya saat tombol Pindai diklik.</span></label><button class="btn" style="margin-bottom:23px">Simpan</button></form>"""
+
+    body = f"""<div class="sec-head"><h2>Cocok dengan aturan</h2>
+<form method="post" action="/apps/scan">{hidden(csrf, dev='semua')}<button class="btn sm" data-busy="Memulai…">Pindai semua sekarang</button></form></div>
+{finds}{auto_card}
+<div class="sec-head"><h2>Aturan</h2></div><div class="card">{rules_list}{rule_form}</div>
+<div class="sec-head"><h2>Komputer</h2></div><div class="card"><div class="list">{drows}</div>{interval}</div>{note}"""
+    return shell(user, csrf, "/apps", body, q)
+
+
+def apps_device_page(user, csrf, q, dev):
+    s = SCANS.get(dev["id"]) or {}
+    apps = s.get("apps", [])
+    rows = []
+    for a in apps:
+        r = match_rule(a)
+        tag = ""
+        if r:
+            tag = ' <span class="tag bad">Hapus otomatis</span>' if r.get("auto") else ' <span class="tag warn">Cocok aturan</span>'
+            if r.get("auto") and PROTECTED.search(a.get("name", "")):
+                tag = ' <span class="tag">Dilindungi — hapus manual</span>'
+        mk = "" if r else (f'<form method="post" action="/apps/rules/add">{hidden(csrf, pattern=a["name"], mode="report", dev=dev["id"])}'
+                           f'<button class="btn quiet sm" title="Tandai aplikasi ini di semua komputer">Jadikan aturan</button></form>')
+        rows.append(f'<div class="row" data-name="{E((a.get("name","") + " " + (a.get("publisher") or "")).lower())}">'
+                    f'<div class="row-main"><b>{E(a["name"])}</b>{tag}<div class="mut small">{app_meta(a)}</div></div>'
+                    f'<div class="acts">{mk}{uninstall_form(csrf, dev, a, back=True)}</div></div>')
+    if not dev.get("agent_secret"):
+        content = '<div class="card empty"><p class="small" style="margin:0">Komputer ini belum dipasangi agen. Buka Pengaturan → Agen.</p></div>'
+    elif not s:
+        content = '<div class="card empty"><p class="small" style="margin:0">Belum pernah dipindai. Klik <b>Pindai sekarang</b> saat komputer menyala.</p></div>'
+    else:
+        content = (f'<div class="search"><input id="q" type="search" placeholder="Cari aplikasi atau penerbit…" aria-label="Cari aplikasi"></div>'
+                   f'<div class="card"><div class="list" id="apps">{"".join(rows) or "<p class=mut>Tidak ada aplikasi.</p>"}</div></div>')
+    js = """(function(){var q=document.getElementById('q');if(!q)return;
+q.addEventListener('input',function(){var v=q.value.trim().toLowerCase();
+document.querySelectorAll('#apps .row').forEach(function(r){r.style.display=!v||r.dataset.name.indexOf(v)>=0?'':'none'})})})();"""
+    body = f"""<p style="margin:0 0 8px"><a href="/apps" class="small">← Semua komputer</a></p>
+<div class="sec-head" style="margin-top:0"><div><h2 style="color:var(--fg);font-size:18px">{E(dev['name'])}</h2>{scan_label(dev['id'])}</div>
+<form method="post" action="/apps/scan">{hidden(csrf, dev=dev['id'], back=dev['id'])}<button class="btn primary sm" data-busy="Memindai…">Pindai sekarang</button></form></div>
+{content}"""
+    return shell(user, csrf, "/apps", body, q, js)
+
+
 def account_page(user, csrf, q):
     body = f"""<div class="sec-head"><h2>Akun</h2></div><section class="card"><h2>Ganti password</h2>
 <form method="post" action="/account">{hidden(csrf)}
@@ -995,6 +1338,10 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin(user):
                 return self.redirect("/")
             return self._send(200, settings_page(user, csrf, q))
+        if url.path == "/apps":
+            if not is_admin(user):
+                return self.redirect("/")
+            return self._send(200, apps_page(user, csrf, q))
         self._send(404, page("Tidak ditemukan", '<p>Halaman tidak ditemukan. <a href="/">Kembali</a></p>'))
 
     # ---------------- POST
@@ -1031,7 +1378,19 @@ class Handler(BaseHTTPRequestHandler):
             if not dev:
                 return self.back("/settings", "Komputer tidak ditemukan.", True)
             return self.back("/settings", diagnose(dev))
+        if path == "/apps/scan":
+            return self.do_apps_scan(form, user, ip)
+        if path == "/apps/uninstall":
+            return self.do_apps_uninstall(form, user, ip)
         with CFG_LOCK:
+            if path == "/apps/rules/add":
+                return self.do_rule_add(form, user, ip)
+            if path == "/apps/rules/toggle":
+                return self.do_rule_toggle(form, user, ip)
+            if path == "/apps/rules/delete":
+                return self.do_rule_delete(form, user, ip)
+            if path == "/apps/interval":
+                return self.do_scan_interval(form, user, ip)
             if path == "/devices/save":
                 return self.do_device_save(form, user, ip)
             if path == "/devices/delete":
@@ -1092,6 +1451,99 @@ class Handler(BaseHTTPRequestHandler):
         WAKE_COOLDOWN[key] = time.time()
         write_log(user, "matikan", dev["id"], ip)
         return self.back("/", f"{dev['name']} akan mati dalam {SHUTDOWN_DELAY} detik.", stopping=dev["id"])
+
+    # ---------------- aplikasi
+    def apps_back(self, form, msg, err=False):
+        dev = form.get("back") or form.get("dev_back") or ""
+        return self.back("/apps", msg, err, **({"dev": dev} if dev else {}))
+
+    def do_apps_scan(self, form, user, ip):
+        target = form.get("dev", "")
+        if target == "semua":
+            write_log(user, "pindai", "semua", ip)
+            threading.Thread(target=scan_all, args=(user,), daemon=True).start()
+            return self.back("/apps", "Pemindaian semua komputer berjalan di latar belakang. Muat ulang halaman ini dalam 1–2 menit.")
+        dev = next((d for d in CFG["devices"] if d["id"] == target), None)
+        if not dev or not dev.get("agent_secret"):
+            return self.apps_back(form, "Komputer ini belum dipasangi agen.", True)
+        write_log(user, "pindai", dev["id"], ip)
+        msg = scan_device(dev, user)
+        err = bool((SCANS.get(dev["id"]) or {}).get("error"))
+        return self.apps_back(form, msg, err)
+
+    def do_apps_uninstall(self, form, user, ip):
+        dev = next((d for d in CFG["devices"] if d["id"] == form.get("dev")), None)
+        app_id = form.get("app", "")
+        app = next((a for a in (SCANS.get(dev["id"]) or {}).get("apps", []) if a.get("id") == app_id), None) if dev else None
+        back = {"dev": form["back"]} if form.get("back") else {}
+        if not dev or not dev.get("agent_secret") or not app:
+            return self.back("/apps", "Aplikasi tidak ditemukan. Pindai ulang komputer ini.", True, **back)
+        if dev["id"] in SCAN_BUSY:
+            return self.back("/apps", "Komputer ini sedang diproses, coba sebentar lagi.", True, **back)
+        SCAN_BUSY.add(dev["id"])
+        try:
+            ok, msg = uninstall_app(dev, app_id, user)
+        finally:
+            SCAN_BUSY.discard(dev["id"])
+        return self.back("/apps", msg, not ok, **back)
+
+    def do_rule_add(self, form, user, ip):
+        pattern = form.get("pattern", "").strip()
+        literal = re.sub(r"[*?\s]", "", pattern)
+        back = {"dev": form["dev"]} if form.get("dev") else {}
+        if len(literal) < 3 or len(pattern) > 80:
+            return self.back("/apps", "Aturan minimal 3 huruf (selain tanda *).", True, **back)
+        if any(r["pattern"].lower() == pattern.lower() for r in CFG["app_rules"]):
+            return self.back("/apps", f"Aturan '{pattern}' sudah ada.", True, **back)
+        auto = form.get("mode") == "auto"
+        CFG["app_rules"].append({"id": secrets.token_hex(4), "pattern": pattern, "auto": auto})
+        save_config(CFG)
+        write_log(user, "aturan-aplikasi", pattern, ip)
+        if auto:
+            threading.Thread(target=self.auto_now, daemon=True).start()
+        msg = f"Aturan '{pattern}' ditambahkan" + (" — aplikasi yang cocok dihapus di latar belakang." if auto else ".")
+        return self.back("/apps", msg, **back)
+
+    @staticmethod
+    def auto_now():
+        for d in list(CFG["devices"]):
+            if d.get("agent_secret") and d.get("ip") and d["id"] in SCANS and d["id"] not in SCAN_BUSY and agent_ping(d)[0]:
+                SCAN_BUSY.add(d["id"])
+                try:
+                    run_auto_rules(d)
+                finally:
+                    SCAN_BUSY.discard(d["id"])
+
+    def do_rule_toggle(self, form, user, ip):
+        r = next((r for r in CFG["app_rules"] if r["id"] == form.get("rid")), None)
+        if not r:
+            return self.back("/apps", "Aturan tidak ditemukan.", True)
+        r["auto"] = not r.get("auto")
+        save_config(CFG)
+        write_log(user, "aturan-aplikasi", r["pattern"], ip)
+        if r["auto"]:
+            threading.Thread(target=self.auto_now, daemon=True).start()
+        return self.back("/apps", f"Aturan '{r['pattern']}' sekarang " + ("hapus otomatis." if r["auto"] else "hanya dilaporkan."))
+
+    def do_rule_delete(self, form, user, ip):
+        r = next((r for r in CFG["app_rules"] if r["id"] == form.get("rid")), None)
+        if not r:
+            return self.back("/apps", "Aturan tidak ditemukan.", True)
+        CFG["app_rules"] = [x for x in CFG["app_rules"] if x["id"] != r["id"]]
+        save_config(CFG)
+        write_log(user, "aturan-aplikasi", r["pattern"], ip)
+        return self.back("/apps", f"Aturan '{r['pattern']}' dihapus.")
+
+    def do_scan_interval(self, form, user, ip):
+        try:
+            m = int(form.get("minutes") or 0)
+            if not 0 <= m <= 1440:
+                raise ValueError
+        except ValueError:
+            return self.back("/apps", "Isi 0–1440 menit.", True)
+        CFG["scan_minutes"] = m
+        save_config(CFG)
+        return self.back("/apps", "Pemindaian otomatis dimatikan." if m == 0 else f"Komputer dipindai otomatis setiap {m} menit saat menyala.")
 
     def do_agent(self, form, user, ip):
         dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
@@ -1294,6 +1746,8 @@ def main():
     if cmd == "serve":
         addr = (CFG.get("listen", "0.0.0.0"), int(CFG.get("port", 8080)))
         print(f"WOL Panel berjalan di http://{addr[0]}:{addr[1]}")
+        load_scans()
+        threading.Thread(target=scanner_loop, daemon=True).start()
         ThreadingHTTPServer(addr, Handler).serve_forever()
         return
     print(__doc__)

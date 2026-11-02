@@ -27,6 +27,8 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
+$AgentVersion = 2
+$script:By = ''
 
 function Write-Log([string]$t) {
     try {
@@ -58,6 +60,226 @@ function Test-Same([string]$a, [string]$b) {
     return ($d -eq 0)
 }
 
+function Get-Sha256([string]$text) {
+    $s = [Security.Cryptography.SHA256]::Create()
+    try { return -join ($s.ComputeHash([Text.Encoding]::UTF8.GetBytes($text)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $s.Dispose() }
+}
+
+function Send-Json($ctx, [int]$code, $obj) {
+    try {
+        $b = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $obj -Depth 5 -Compress))
+        $ctx.Response.StatusCode = $code
+        $ctx.Response.ContentType = 'application/json; charset=utf-8'
+        $ctx.Response.ContentLength64 = $b.Length
+        $ctx.Response.OutputStream.Write($b, 0, $b.Length)
+    } catch {} finally { try { $ctx.Response.Close() } catch {} }
+}
+
+# ---------------------------------------------------------------- pemindai aplikasi
+$UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+
+function Get-Profiles {
+    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.Special -and $_.LocalPath -and $_.SID -like 'S-1-5-21-*' }
+}
+
+# Membuka registry pengguna; bila pengguna tidak sedang login, hive-nya dimuat sementara.
+function Open-UserHive($p) {
+    $live = "Registry::HKEY_USERS\$($p.SID)"
+    if (Test-Path $live) { return @{ Root = $live; Temp = $null } }
+    $dat = Join-Path $p.LocalPath 'NTUSER.DAT'
+    if (-not (Test-Path -LiteralPath $dat)) { return $null }
+    $tmp = 'WOLSCAN_' + ($p.SID -replace '-', '_')
+    & reg.exe load "HKU\$tmp" "$dat" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return @{ Root = "Registry::HKEY_USERS\$tmp"; Temp = $tmp }
+}
+
+function Close-UserHive($h) {
+    if ($h -and $h.Temp) {
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        & reg.exe unload "HKU\$($h.Temp)" 2>&1 | Out-Null
+    }
+}
+
+function Read-UninstallKey([string]$path, [string]$idPrefix, [string]$scope, $list) {
+    if (-not (Test-Path $path)) { return }
+    foreach ($k in Get-ChildItem -Path $path -ErrorAction SilentlyContinue) {
+        $v = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+        if (-not $v -or -not $v.DisplayName) { continue }
+        if ($v.SystemComponent -eq 1 -or $v.ParentKeyName -or ([string]$v.ReleaseType) -match 'Update|Hotfix') { continue }
+        $list.Add([pscustomobject]@{
+            id = "$idPrefix|$($k.PSChildName)"; name = ([string]$v.DisplayName).Trim(); version = [string]$v.DisplayVersion
+            publisher = [string]$v.Publisher; scope = $scope; kind = 'win32'; date = [string]$v.InstallDate })
+    }
+}
+
+function Get-Apps {
+    $list = New-Object System.Collections.Generic.List[object]
+    Read-UninstallKey "HKLM:\$UninstallKey" 'M64' 'Semua pengguna' $list
+    Read-UninstallKey "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" 'M32' 'Semua pengguna' $list
+    foreach ($p in Get-Profiles) {
+        $h = Open-UserHive $p
+        if (-not $h) { continue }
+        try { Read-UninstallKey "$($h.Root)\$UninstallKey" "U:$($p.SID)" (Split-Path $p.LocalPath -Leaf) $list }
+        finally { Close-UserHive $h }
+    }
+    try {
+        foreach ($a in Get-AppxPackage -AllUsers -ErrorAction Stop) {
+            if ($a.IsFramework -or $a.IsResourcePackage -or $a.NonRemovable -or "$($a.SignatureKind)" -eq 'System') { continue }
+            $users = @($a.PackageUserInformation | ForEach-Object { ("$($_.UserSecurityId.Username)" -split '\\')[-1] } | Where-Object { $_ }) -join ', '
+            $list.Add([pscustomobject]@{
+                id = "APPX|$($a.PackageFullName)"; name = [string]$a.Name; version = [string]$a.Version
+                publisher = ([string]$a.Publisher -replace '^CN=([^,]+).*$', '$1'); scope = $(if ($users) { "Store ($users)" } else { 'Store' })
+                kind = 'store'; date = '' })
+        }
+    } catch {}
+    return $list
+}
+
+function Invoke-Cmdline([string]$cmdline, [int]$timeoutSec) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = "$env:SystemRoot\System32\cmd.exe"
+    $psi.Arguments = '/d /s /c "' + $cmdline + '"'
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    if (-not $p.WaitForExit($timeoutSec * 1000)) {
+        & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null
+        return -999
+    }
+    return $p.ExitCode
+}
+
+# Folder utama aplikasi di dalam profil pengguna, mis. C:\Users\siswa\AppData\Local\Roblox
+function Get-UserAppRoot([string]$path, [string]$profileDir) {
+    if (-not $path) { return $null }
+    $path = $path.Trim()
+    if ($path -match '^"([^"]+)"') { $path = $Matches[1] } elseif ($path -match '^(.+?\.exe)\b') { $path = $Matches[1] }
+    try { $full = [IO.Path]::GetFullPath($path) } catch { return $null }
+    $prefix = $profileDir.TrimEnd('\') + '\'
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $parts = $full.Substring($prefix.Length) -split '\\'
+    if ($parts.Count -lt 3 -or $parts[0] -ne 'AppData' -or ($parts[1] -ne 'Local' -and $parts[1] -ne 'Roaming')) { return $null }
+    $i = 2
+    if ($parts[1] -eq 'Local' -and $parts[2] -eq 'Programs') { $i = 3 }
+    $generic = @('Microsoft', 'Packages', 'Temp', 'Google', 'Mozilla', 'Apps', 'Comms', 'CrashDumps', 'Publishers', 'D3DSCache', 'Programs')
+    if ($parts.Count -gt $i -and $generic -contains $parts[$i]) { $i++ }
+    if ($parts.Count -le $i) { return $null }
+    # path berupa file langsung di AppData\Local (bukan di dalam folder aplikasi) tidak dihapus
+    if ($parts.Count -eq $i + 1 -and -not (Test-Path -LiteralPath $full -PathType Container)) { return $null }
+    $root = $prefix + (($parts[0..$i]) -join '\')
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+    return $root
+}
+
+function Remove-UserShortcuts([string]$profileDir, [string]$root) {
+    $dirs = @("$profileDir\Desktop", "$profileDir\AppData\Roaming\Microsoft\Windows\Start Menu\Programs")
+    $sh = New-Object -ComObject WScript.Shell
+    foreach ($d in $dirs) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        foreach ($l in Get-ChildItem -LiteralPath $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue) {
+            try { if ($sh.CreateShortcut($l.FullName).TargetPath -like "$root\*") { Remove-Item -LiteralPath $l.FullName -Force } } catch {}
+        }
+    }
+}
+
+function Invoke-Uninstall([string]$id) {
+    if ($id -like 'APPX|*') {
+        try { Remove-AppxPackage -Package $id.Substring(5) -AllUsers -ErrorAction Stop; return @{ ok = $true; msg = 'Aplikasi Store dihapus untuk semua pengguna.' } }
+        catch { return @{ ok = $false; msg = "Gagal menghapus aplikasi Store: $($_.Exception.Message)" } }
+    }
+    $prefix, $keyName = $id -split '\|', 2
+    if (-not $keyName -or $keyName -match '[\\/]') { return @{ ok = $false; msg = 'ID aplikasi tidak valid.' } }
+    $hive = $null; $profileDir = $null
+    switch -regex ($prefix) {
+        '^M64$' { $base = "HKLM:\$UninstallKey" }
+        '^M32$' { $base = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' }
+        '^U:(S-1-5-21-[\d-]+)$' {
+            $sid = $Matches[1]
+            $p = Get-Profiles | Where-Object { $_.SID -eq $sid } | Select-Object -First 1
+            if (-not $p) { return @{ ok = $false; msg = 'Profil pengguna tidak ditemukan.' } }
+            $profileDir = $p.LocalPath
+            $hive = Open-UserHive $p
+            if (-not $hive) { return @{ ok = $false; msg = 'Registry pengguna tidak bisa dibuka.' } }
+            $base = "$($hive.Root)\$UninstallKey"
+        }
+        default { return @{ ok = $false; msg = 'ID aplikasi tidak valid.' } }
+    }
+    try {
+        $keyPath = "$base\$keyName"
+        $v = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
+        if (-not $v) { return @{ ok = $true; msg = 'Aplikasi sudah tidak terpasang.' } }
+        $name = [string]$v.DisplayName
+        $u = [string]$v.UninstallString
+        $cmd = [string]$v.QuietUninstallString
+        if (-not $cmd) {
+            if ($v.WindowsInstaller -eq 1 -or $u -match 'msiexec') {
+                $guid = if ($keyName -match '^\{[0-9A-Fa-f-]{36}\}$') { $keyName } else { [regex]::Match($u, '\{[0-9A-Fa-f-]{36}\}').Value }
+                if ($guid) { $cmd = "msiexec.exe /x $guid /qn /norestart" }
+            } elseif ($u -match 'unins\d{3}\.exe') {
+                $cmd = "$u /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+            }
+        }
+        $note = ''
+        if ($cmd) {
+            Write-Log "Uninstall $name : $cmd"
+            $code = Invoke-Cmdline $cmd 180
+            if ($code -eq -999) { $note = 'Uninstaller tidak selesai dalam 3 menit. ' }
+            elseif ($code -ne 0 -and $code -ne 3010 -and $code -ne 1605) { $note = "Uninstaller selesai dengan kode $code. " }
+        }
+        if (-not (Test-Path $keyPath)) { return @{ ok = $true; msg = "$name berhasil di-uninstall." } }
+
+        # Aplikasi yang terpasang di profil pengguna (mis. Roblox) dibersihkan langsung
+        if ($profileDir) {
+            $root = $null
+            foreach ($cand in @([string]$v.InstallLocation, $u, [string]$v.DisplayIcon)) {
+                $root = Get-UserAppRoot $cand $profileDir
+                if ($root) { break }
+            }
+            if ($root) {
+                Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$root\*" } |
+                    ForEach-Object { try { $_.Kill() } catch {} }
+                Start-Sleep -Milliseconds 800
+                Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-UserShortcuts $profileDir $root
+                if (-not (Test-Path -LiteralPath $root)) {
+                    Remove-Item -Path $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Log "Hapus paksa $name : $root"
+                    return @{ ok = $true; msg = "$name dihapus (folder $root dibersihkan)." }
+                }
+                return @{ ok = $false; msg = "${note}Sebagian file $name masih dipakai. Coba lagi setelah pengguna logout." }
+            }
+        }
+        if (-not $cmd) { return @{ ok = $false; msg = "$name tidak punya uninstaller otomatis. Uninstall manual lewat Settings > Apps di komputer itu." } }
+        return @{ ok = $false; msg = "${note}$name masih terpasang. Uninstall manual lewat Settings > Apps di komputer itu." }
+    } finally {
+        Close-UserHive $hive
+    }
+}
+
+# ---------------------------------------------------------------- permintaan dari panel
+function Test-Signed($ctx, [string]$kind, [string]$extra) {
+    $req   = $ctx.Request
+    $ts    = [string]$req.Headers['X-WOL-Time']
+    $nonce = [string]$req.Headers['X-WOL-Nonce']
+    $by    = [string]$req.Headers['X-WOL-User']
+    $sig   = [string]$req.Headers['X-WOL-Signature']
+    if ($ts -notmatch '^\d{9,11}$' -or $nonce -notmatch '^[0-9a-f]{16,64}$' -or
+        $by -notmatch '^[A-Za-z0-9._-]{0,32}$' -or $sig -notmatch '^[0-9a-f]{64}$') {
+        Send-Text $ctx 400 'bad request'; return $false
+    }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ([Math]::Abs($now - [long]$ts) -gt 120) { Send-Text $ctx 401 'clock'; Write-Log 'Ditolak: selisih jam panel dan komputer lebih dari 2 menit'; return $false }
+    if (-not (Test-Same (Get-Sig "$kind|$ts|$nonce|$extra|$by") $sig)) { Send-Text $ctx 401 'unauthorized'; Write-Log 'Ditolak: tanda tangan tidak cocok'; return $false }
+    if ($Seen.ContainsKey($nonce)) { Send-Text $ctx 401 'replay'; return $false }
+    foreach ($k in @($Seen.Keys)) { if ($now - $Seen[$k] -gt 300) { $Seen.Remove($k) } }
+    $Seen[$nonce] = $now
+    $script:By = $by
+    return $true
+}
+
 function Handle($ctx) {
     $req  = $ctx.Request
     $from = $req.RemoteEndPoint.Address.ToString()
@@ -69,30 +291,41 @@ function Handle($ctx) {
         return
     }
     if ($from -ne $PanelIp) { Send-Text $ctx 403 'forbidden'; Write-Log "Ditolak dari $from (bukan IP panel)"; return }
-    if ($req.HttpMethod -ne 'POST' -or $path -ne '/shutdown') { Send-Text $ctx 404 'not found'; return }
+    if ($req.HttpMethod -ne 'POST') { Send-Text $ctx 404 'not found'; return }
 
-    $ts    = [string]$req.Headers['X-WOL-Time']
-    $nonce = [string]$req.Headers['X-WOL-Nonce']
-    $delay = [string]$req.Headers['X-WOL-Delay']
-    $by    = [string]$req.Headers['X-WOL-User']
-    $sig   = [string]$req.Headers['X-WOL-Signature']
-
-    if ($ts -notmatch '^\d{9,11}$' -or $nonce -notmatch '^[0-9a-f]{16,64}$' -or
-        $delay -notmatch '^\d{1,3}$' -or $by -notmatch '^[A-Za-z0-9._-]{0,32}$' -or $sig -notmatch '^[0-9a-f]{64}$') {
-        Send-Text $ctx 400 'bad request'; return
+    if ($path -eq '/shutdown') {
+        $delay = [string]$req.Headers['X-WOL-Delay']
+        if ($delay -notmatch '^\d{1,3}$') { Send-Text $ctx 400 'bad request'; return }
+        if (-not (Test-Signed $ctx 'shutdown' $delay)) { return }
+        $d = [Math]::Min([int]$delay, 600)
+        Send-Text $ctx 200 'ok'
+        Write-Log "Matikan dalam $d detik, diminta oleh $script:By"
+        & "$env:SystemRoot\System32\shutdown.exe" /s /f /t $d /c "Komputer dimatikan dari WOL Panel oleh $script:By" | Out-Null
+        return
     }
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ([Math]::Abs($now - [long]$ts) -gt 120) { Send-Text $ctx 401 'clock'; Write-Log 'Ditolak: selisih jam panel dan komputer lebih dari 2 menit'; return }
-    if (-not (Test-Same (Get-Sig "shutdown|$ts|$nonce|$delay|$by") $sig)) { Send-Text $ctx 401 'unauthorized'; Write-Log 'Ditolak: tanda tangan tidak cocok'; return }
-    if ($Seen.ContainsKey($nonce)) { Send-Text $ctx 401 'replay'; return }
 
-    foreach ($k in @($Seen.Keys)) { if ($now - $Seen[$k] -gt 300) { $Seen.Remove($k) } }
-    $Seen[$nonce] = $now
-
-    $d = [Math]::Min([int]$delay, 600)
-    Send-Text $ctx 200 'ok'
-    Write-Log "Matikan dalam $d detik, diminta oleh $by"
-    & "$env:SystemRoot\System32\shutdown.exe" /s /f /t $d /c "Komputer dimatikan dari WOL Panel oleh $by" | Out-Null
+    if ($path -eq '/cmd') {
+        if ($req.ContentLength64 -gt 65536) { Send-Text $ctx 413 'too large'; return }
+        $reader = New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)
+        $body = $reader.ReadToEnd(); $reader.Close()
+        if (-not (Test-Signed $ctx 'cmd' (Get-Sha256 $body))) { return }
+        try { $c = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ ok = $false; msg = 'JSON tidak valid' }; return }
+        switch ([string]$c.action) {
+            'scan' {
+                $apps = Get-Apps
+                Write-Log "Pindai aplikasi: $($apps.Count) ditemukan"
+                Send-Json $ctx 200 @{ ok = $true; version = $AgentVersion; apps = @($apps) }
+            }
+            'uninstall' {
+                $r = Invoke-Uninstall ([string]$c.id)
+                Write-Log "Uninstall diminta $script:By : $($r.msg)"
+                Send-Json $ctx 200 $r
+            }
+            default { Send-Json $ctx 400 @{ ok = $false; msg = 'Perintah tidak dikenal' } }
+        }
+        return
+    }
+    Send-Text $ctx 404 'not found'
 }
 
 while ($true) {

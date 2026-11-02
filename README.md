@@ -98,6 +98,37 @@ Remove-Item "$env:ProgramData\WOLPanelAgent" -Recurse -Force
 
 Lalu di panel klik **Agen** → **Lepas agen**.
 
+### Pemindai aplikasi (menu Aplikasi)
+
+Agen yang sama juga memindai aplikasi yang terpasang di komputer. Yang dibaca:
+- aplikasi untuk semua pengguna,
+- aplikasi di profil setiap akun, termasuk game yang terpasang tanpa hak admin seperti Roblox,
+- aplikasi Microsoft Store.
+
+Cara pakai:
+1. Buka menu **Aplikasi**, lalu tambahkan **aturan** berupa nama aplikasi, misalnya `roblox` atau `Google Play Games`.
+   Tanpa tanda `*` berarti "nama mengandung".
+2. Pilih tindakan untuk aturan itu:
+   - **Laporkan saja**: aplikasi ditandai di bagian *Cocok dengan aturan*, lalu Anda klik **Uninstall** sendiri.
+   - **Hapus otomatis**: aplikasi langsung di-uninstall setiap kali komputer dipindai.
+3. Komputer yang menyala dipindai otomatis setiap 60 menit (bisa diubah, 0 = mati). Bisa juga dipindai kapan saja
+   lewat **Pindai** atau **Pindai semua sekarang**.
+4. **Lihat aplikasi** menampilkan semua aplikasi di satu komputer, lengkap dengan pencarian. Di setiap baris ada
+   tombol **Uninstall** dan **Jadikan aturan**.
+
+Cara uninstall yang dipakai agen:
+- Memakai uninstaller senyap bila tersedia (MSI, Inno Setup, atau *QuietUninstallString*).
+- Untuk aplikasi di profil siswa (mis. Roblox), proses dihentikan, lalu folder aplikasi dan shortcut-nya dihapus.
+- Aplikasi Store dihapus untuk semua pengguna.
+- Kalau sebuah aplikasi tidak bisa dihapus otomatis, panel memberi tahu agar di-uninstall manual. Penghapusan
+  otomatis yang gagal tidak diulang selama 6 jam.
+
+Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge, Chrome Remote Desktop, dan WOL Panel)
+**tidak pernah dihapus otomatis** walaupun cocok dengan aturan. Aplikasi itu tetap bisa di-uninstall manual.
+
+> Agen yang dipasang sebelum fitur ini ada perlu dipasang ulang: **Pengaturan → Agen**, lalu jalankan
+> perintahnya lagi di komputer tersebut. Panel memberi tanda *Agen versi lama* bila belum.
+
 ## 4. Akses dari luar sekolah
 
 Pilih salah satu:
