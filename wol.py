@@ -243,7 +243,7 @@ def diagnose(dev):
             v, t = agent_info(dev), template_version()
             if v:
                 set_agent_version(dev, v)
-            state = ("terbaru" if v == t else "perlu pasang ulang sekali" if v < MIN_UPDATABLE else f"versi {t} tersedia — diperbarui otomatis") if v else ""
+            state = ("terbaru" if v == t else "perlu pasang ulang sekali" if v < MIN_UPDATABLE else f"versi {t} tersedia — klik Perbarui agen") if v else ""
             out.append(f"Agen: aktif, versi {v or '?'}" + (f" ({state})" if state else ""))
         else:
             out.append("Agen: " + why)
@@ -540,8 +540,6 @@ def scanner_loop():
 
 
 # ------------------------------------------------------- versi & pembaruan agen
-UPDATE_FAIL = {}      # id perangkat -> waktu gagal perbarui terakhir
-UPDATE_RETRY = 3600
 MIN_UPDATABLE = 4     # agen mulai versi ini bisa diperbarui dari panel
 
 
@@ -593,23 +591,18 @@ def agent_update(dev, user="otomatis"):
             msg = json.loads(e.read().decode("utf-8-sig")).get("msg") or agent_error(e)
         except Exception:
             msg = agent_error(e)
-        UPDATE_FAIL[dev["id"]] = time.time()
         return False, msg
     except Exception as e:
-        UPDATE_FAIL[dev["id"]] = time.time()
         return False, agent_error(e)
     if not r.get("ok"):
-        UPDATE_FAIL[dev["id"]] = time.time()
         return False, str(r.get("msg") or "Pembaruan ditolak agen.")
     for _ in range(30):  # tunggu agen dimulai ulang
         time.sleep(2)
         v = agent_info(dev)
         if v == target:
             set_agent_version(dev, v)
-            UPDATE_FAIL.pop(dev["id"], None)
             write_log(user, "perbarui-agen", f"{dev['id']}:versi {v}", "-")
             return True, f"Agen {dev['name']} diperbarui ke versi {v}."
-    UPDATE_FAIL[dev["id"]] = time.time()
     v = agent_info(dev)
     if v:
         set_agent_version(dev, v)
@@ -625,13 +618,6 @@ def maintain_agent(dev):
         v = agent_info(dev) or v
         if v:
             set_agent_version(dev, v)
-    if (v and MIN_UPDATABLE <= v < target and CFG.get("auto_update_agent", True)
-            and time.time() - UPDATE_FAIL.get(dev["id"], 0) > UPDATE_RETRY and dev["id"] not in SCAN_BUSY):
-        SCAN_BUSY.add(dev["id"])
-        try:
-            agent_update(dev)
-        finally:
-            SCAN_BUSY.discard(dev["id"])
 
 
 def maintain_agents():
@@ -664,7 +650,18 @@ VMSTATE = {}          # id VM -> {"checked", "data", "error"}
 VM_LOCK = threading.Lock()
 VM_JOBS = {}          # id VM -> {"action", "start", "end", "rc", "by"}
 VM_TOKENS = {}        # token pasang -> (id VM, kedaluwarsa)
-VM_ACTIONS = {"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot"}
+VM_ACTIONS = {"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot",
+              "self-update": "Perbarui wol-update"}
+VM_SELF_UPDATE_MIN = 3   # wol-update mulai versi ini bisa memperbarui dirinya
+
+
+def vm_template_version():
+    try:
+        with open(VM_TEMPLATE, encoding="utf-8") as f:
+            m = re.search(r"^WOL_UPDATE_VERSION=(\d+)$", f.read(), re.M)
+        return int(m.group(1)) if m else 0
+    except OSError:
+        return 0
 
 
 def load_vmstate():
@@ -2029,6 +2026,10 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                     tags.append(f'<span class="tag warn">{E(b)} commit baru</span>')
                 elif b == "0":
                     tags.append('<span class="tag ok">Kode terbaru</span>')
+            hv, tv = int(d.get("version") or 0), vm_template_version()
+            if hv and hv < tv:
+                tags.append(f'<span class="tag warn">wol-update v{hv} · ada v{tv}</span>' if hv >= VM_SELF_UPDATE_MIN else
+                            f'<span class="tag warn" title="Versi ini belum bisa memperbarui dirinya">wol-update v{hv} · Lainnya → Pasang ulang sekali</span>')
             if time.time() - st.get("rebooting", 0) < 900:
                 tags.insert(0, '<span class="pill wait"><span class="dot"></span><span>Sedang restart… menunggu VM kembali</span></span>')
             elif d.get("reboot") == "1":
@@ -2070,6 +2071,10 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                                 f"deploy/update.sh akan dijalankan: backup database, mode pemeliharaan, git pull, composer, migrasi, "
                                 f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit.", f"Update aplikasi di {vm['name']}?"))
         more_btns = []
+        if d and VM_SELF_UPDATE_MIN <= int(d.get("version") or 0) < vm_template_version():
+            btns.append(act("self-update", "Perbarui wol-update", "primary",
+                            f"{vm['name']} akan mengunduh wol-update versi {vm_template_version()} dari repo resmi di GitHub, "
+                            "lalu menggantikan versi lama.", f"Perbarui wol-update di {vm['name']}?"))
         if d:
             (btns if d.get("reboot") == "1" else more_btns).append(
                 act("reboot", "Reboot", "danger" if d.get("reboot") == "1" else "quiet",
@@ -2716,7 +2721,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_vm_run(self, form, user, ip):
         vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
         action = form.get("action", "")
-        if not vm or action not in ("os-upgrade", "app-update", "reboot"):
+        if not vm or action not in ("os-upgrade", "app-update", "reboot", "self-update"):
             return self.back("/servers", "Permintaan tidak valid.", True)
         if vm_job_running(vm["id"]):
             return self.back("/servers", "Sedang ada proses di VM ini.", True)
@@ -2841,7 +2846,6 @@ class Handler(BaseHTTPRequestHandler):
             dev["agent_secret"] = secrets.token_hex(32)
             dev.setdefault("agent_port", AGENT_PORT)
         dev.pop("agent_version", None)  # dicek ulang setelah dipasang
-        UPDATE_FAIL.pop(dev["id"], None)
         save_config(CFG)
         write_log(user, "token-agen", dev["id"], ip)
         self.redirect("/settings?" + urlencode({"agent": dev["id"], "tok": new_agent_token(dev["id"])}) + "#agent")

@@ -7,21 +7,23 @@
 #   check        apt-get update + daftar paket yang bisa di-update + commit baru di repo
 #   os-upgrade   apt-get upgrade (aman, tanpa menghapus paket)
 #   app-update   menjalankan deploy/update.sh milik aplikasi
-#   reboot       restart VM dalam 1 menit
+#   reboot       restart VM dalam 3 detik
+#   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=2
+WOL_UPDATE_VERSION=3
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 APP_DIR=""
+WOL_UPDATE_SRC="https://raw.githubusercontent.com/andieawan/wol-panel/main/vm-update.sh"
 [ -f /etc/wol-update.conf ] && . /etc/wol-update.conf
 CMD="${SSH_ORIGINAL_COMMAND:-${1:-status}}"
 CMD="${CMD%% *}"
 
 exec 9>/run/wol-update.lock
 case "$CMD" in
-  os-upgrade|app-update|reboot)
+  os-upgrade|app-update|reboot|self-update)
     flock -n 9 || { echo "error=Sedang ada proses update lain di VM ini."; exit 75; } ;;
 esac
 
@@ -98,6 +100,19 @@ case "$CMD" in
       nohup setsid sh -c 'sleep 3; systemctl reboot || reboot' >/dev/null 2>&1 &
       echo "VM restart dalam 3 detik."
     fi ;;
+  self-update)
+    # skrip diunduh VM sendiri dari repo resmi: panel tidak bisa menyisipkan kode
+    echo "==> Mengunduh $WOL_UPDATE_SRC"
+    self="$(readlink -f "$0")"; tmp="$(mktemp "$self.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+    curl -fsSL --max-time 60 "$WOL_UPDATE_SRC" -o "$tmp" || { echo "error: gagal mengunduh skrip baru."; exit 1; }
+    bash -n "$tmp" || { echo "error: skrip baru tidak valid, dibatalkan."; exit 1; }
+    nv="$(sed -n 's/^WOL_UPDATE_VERSION=\([0-9][0-9]*\)$/\1/p' "$tmp" | head -1)"
+    [ -n "$nv" ] || { echo "error: versi skrip baru tidak terbaca, dibatalkan."; exit 1; }
+    [ "$nv" -ge "$WOL_UPDATE_VERSION" ] || { echo "error: versi di repo ($nv) lebih lama dari yang terpasang ($WOL_UPDATE_VERSION), dibatalkan."; exit 1; }
+    chown root:root "$tmp"; chmod 755 "$tmp"
+    mv -f "$tmp" "$self"   # ganti file baru (inode baru) agar skrip yang sedang berjalan tidak rusak
+    echo "wol-update diperbarui: versi $WOL_UPDATE_VERSION -> $nv" ;;
   *)
     echo "error=Perintah tidak dikenal: $CMD"; exit 64 ;;
 esac

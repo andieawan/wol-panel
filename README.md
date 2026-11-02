@@ -102,18 +102,20 @@ Remove-Item "$env:ProgramData\WOLPanelAgent" -Recurse -Force
 
 Lalu di panel klik **Agen** → **Lepas agen**.
 
-### Pembaruan agen otomatis
+### Pembaruan agen
 
-Mulai agen versi 4, agen **diperbarui otomatis oleh panel**, jadi tidak perlu dipasang ulang di setiap komputer.
-1. Setelah server panel di-update (`git pull && bash install.sh`), panel mengecek versi agen di setiap komputer
-   yang menyala, setiap menit.
-2. Kalau versinya lebih lama, panel mengirim kode agen terbaru. Kode itu ditandatangani kunci rahasia, jadi hanya
-   panel Anda yang bisa memperbarui.
-3. Agen memeriksa kode baru, menyimpan cadangan, lalu memulai ulang dirinya.
-4. Kalau agen baru gagal berjalan, versi lama dipulihkan otomatis.
+Mulai agen versi 4, agen bisa **diperbarui dari panel dengan satu tombol**, jadi tidak perlu dipasang ulang di setiap
+komputer.
+1. Setelah server panel di-update (`git pull && bash install.sh`), panel mengecek versi agen di setiap komputer yang
+   menyala, setiap menit.
+2. Komputer dengan agen lebih lama diberi tanda *ada versi X* di **Pengaturan → Komputer**, dan tombol
+   **Perbarui agen** muncul.
+3. Saat tombol diklik, panel mengirim kode agen terbaru. Kode itu ditandatangani kunci rahasia, jadi hanya panel Anda
+   yang bisa memperbarui.
+4. Agen memeriksa kode baru, menyimpan cadangan, lalu memulai ulang dirinya. Kalau agen baru gagal berjalan, versi
+   lama dipulihkan otomatis.
 
-Komputer yang sedang mati diperbarui saat berikutnya menyala. Versi agen tampil di **Pengaturan → Komputer**.
-Tombol **Perbarui agen** di sana bisa dipakai untuk memperbarui langsung tanpa menunggu.
+Pembaruan **tidak berjalan sendiri**; agen hanya diperbarui saat tombolnya diklik.
 
 Agen versi 1–3 belum punya kemampuan ini, sehingga perlu **dipasang ulang sekali** (tombol **Pasang ulang**).
 Panel menandainya dengan *pasang ulang sekali*.
@@ -190,6 +192,12 @@ lalu jalankan perintah pasangnya di container tersebut. Repo panel di `/root/wol
 **Update aplikasi** menjalankan `deploy/update.sh` milik panel (`git pull` + `install.sh`). Layanan panel dimulai
 ulang 5 detik setelah update selesai, jadi halaman cukup dimuat ulang. Perintah yang sama bisa dijalankan manual:
 `cd ~/wol-panel && bash deploy/update.sh`.
+
+**Memperbarui skrip `wol-update` di VM:** kalau panel punya versi lebih baru, kartu VM menampilkan
+*wol-update vX · ada vY* dan tombol **Perbarui wol-update**. VM mengunduh skrip itu sendiri dari repo resmi
+(`WOL_UPDATE_SRC`, bawaan `andieawan/wol-panel` branch `main`). Panel tidak mengirim kode, jadi kunci SSH panel tetap
+tidak bisa dipakai untuk menjalankan perintah lain. Skrip yang rusak atau versinya lebih lama ditolak. `wol-update`
+versi 1–2 belum punya kemampuan ini, jadi perlu **Lainnya → Pasang ulang** sekali.
 
 Mencabut akses panel dari sebuah VM:
 
