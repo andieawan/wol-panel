@@ -168,6 +168,11 @@ Menu **Server** dipakai untuk memperbarui VM aplikasi (Pusat, Absensi, BK, TU, P
 - **Update aplikasi**: menjalankan `deploy/update.sh` milik aplikasi itu, yang berisi backup database, mode pemeliharaan,
   `git pull`, `composer`, `migrate --force`, cache, dan reload PHP-FPM.
 
+**Update semua** (di samping **Cek semua**) menjalankan semua pembaruan yang ditemukan Cek terakhir sekaligus. Untuk
+tiap VM urutannya *Perbarui wol-update → Update OS → Update aplikasi*, hanya yang memang ada pembaruannya, dan
+berhenti bila satu langkah gagal. VM-VM berjalan bersamaan; VM WOL Panel sendiri diproses paling akhir karena panel
+restart sebentar setelah diupdate. Daftar yang akan dijalankan tampil di jendela konfirmasi.
+
 Cara menyambungkan VM:
 1. **Server → Tambah VM**: isi nama dan IP VM. Panel menampilkan satu perintah.
 2. Di konsol VM (Proxmox → Console), masuk sebagai root, tempel perintah itu, lalu Enter.
@@ -214,7 +219,8 @@ terminal dibatasi ketat:
 - **Hanya dari jaringan sekolah.** Terminal ditolak bila panel dibuka lewat NPMplus/internet; buka panel langsung
   di `http://IP-container:8080`.
 - **Login di dalam layar terminal** (`wol-panel login:` lalu `Password:`, seperti konsol VM). Admin mana pun boleh
-  login dengan akunnya sendiri, dan sesi serta rekamannya tercatat atas nama akun itu. Login berlaku 30 menit.
+  login dengan akunnya sendiri, dan sesi serta rekamannya tercatat atas nama akun itu. Seperti konsol: setelah
+  **Putuskan**, `exit`, sesi terputus, atau halaman dimuat ulang, harus login lagi untuk membuka terminal.
 - **Izin per VM.** Di **Server**, klik **Izinkan terminal**, lalu jalankan perintah pasang yang muncul di VM itu.
   Kunci terminal terpisah dari kunci update dan hanya diterima dari IP panel.
 - **Semua tampilan sesi direkam** di `/opt/wol-panel/vmlogs/terminal/`.

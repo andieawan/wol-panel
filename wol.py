@@ -760,30 +760,42 @@ def vm_log_path(vm_id):
     return os.path.join(VM_LOG_DIR, f"{vm_id}.log")
 
 
-def run_vm_job(vm, action, user):
-    """Jalankan aksi di VM di latar belakang; keluaran ditulis ke log agar bisa dipantau langsung."""
+def run_vm_job(vm, action, user, steps=None):
+    """Jalankan aksi di VM di latar belakang; keluaran ditulis ke log agar bisa dipantau langsung.
+    steps: beberapa aksi berurutan (Update semua); berhenti di langkah pertama yang gagal."""
     os.makedirs(VM_LOG_DIR, exist_ok=True)
-    job = {"action": action, "start": int(time.time()), "end": None, "rc": None, "by": user}
+    steps = list(steps or [action])
+    job = {"action": steps[0], "start": int(time.time()), "end": None, "rc": None, "by": user}
     VM_JOBS[vm["id"]] = job
 
     def work():
         path = vm_log_path(vm["id"])
+        rc = 0
         with open(path, "w", encoding="utf-8") as log:
-            log.write(f"# {VM_ACTIONS.get(action, action)} di {vm['name']} oleh {user} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            log.flush()
-            try:
-                p = subprocess.Popen(ssh_cmd(vm, action), stdout=log, stderr=subprocess.STDOUT, text=True)
-                rc = p.wait(timeout=3600)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                rc = -1
-                log.write("\n[panel] Dihentikan: melebihi 60 menit.\n")
-            except Exception as e:
-                rc = -1
-                log.write(f"\n[panel] Gagal menjalankan SSH: {e}\n")
-            log.write(f"\n[panel] Selesai dengan kode {rc}.\n")
+            for i, act in enumerate(steps):
+                job["action"] = act
+                head = f"[{i + 1}/{len(steps)}] " if len(steps) > 1 else ""
+                log.write(f"{'' if i == 0 else chr(10)}# {head}{VM_ACTIONS.get(act, act)} di {vm['name']} oleh {user} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                log.flush()
+                try:
+                    p = subprocess.Popen(ssh_cmd(vm, act), stdout=log, stderr=subprocess.STDOUT, text=True)
+                    rc = p.wait(timeout=3600)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    rc = -1
+                    log.write("\n[panel] Dihentikan: melebihi 60 menit.\n")
+                except Exception as e:
+                    rc = -1
+                    log.write(f"\n[panel] Gagal menjalankan SSH: {e}\n")
+                log.write(f"\n[panel] Selesai dengan kode {rc}.\n")
+                log.flush()
+                write_log(user, "vm-" + act + ("" if rc == 0 else "-gagal"), f"{vm['id']}:{vm['name']}", "-")
+                if rc != 0:
+                    if i + 1 < len(steps):
+                        log.write(f"[panel] Langkah berikutnya dibatalkan karena {VM_ACTIONS.get(act, act)} gagal.\n")
+                    break
+        action = job["action"]
         job["rc"], job["end"] = rc, int(time.time())
-        write_log(user, "vm-" + action + ("" if rc == 0 else "-gagal"), f"{vm['id']}:{vm['name']}", "-")
         with VM_LOCK:
             st = VMSTATE.setdefault(vm["id"], {})
             st["last_job"] = {k: job[k] for k in ("action", "start", "end", "rc", "by")}
@@ -794,6 +806,42 @@ def run_vm_job(vm, action, user):
             wait_vm_back(vm)
 
     threading.Thread(target=work, daemon=True).start()
+
+
+def is_panel_vm(vm):
+    """VM tempat WOL Panel ini berjalan (update aplikasinya me-restart panel)."""
+    app = ((VMSTATE.get(vm["id"]) or {}).get("data") or {}).get("app") or ""
+    return app.rstrip("/").endswith("/wol-panel")
+
+
+def vm_update_plan(vm):
+    """Langkah update yang memang perlu untuk VM ini, berdasarkan hasil Cek terakhir."""
+    st = VMSTATE.get(vm["id"]) or {}
+    d = st.get("data") or {}
+    if not d or st.get("error"):
+        return []
+    steps = []
+    if VM_SELF_UPDATE_MIN <= int(d.get("version") or 0) < vm_template_version():
+        steps.append("self-update")
+    if int(d.get("upgradable") or 0) > 0:
+        steps.append("os-upgrade")
+    if d.get("app") and d.get("app_script") == "1" and d.get("app_behind") not in ("0", "?", None, ""):
+        steps.append("app-update")
+    return steps
+
+
+def update_all_vms(user):
+    """Update semua VM yang punya pembaruan. VM panel sendiri terakhir, setelah yang lain selesai."""
+    plans = [(vm, vm_update_plan(vm)) for vm in list(CFG.get("vms", [])) if not vm_job_running(vm["id"])]
+    plans = [(vm, st) for vm, st in plans if st]
+    panel = [(vm, st) for vm, st in plans if is_panel_vm(vm)]
+    for vm, st in plans:
+        if (vm, st) not in panel:
+            run_vm_job(vm, st[0], user, st)
+    while any(vm_job_running(vm["id"]) for vm, _ in plans if (vm, _) not in panel):
+        time.sleep(3)
+    for vm, st in panel:
+        run_vm_job(vm, st[0], user, st)
 
 
 def vm_term_user(vm):
@@ -914,12 +962,13 @@ class TermSession:
                 break
             self._append(data)
         self.rc = self.proc.wait()
-        msg = "\r\n[panel] Sesi selesai." if self.rc in (0, None) else \
+        msg = "\r\n[panel] Sesi selesai." if self.rc in (0, None) else "\r\n[panel] Diputuskan." if getattr(self, "closed", False) else \
               f"\r\n[panel] Koneksi terputus (kode {self.rc}). Pastikan terminal sudah diizinkan di VM ini."
         self._append(msg.encode())
         with self.cond:
             self.alive = False
             self.cond.notify_all()
+        TERM_UNLOCK.pop(self.owner, None)  # seperti konsol: sesi selesai = logout, buka lagi harus login
         try:
             self.log.write(f"\n# Ditutup — {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
             self.log.close()
@@ -968,6 +1017,7 @@ class TermSession:
             pass
 
     def close(self):
+        self.closed = True
         if self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGHUP)
@@ -2176,8 +2226,17 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
     interval = f"""<form method="post" action="/servers/interval" class="inline" style="margin-top:4px">{hidden(csrf)}
 <label style="flex:0 1 260px">Cek otomatis setiap (jam)<input name="hours" type="number" min="0" max="168" value="{E(str(CFG.get('vm_check_hours', 6)))}"></label>
 <button class="btn">Simpan</button></form><p class="mut small" style="margin:6px 0 0">0 = hanya saat tombol Cek diklik. Update tetap dijalankan manual.</p>"""
-    head = (f'<div class="sec-head"><h2>Server / VM</h2><form method="post" action="/servers/check">{hidden(csrf, id="semua")}'
-            f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
+    plans = [(vm, vm_update_plan(vm)) for vm in vms if not vm_job_running(vm["id"])]
+    plans = [(vm, st) for vm, st in plans if st]
+    upd_all = ""
+    if plans:
+        lines = "; ".join(f"{vm['name']}: " + ", ".join(VM_ACTIONS[a] for a in st) for vm, st in plans)
+        note = " WOL Panel diupdate paling akhir lalu restart sebentar." if any(is_panel_vm(vm) for vm, _ in plans) else ""
+        upd_all = (f'<form method="post" action="/servers/update-all" {confirm(lines + "." + note + " Aplikasi yang diupdate tidak bisa diakses ±1 menit.", "Update semua", f"Update {len(plans)} VM?")}>'
+                   f'{hidden(csrf)}<button class="btn sm primary" data-busy="Memulai…">Update semua ({len(plans)})</button></form>')
+    head = (f'<div class="sec-head"><h2>Server / VM</h2><div style="display:flex;gap:8px;flex-wrap:wrap">{upd_all}'
+            f'<form method="post" action="/servers/check">{hidden(csrf, id="semua")}'
+            f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form></div></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
     js = """(function(){
 function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.querySelector('.jobstate');
  fetch('/api/vmjob?id='+encodeURIComponent(id),{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
@@ -2223,7 +2282,7 @@ function poll(){if(!sid)return;var my=sid;
  fetch('/terminal/out?sid='+encodeURIComponent(my)+'&since='+since,{cache:'no-store'}).then(function(r){
   if(r.status===401||r.status===403){throw new Error('auth')}return r.json()}).then(function(j){
   if(my!==sid)return;if(j.d)term.write(b64(j.d));since=j.n;
-  if(j.alive){poll()}else{alive=false;setStat('Terputus','');openBtn.disabled=false;closeBtn.disabled=true;sel.disabled=false}
+  if(j.alive){poll()}else{relogin('Logout. Login lagi untuk membuka terminal.')}
  }).catch(function(e){if(e.message==='auth'){relogin('Sesi login terminal habis. Silakan login lagi.');return}setTimeout(poll,2000)})}
 function flush(){if(sending||!q.length||!sid)return;sending=true;var data=q.join('');q=[];
  post('/terminal/in?sid='+encodeURIComponent(sid),data,'text/plain;charset=utf-8').finally(function(){sending=false;flush()})}
@@ -2246,7 +2305,7 @@ openBtn.onclick=function(){openBtn.disabled=true;sel.disabled=true;setStat('Meny
   if(!j.sid){term.writeln('\\r\\n'+(j.error||'Gagal membuka terminal.'));setStat('Gagal','bad');openBtn.disabled=false;sel.disabled=false;return}
   sid=j.sid;since=0;alive=true;closeBtn.disabled=false;setStat('Tersambung ke '+sel.options[sel.selectedIndex].text,'on');term.focus();poll();
  })};
-closeBtn.onclick=function(){if(sid)post('/terminal/close','sid='+encodeURIComponent(sid));closeBtn.disabled=true};
+closeBtn.onclick=function(){if(sid)post('/terminal/close','sid='+encodeURIComponent(sid));closeBtn.disabled=true;setStat('Memutuskan…','wait')};
 window.addEventListener('beforeunload',function(){if(sid&&alive)navigator.sendBeacon&&fetch('/terminal/close',{method:'POST',keepalive:true,
  headers:{'X-CSRF':csrf,'Content-Type':'application/x-www-form-urlencoded'},body:'sid='+encodeURIComponent(sid)})});
 })();
@@ -2411,11 +2470,16 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/terminal":
             if not is_admin(user):
                 return self.redirect("/")
-            panel = f"http://{self.headers.get('Host', '').split(':')[0] or 'IP-panel'}:{int(CFG.get('port', 8080))}"
-            return self._send(200, terminal_page(user, csrf, q, self.lan_direct(), term_unlocked(tok),
+            owner = tok_hash(tok)
+            TERM_UNLOCK.pop(owner, None)  # seperti konsol: tiap kali dibuka harus login
+            with TERMS_LOCK:
+                mine = [t for t in TERMS.values() if t.owner == owner and t.alive]
+            for t in mine:
+                t.close()
+            return self._send(200, terminal_page(user, csrf, q, self.lan_direct(), None,
                                                  "" if self.lan_direct() else "http://<IP container panel>:" + str(int(CFG.get('port', 8080)))))
         if url.path == "/terminal/out":
-            t = self.term_session(user, tok, q.get("sid", [""])[0])
+            t = self.term_session(user, tok, q.get("sid", [""])[0], ended_ok=True)
             if not t:
                 return self._send(403, '{"error":"sesi"}', "application/json")
             try:
@@ -2482,6 +2546,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_vm_check(form, user, ip)
         if path == "/servers/run":
             return self.do_vm_run(form, user, ip)
+        if path == "/servers/update-all":
+            n = sum(1 for vm in CFG.get("vms", []) if not vm_job_running(vm["id"]) and vm_update_plan(vm))
+            if not n:
+                return self.back("/servers", "Tidak ada pembaruan. Klik Cek semua dulu untuk memastikan.")
+            write_log(user, "vm-update-semua", f"{n} VM", ip)
+            threading.Thread(target=update_all_vms, args=(user,), daemon=True).start()
+            return self.back("/servers", f"Update {n} VM dimulai. Proses tiap VM tampil di kartunya masing-masing.")
         if path == "/terminal/unlock":  # dipanggil dari layar login di dalam terminal
             reply = lambda d: self._send(200, json.dumps(d), "application/json")
             if not self.lan_direct():
@@ -2700,11 +2771,15 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return a.is_private or a.is_loopback
 
-    def term_session(self, user, tok, sid):
-        if not user or not is_admin(user) or not self.lan_direct() or not term_unlocked(tok):
+    def term_session(self, user, tok, sid, ended_ok=False):
+        if not user or not is_admin(user) or not self.lan_direct():
             return None
         t = TERMS.get(sid)
-        return t if t and t.owner == tok_hash(tok) else None
+        if not t or t.owner != tok_hash(tok):
+            return None
+        if ended_ok and not t.alive:  # hanya untuk membaca pesan penutup sesi yang sudah selesai
+            return t
+        return t if term_unlocked(tok) else None
 
     def do_terminal_api(self, path, raw, form, user, tok):
         if not user or not is_admin(user):
