@@ -66,7 +66,10 @@ dan perubahan pengaturan tampil di Beranda untuk admin.
 Jika lupa password admin, jalankan di server:
 
 ```bash
-cd /opt/wol-panel && python3 wol.py resetpw admin && systemctl restart wol-panel
+cd /opt/wol-panel
+python3 wol.py users                 # lihat nama akun yang ada
+python3 wol.py resetpw andi          # ganti 'andi' dengan nama akun admin Anda
+systemctl restart wol-panel
 ```
 
 ### Mematikan komputer dari panel

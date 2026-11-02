@@ -8,6 +8,7 @@ menu "Pengaturan" (khusus peran admin).
 
 Perintah terminal:
   python3 wol.py init              buat config.json + akun admin pertama
+  python3 wol.py users             tampilkan daftar akun
   python3 wol.py resetpw <nama>    reset password / buat admin jika lupa password
   python3 wol.py list              tampilkan daftar komputer + status
   python3 wol.py wake <id>         kirim magic packet dari terminal
@@ -84,6 +85,12 @@ def save_config(cfg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.chmod(tmp, 0o600)
+    if os.geteuid() == 0:  # dijalankan root (mis. resetpw): pertahankan pemilik agar layanan tetap bisa membaca
+        try:
+            st = os.stat(CONFIG_PATH if os.path.exists(CONFIG_PATH) else BASE)
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass
     os.replace(tmp, CONFIG_PATH)
 
 
@@ -2536,7 +2543,8 @@ def cmd_resetpw(name):
     rec["sv"] = rec.get("sv", 0) + 1
     cfg["users"][name] = rec
     save_config(cfg)
-    print(f"Password '{name}' disimpan. Jalankan: systemctl restart wol-panel")
+    print(f"Password '{name}' disimpan (peran: {rec.get('role')}). Semua sesi login akun ini otomatis keluar.")
+    print("Jalankan: systemctl restart wol-panel")
 
 
 def main():
@@ -2547,6 +2555,10 @@ def main():
     if not os.path.exists(CONFIG_PATH):
         sys.exit("config.json belum ada. Jalankan dulu: python3 wol.py init")
     CFG = load_config()
+    if cmd == "users":
+        for u, v in sorted(CFG["users"].items()):
+            print(f"{u:<24} {v.get('role', 'user')}")
+        return
     if cmd == "resetpw":
         if len(sys.argv) < 3:
             sys.exit("Pakai: python3 wol.py resetpw <nama_pengguna>")
