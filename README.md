@@ -3,7 +3,7 @@
 Panel web ringan untuk menghidupkan komputer desktop lewat Wake-on-LAN (WOL).
 Berjalan di server (container LXC kecil di Proxmox sudah cukup), satu file Python, tanpa database.
 
-Alurnya: **buka panel → klik Hidupkan → tunggu status "Menyala" (30–90 detik) → remote desktop seperti biasa.**
+Alurnya: **buka panel → klik Hidupkan → tunggu status "Menyala" (30–90 detik) → klik Buka Remote.**
 
 ---
 
@@ -53,6 +53,8 @@ masuk sebagai admin, lalu buka menu **Pengaturan**.
 Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layanan:
 
 - **Komputer**: tambah, ubah, hapus. Isi nama, MAC address, dan IP. Alamat broadcast dan ID dibuat otomatis jika dikosongkan.
+  Setiap komputer punya tombol **Buka Remote** di Beranda; bawaannya membuka Chrome Remote Desktop
+  (remotedesktop.google.com/access), linknya bisa diganti per komputer.
 - **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
   - *Admin*: bisa menyalakan komputer dan mengubah pengaturan.
   - *Pengguna*: hanya bisa menyalakan komputer.

@@ -46,6 +46,7 @@ FAIL_LIMIT, FAIL_WINDOW = 5, 600
 WAKE_COOLDOWN = {}  # id perangkat -> waktu terakhir dikirim
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
+DEFAULT_REMOTE = "https://remotedesktop.google.com/access"
 
 
 # ---------------------------------------------------------------- konfigurasi
@@ -260,8 +261,11 @@ def build_device(form, others):
             raise ValueError
     except ValueError:
         return None, "Nomor port harus angka 1–65535."
+    remote = form.get("remote_url", "").strip() or DEFAULT_REMOTE
+    if not re.match(r"^https?://[^\s\"'<>]+$", remote) or len(remote) > 300:
+        return None, "Link remote harus diawali http:// atau https://"
     return {"id": did, "name": name, "mac": mac, "ip": ip, "broadcast": bc,
-            "port": port, "check_ports": checks}, None
+            "port": port, "check_ports": checks, "remote_url": remote}, None
 
 
 # ------------------------------------------------------------------ sesi
@@ -398,7 +402,8 @@ def home_page(user, csrf, q):
         cards.append(f"""<div class="card dev"><div><h2>{E(d['name'])}</h2>
 <div class="mut">{E(d.get('ip') or '-')} · {E(d['mac'])}</div>
 <span id="st-{did}" class="badge off" data-waking="{'1' if d['id'] == waking else '0'}"><span class="dot"></span><span>Mengecek…</span></span></div>
-<form method="post" action="/wake">{hidden(csrf, id=d['id'])}<button id="btn-{did}">Hidupkan</button></form></div>""")
+<div class="acts"><a class="btn ghost" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote</a>
+<form method="post" action="/wake">{hidden(csrf, id=d['id'])}<button id="btn-{did}">Hidupkan</button></form></div></div>""")
     if not cards:
         tip = 'Tambahkan lewat menu <a href="/settings">Pengaturan</a>.' if is_admin(user) else "Hubungi admin untuk menambahkan."
         cards.append(f'<div class="card mut">Belum ada komputer. {tip}</div>')
@@ -442,7 +447,8 @@ def settings_page(user, csrf, q):
 <label>IP komputer (untuk cek status)<input name="ip" value="{dv('ip')}" placeholder="192.168.10.50"></label>
 <label>Alamat broadcast (kosongkan = otomatis)<input name="broadcast" value="{dv('broadcast')}" placeholder="192.168.10.255"></label>
 <label>Port WOL<input name="port" type="number" min="1" max="65535" value="{dv('port', '9')}"></label>
-<label>Port untuk cek status (pisahkan koma)<input name="check_ports" value="{dv('check_ports', '3389')}" placeholder="3389"></label>
+<label>Port untuk cek status (pisahkan koma)<input name="check_ports" value="{dv('check_ports', '')}" placeholder="kosongkan jika tidak pakai RDP"></label>
+<label>Link tombol "Buka Remote" (kosongkan = Chrome Remote Desktop)<input name="remote_url" value="{'' if dv('remote_url') == E(DEFAULT_REMOTE) else dv('remote_url')}" placeholder="{DEFAULT_REMOTE}"></label>
 </div>
 <p class="mut" style="margin-top:0">3389 = Remote Desktop, 22 = SSH (boleh dikosongkan). Status juga dicek lewat ARP dan ping,
 jadi tetap terdeteksi walau Remote Desktop tidak aktif. Pakai tombol <b>Tes</b> untuk melihat hasil tiap cara cek.</p>
@@ -674,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
         others = [d for d in CFG["devices"] if d["id"] != orig]
         dev, err = build_device(form, others)
         if err:
-            keep = {f"f_{k}": form.get(k, "") for k in ("name", "id", "mac", "ip", "broadcast", "port", "check_ports")}
+            keep = {f"f_{k}": form.get(k, "") for k in ("name", "id", "mac", "ip", "broadcast", "port", "check_ports", "remote_url")}
             if orig:
                 keep["edit"] = orig
             return self.back("/settings", err, True, **keep)
