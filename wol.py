@@ -1180,7 +1180,12 @@ svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-widt
 .nav a:hover{color:var(--fg);background:var(--off-soft)}
 .nav a[aria-current=page]{color:var(--fg);background:var(--card);box-shadow:inset 0 0 0 1px var(--line)}
 .nav form{margin:0}
-@media (max-width:420px){.nav a{padding:8px 9px}.nav .btn.quiet{padding:0 6px}}
+@media (max-width:640px){.top{flex-wrap:nowrap;flex-direction:column;align-items:stretch;gap:4px;padding:0 0 8px}
+.nav{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:0 16px}.nav::-webkit-scrollbar{display:none}
+.nav a,.nav form{flex:none}}
+@media (pointer:coarse){.nav a,.tabs a{min-height:44px;display:flex;align-items:center;justify-content:center}
+input,select{height:44px}
+details.more summary{min-height:44px}}
 
 /* card & layout */
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
@@ -1270,7 +1275,7 @@ background:var(--ok-soft);color:var(--fg);border:1px solid color-mix(in srgb,var
 /* forms */
 label{display:block;font-size:13px;font-weight:600;color:var(--fg);margin-bottom:14px}
 label .hint{display:block;font-weight:400;color:var(--mut);margin-top:4px}
-input,select{font:inherit;font-weight:400;width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line2);background:var(--field);color:var(--fg);margin-top:6px}
+input,select{font:inherit;font-weight:400;width:100%;height:40px;padding:0 12px;border-radius:9px;border:1px solid var(--line2);background:var(--field);color:var(--fg);margin-top:6px}
 input::placeholder{color:var(--faint)}
 input[readonly]{background:var(--off-soft)}
 .check{display:flex;gap:10px;align-items:flex-start;font-weight:600}
@@ -1499,10 +1504,14 @@ def fmt_time(ts):
 def log_list(n=8):
     names = {d["id"]: d["name"] for d in CFG.get("devices", [])}
     rows = []
-    for r in read_log(n):
+    for r in read_log(n * 10):
+        if len(rows) >= n:
+            break
         if len(r) < 5:
             continue
         ts, who, act, target, ip = r[:5]
+        if act == "login":  # tetap tercatat di wol.log, tapi menutupi kejadian penting di Beranda
+            continue
         label = LOG_LABELS.get(act, act)
         if (act.startswith("vm-") or act.startswith("terminal")) and ":" in target:
             label += " " + target.split(":", 1)[1]
@@ -1838,8 +1847,8 @@ def apps_page(user, csrf, q):
 Contoh: <span class="mono">roblox</span>, <span class="mono">Google Play Games</span>, <span class="mono">*minecraft*</span>.
 Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge) tidak pernah dihapus otomatis.</p></form>"""
     interval = f"""<form method="post" action="/apps/interval" class="inline" style="margin-top:14px">{hidden(csrf)}
-<label style="flex:0 1 260px">Pindai otomatis setiap (menit)<input name="minutes" type="number" min="0" max="1440" value="{int(CFG.get('scan_minutes', 60))}">
-<span class="hint">0 = hanya saat tombol Pindai diklik.</span></label><button class="btn" style="margin-bottom:23px">Simpan</button></form>"""
+<label style="flex:0 1 260px">Pindai otomatis setiap (menit)<input name="minutes" type="number" min="0" max="1440" value="{int(CFG.get('scan_minutes', 60))}"></label>
+<button class="btn">Simpan</button></form><p class="mut small" style="margin:6px 0 0">0 = hanya saat tombol Pindai diklik.</p>"""
 
     body = f"""<div class="sec-head"><h2>Cocok dengan aturan</h2>
 <form method="post" action="/apps/scan">{hidden(csrf, dev='semua')}<button class="btn sm" data-busy="Memulai…">Pindai semua sekarang</button></form></div>
@@ -2072,8 +2081,8 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
 <label>Port SSH<input name="port" type="number" min="1" max="65535" value="{E(q.get('f_port', ['22'])[0])}"></label></div>
 <button class="btn primary" data-busy="Menyimpan…">Tambah VM</button></form></details>"""
     interval = f"""<form method="post" action="/servers/interval" class="inline" style="margin-top:4px">{hidden(csrf)}
-<label style="flex:0 1 260px">Cek otomatis setiap (jam)<input name="hours" type="number" min="0" max="168" value="{E(str(CFG.get('vm_check_hours', 6)))}">
-<span class="hint">0 = hanya saat tombol Cek diklik. Update tetap dijalankan manual.</span></label><button class="btn" style="margin-bottom:23px">Simpan</button></form>"""
+<label style="flex:0 1 260px">Cek otomatis setiap (jam)<input name="hours" type="number" min="0" max="168" value="{E(str(CFG.get('vm_check_hours', 6)))}"></label>
+<button class="btn">Simpan</button></form><p class="mut small" style="margin:6px 0 0">0 = hanya saat tombol Cek diklik. Update tetap dijalankan manual.</p>"""
     head = (f'<div class="sec-head"><h2>Server / VM</h2><form method="post" action="/servers/check">{hidden(csrf, id="semua")}'
             f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
     js = """(function(){
