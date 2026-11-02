@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 2
+$AgentVersion = 3
 $script:By = ''
 
 function Write-Log([string]$t) {
@@ -126,13 +126,16 @@ function Get-Apps {
         finally { Close-UserHive $h }
     }
     try {
+        # paket yang ikut terpasang bersama Windows / dari pabrikan (bawaan)
+        $prov = @{}
+        try { Get-AppxProvisionedPackage -Online -ErrorAction Stop | ForEach-Object { $prov[$_.DisplayName] = $true } } catch {}
         foreach ($a in Get-AppxPackage -AllUsers -ErrorAction Stop) {
             if ($a.IsFramework -or $a.IsResourcePackage -or $a.NonRemovable -or "$($a.SignatureKind)" -eq 'System') { continue }
             $users = @($a.PackageUserInformation | ForEach-Object { ("$($_.UserSecurityId.Username)" -split '\\')[-1] } | Where-Object { $_ }) -join ', '
             $list.Add([pscustomobject]@{
                 id = "APPX|$($a.PackageFullName)"; name = [string]$a.Name; version = [string]$a.Version
                 publisher = ([string]$a.Publisher -replace '^CN=([^,]+).*$', '$1'); scope = $(if ($users) { "Store ($users)" } else { 'Store' })
-                kind = 'store'; date = '' })
+                kind = 'store'; date = ''; provisioned = [bool]$prov[$a.Name]; signature = "$($a.SignatureKind)" })
         }
     } catch {}
     return $list
@@ -313,8 +316,10 @@ function Handle($ctx) {
         switch ([string]$c.action) {
             'scan' {
                 $apps = Get-Apps
+                $osdate = ''
+                try { $osdate = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).InstallDate.ToString('yyyyMMdd') } catch {}
                 Write-Log "Pindai aplikasi: $($apps.Count) ditemukan"
-                Send-Json $ctx 200 @{ ok = $true; version = $AgentVersion; apps = @($apps) }
+                Send-Json $ctx 200 @{ ok = $true; version = $AgentVersion; osdate = $osdate; apps = @($apps) }
             }
             'uninstall' {
                 $r = Invoke-Uninstall ([string]$c.id)

@@ -308,6 +308,63 @@ PROTECTED = re.compile(r"wol panel|visual c\+\+|\.net|windows|driver|intel|nvidi
                        r"microsoft office|microsoft 365|update health|chrome remote desktop", re.I)
 
 
+SOURCES = (("luar", "Dari luar"), ("store", "Store"), ("bawaan", "Bawaan"))
+SYSTEM_NAME = re.compile(r"visual c\+\+|\.net|windows|driver|webview|microsoft edge|onedrive|update health|"
+                         r"runtime|redistributable|directx|vcredist|chipset|bluetooth|audio|graphics", re.I)
+OEM_PUBLISHER = re.compile(r"^(microsoft|intel|realtek|nvidia|amd|advanced micro devices|synaptics|elan|dolby|waves|"
+                           r"lenovo|hp |hp inc|hewlett|dell|asus|asustek|acer|msi|micro-star|qualcomm|mediatek|broadcom)", re.I)
+
+
+def app_source(app, osdate=""):
+    """Kelompok aplikasi: 'bawaan' (ikut Windows/pabrikan), 'store' (dari Microsoft Store), 'luar' (installer dari luar)."""
+    name, pub = app.get("name") or "", (app.get("publisher") or "").strip()
+    if app.get("kind") == "store":
+        if app.get("provisioned"):
+            return "bawaan"
+        if "provisioned" not in app and pub.lower().startswith("microsoft"):  # data agen lama
+            return "bawaan"
+        return "store"
+    if SYSTEM_NAME.search(name) or OEM_PUBLISHER.match(pub):
+        return "bawaan"
+    d = app.get("date") or ""
+    if osdate and re.fullmatch(r"\d{8}", d) and re.fullmatch(r"\d{8}", osdate):
+        try:
+            if abs(time.mktime(time.strptime(d, "%Y%m%d")) - time.mktime(time.strptime(osdate, "%Y%m%d"))) <= 2 * 86400:
+                return "bawaan"
+        except ValueError:
+            pass
+    return "luar"
+
+
+def user_installed(app):
+    """Terpasang di profil satu akun (tanpa hak admin) — biasanya dipasang sendiri oleh siswa."""
+    return app.get("kind") != "store" and str(app.get("id", "")).startswith("U:")
+
+
+def note_failure(dev_id, app, ok, msg, by):
+    with SCAN_LOCK:
+        s = SCANS.get(dev_id)
+        if s is None:
+            return
+        failed = s.setdefault("failed", {})
+        if ok:
+            failed.pop(app["id"], None)
+        elif app["id"] not in s.get("dismissed", []):
+            failed[app["id"]] = {"name": app.get("name", app["id"]), "msg": msg, "time": int(time.time()), "by": by}
+        save_scans()
+
+
+def failures():
+    out = []
+    for d in CFG.get("devices", []):
+        s = SCANS.get(d["id"]) or {}
+        present = {a.get("id") for a in s.get("apps", [])}
+        for aid, f in (s.get("failed") or {}).items():
+            if aid in present:
+                out.append((d, aid, f))
+    return sorted(out, key=lambda x: -x[2]["time"])
+
+
 def load_scans():
     global SCANS
     try:
@@ -352,13 +409,20 @@ def scan_device(dev, user="otomatis", auto=True):
         try:
             res = agent_cmd(dev, user, {"action": "scan"}, timeout=90)
             apps = sorted(res.get("apps") or [], key=lambda a: (a.get("name") or "").lower())
-            entry = {"time": int(time.time()), "apps": apps, "error": None, "auto": []}
+            entry = {"time": int(time.time()), "apps": apps, "error": None, "osdate": str(res.get("osdate") or "")}
         except AgentOld:
             entry = {"time": int(time.time()), "apps": (SCANS.get(dev["id"]) or {}).get("apps", []),
                      "error": "Agen versi lama — klik Agen di Pengaturan lalu jalankan ulang perintahnya di komputer ini."}
         except Exception as e:
             entry = {"time": int(time.time()), "apps": (SCANS.get(dev["id"]) or {}).get("apps", []), "error": agent_error(e)}
         with SCAN_LOCK:
+            old = SCANS.get(dev["id"]) or {}
+            present = {a.get("id") for a in entry["apps"]}
+            entry["auto"] = old.get("auto", [])
+            entry.setdefault("osdate", old.get("osdate", ""))
+            # kegagalan / abaikan untuk aplikasi yang sudah tidak ada dibuang
+            entry["failed"] = {k: v for k, v in (old.get("failed") or {}).items() if k in present}
+            entry["dismissed"] = [k for k in old.get("dismissed", []) if k in present]
             SCANS[dev["id"]] = entry
             save_scans()
         if entry["error"]:
@@ -379,9 +443,12 @@ def uninstall_app(dev, app_id, user, mode="uninstall"):
     except AgentOld:
         return False, "Agen versi lama — pasang ulang agen di komputer ini."
     except Exception as e:
-        return False, agent_error(e)
+        return False, agent_error(e)  # komputer tidak terjangkau: bukan kegagalan uninstall
     ok, msg = bool(r.get("ok")), str(r.get("msg") or "")
-    write_log(user, mode if ok else mode + "-gagal", f"{dev['id']}:{msg[:80]}", "-")
+    short = msg if len(msg) <= 90 else msg[:90].rsplit(" ", 1)[0] + "…"
+    write_log(user, mode if ok else mode + "-gagal", f"{dev['id']}:{short}", "-")
+    app = next((a for a in (SCANS.get(dev["id"]) or {}).get("apps", []) if a.get("id") == app_id), {"id": app_id})
+    note_failure(dev["id"], app, ok, msg, user)
     if ok:  # hapus dari hasil pindai tanpa menunggu pindai ulang
         with SCAN_LOCK:
             s = SCANS.get(dev["id"])
@@ -395,6 +462,8 @@ def run_auto_rules(dev):
     removed = []
     for app, rule in flagged(dev["id"]):
         if not rule.get("auto") or PROTECTED.search(app.get("name", "")):
+            continue
+        if app["id"] in (SCANS.get(dev["id"]) or {}).get("dismissed", []):
             continue
         key = (dev["id"], app["id"])
         if time.time() - AUTO_FAIL.get(key, 0) < AUTO_RETRY:
@@ -906,7 +975,8 @@ def log_list(n=8):
             label += f" {target}"
         who = "Sistem" if who in ("-", "cli") else who
         rows.append(f'<div class="row"><div class="row-main"><b>{E(who)}</b> <span class="mut">{E(label)}</span>'
-                    f'<div class="mut small mono">{E(ip)}</div></div><time>{E(fmt_time(ts))}</time></div>')
+                    + (f'<div class="mut small mono">{E(ip)}</div>' if ip not in ("-", "") else "")
+                    + f'</div><time>{E(fmt_time(ts))}</time></div>')
     return "".join(rows)
 
 
@@ -940,12 +1010,33 @@ def home_page(user, csrf, q):
             else '<p class="small">Hubungi admin untuk menambahkan komputer.</p>'
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada komputer</h3>'
                      f'<p class="small" style="margin:0 0 14px">Tambahkan komputer yang ingin dinyalakan lewat panel ini.</p>{tip}</div>')
+    attention = ""
+    if is_admin(user):
+        fl = failures()
+        if fl:
+            rows = []
+            for d, aid, f in fl[:10]:
+                a = next((x for x in (SCANS.get(d["id"]) or {}).get("apps", []) if x.get("id") == aid), {"id": aid, "name": f["name"]})
+                t = fmt_time(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(f["time"])))
+                who = "otomatis" if f.get("by") == "otomatis" else f"oleh {f.get('by')}"
+                dismiss = (f'<form method="post" action="/apps/dismiss">{hidden(csrf, dev=d["id"], app=aid)}'
+                           f'<button class="btn quiet sm" title="Sembunyikan dan jangan hapus otomatis lagi">Abaikan</button></form>')
+                rows.append(f'<div class="row"><div class="row-main"><b>{E(f["name"])}</b> <span class="mut">di {E(d["name"])}</span>'
+                            f'<div class="small" style="color:var(--err)">{E(f["msg"])}</div>'
+                            f'<div class="mut small">Gagal {who} · {E(t)}</div></div>'
+                            f'<div class="acts">{dismiss}{uninstall_form(csrf, d, a, back="home", label="Coba lagi")}</div></div>')
+            more = f'<p class="foot" style="margin-top:10px">dan {len(fl) - 10} lainnya di menu Aplikasi.</p>' if len(fl) > 10 else ""
+            attention = (f'<div class="sec-head"><h2>Perlu ditangani manual <span class="tag bad">{len(fl)}</span></h2>'
+                         f'<a class="small" href="/apps">Buka Aplikasi</a></div>'
+                         f'<div class="card" style="border-color:color-mix(in srgb,var(--err) 40%,var(--line))"><div class="list">{"".join(rows)}</div>'
+                         f'<p class="mut small" style="margin:12px 0 0">Uninstall manual lewat Settings → Apps di komputer tersebut, lalu klik Pindai di menu Aplikasi. '
+                         f'Item hilang sendiri setelah aplikasinya tidak terdeteksi lagi.</p>{more}</div>')
     log = ""
     if is_admin(user):
         rows = log_list()
         if rows:
             log = f'<div class="sec-head"><h2>Aktivitas terakhir</h2></div><div class="card log"><div class="list">{rows}</div></div>'
-    body = ('<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + log
+    body = (attention + '<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + log
             + '<p class="foot">Status diperbarui otomatis setiap 5 detik.</p>')
     return shell(user, csrf, "/", body, q, JS_STATUS)
 
@@ -1083,16 +1174,22 @@ def settings_general(user, csrf, q):
 <button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
 
 
-def app_meta(a):
-    bits = [a.get("version"), a.get("publisher"), a.get("scope")]
+def app_meta(a, osdate="", source=True):
+    bits = [a.get("version"), a.get("publisher")]
+    if user_installed(a):
+        bits.append(f"dipasang di akun {a.get('scope')}")
+    elif a.get("kind") != "store":
+        bits.append(a.get("scope"))
+    if source:
+        bits.append(dict(SOURCES)[app_source(a, osdate)])
     return " · ".join(E(b) for b in bits if b)
 
 
-def uninstall_form(csrf, dev, a, back=False):
+def uninstall_form(csrf, dev, a, back=False, label="Uninstall"):
     return (f'<form method="post" action="/apps/uninstall" '
             f'{confirm(a["name"] + " akan di-uninstall dari " + dev["name"] + ". Jika aplikasi sedang dibuka, aplikasi itu akan ditutup.", "Uninstall", "Uninstall " + a["name"] + "?")}>'
-            f'{hidden(csrf, dev=dev["id"], app=a["id"], **({"back": dev["id"]} if back else {}))}'
-            f'<button class="btn danger sm" data-busy="Menghapus…">Uninstall</button></form>')
+            f'{hidden(csrf, dev=dev["id"], app=a["id"], **({"back": back if isinstance(back, str) else dev["id"]} if back else {}))}'
+            f'<button class="btn danger sm" data-busy="Menghapus…">{label}</button></form>')
 
 
 def scan_label(dev_id):
@@ -1126,12 +1223,15 @@ def apps_page(user, csrf, q):
         if not items:
             continue
         rows = []
+        sd = SCANS.get(d["id"]) or {}
         for a, r in items:
             mode = ('<span class="tag bad">Hapus otomatis</span>' if r.get("auto") else '<span class="tag warn">Dilaporkan</span>')
             if r.get("auto") and PROTECTED.search(a.get("name", "")):
                 mode = '<span class="tag">Dilindungi — hapus manual</span>'
+            if a["id"] in (sd.get("failed") or {}):
+                mode += ' <span class="tag bad">Gagal dihapus</span>'
             rows.append(f'<div class="row"><div class="row-main"><b>{E(a["name"])}</b> {mode}'
-                        f'<div class="mut small">{app_meta(a)}</div></div>{uninstall_form(csrf, d, a)}</div>')
+                        f'<div class="mut small">{app_meta(a, sd.get("osdate", ""))}</div></div>{uninstall_form(csrf, d, a)}</div>')
         groups.append(f'<div class="group"><div class="group-head"><h3>{E(d["name"])}</h3>{scan_label(d["id"])}</div>'
                       f'<div class="list">{"".join(rows)}</div></div>')
     if groups:
@@ -1205,8 +1305,9 @@ Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge) tidak pernah d
 
 def apps_device_page(user, csrf, q, dev):
     s = SCANS.get(dev["id"]) or {}
-    apps = s.get("apps", [])
-    rows = []
+    apps, osdate = s.get("apps", []), s.get("osdate", "")
+    failed = s.get("failed") or {}
+    groups = {k: [] for k, _ in SOURCES}
     for a in apps:
         r = match_rule(a)
         tag = ""
@@ -1214,21 +1315,52 @@ def apps_device_page(user, csrf, q, dev):
             tag = ' <span class="tag bad">Hapus otomatis</span>' if r.get("auto") else ' <span class="tag warn">Cocok aturan</span>'
             if r.get("auto") and PROTECTED.search(a.get("name", "")):
                 tag = ' <span class="tag">Dilindungi — hapus manual</span>'
+        if a["id"] in failed:
+            tag += ' <span class="tag bad">Gagal dihapus</span>'
+        if user_installed(a):
+            tag += ' <span class="tag acc">Dipasang sendiri</span>'
         mk = "" if r else (f'<form method="post" action="/apps/rules/add">{hidden(csrf, pattern=a["name"], mode="report", dev=dev["id"])}'
                            f'<button class="btn quiet sm" title="Tandai aplikasi ini di semua komputer">Jadikan aturan</button></form>')
-        rows.append(f'<div class="row" data-name="{E((a.get("name","") + " " + (a.get("publisher") or "")).lower())}">'
-                    f'<div class="row-main"><b>{E(a["name"])}</b>{tag}<div class="mut small">{app_meta(a)}</div></div>'
-                    f'<div class="acts">{mk}{uninstall_form(csrf, dev, a, back=True)}</div></div>')
+        groups[app_source(a, osdate)].append(
+            f'<div class="row" data-name="{E((a.get("name","") + " " + (a.get("publisher") or "")).lower())}">'
+            f'<div class="row-main"><b>{E(a["name"])}</b>{tag}<div class="mut small">{app_meta(a, osdate, source=False)}</div></div>'
+            f'<div class="acts">{mk}{uninstall_form(csrf, dev, a, back=True)}</div></div>')
+    hints = {"luar": "Dipasang dari installer di luar Store — paling perlu diperiksa. Label <b>Dipasang sendiri</b> berarti terpasang di satu akun tanpa hak admin.",
+             "store": "Dipasang dari Microsoft Store oleh pengguna.",
+             "bawaan": "Ikut Windows atau pabrikan komputer: aplikasi sistem, driver, runtime. Biasanya tidak perlu dihapus."}
     if not dev.get("agent_secret"):
         content = '<div class="card empty"><p class="small" style="margin:0">Komputer ini belum dipasangi agen. Buka Pengaturan → Agen.</p></div>'
     elif not s:
         content = '<div class="card empty"><p class="small" style="margin:0">Belum pernah dipindai. Klik <b>Pindai sekarang</b> saat komputer menyala.</p></div>'
     else:
-        content = (f'<div class="search"><input id="q" type="search" placeholder="Cari aplikasi atau penerbit…" aria-label="Cari aplikasi"></div>'
-                   f'<div class="card"><div class="list" id="apps">{"".join(rows) or "<p class=mut>Tidak ada aplikasi.</p>"}</div></div>')
-    js = """(function(){var q=document.getElementById('q');if(!q)return;
-q.addEventListener('input',function(){var v=q.value.trim().toLowerCase();
-document.querySelectorAll('#apps .row').forEach(function(r){r.style.display=!v||r.dataset.name.indexOf(v)>=0?'':'none'})})})();"""
+        tabs = "".join(f'<a href="#g-{k}" data-g="{k}"{" aria-current=page" if k == "luar" else ""}>{t} <span class="mut">{len(groups[k])}</span></a>'
+                       for k, t in SOURCES)
+        none = '<p class="mut small" style="margin:0">Tidak ada.</p>'
+        secs = "".join(
+            f'<section class="grp" id="g-{k}"{"" if k == "luar" else " hidden"}><h3 class="grp-t" hidden style="margin:0 0 8px">{dict(SOURCES)[k]}</h3>'
+            f'<p class="mut small grp-h" style="margin:0 0 10px">{hints[k]}</p>'
+            f'<div class="card"><div class="list">{"".join(groups[k]) or none}</div></div></section>'
+            for k, _ in SOURCES)
+        content = (f'<nav class="tabs" aria-label="Kelompok aplikasi">{tabs}</nav>'
+                   f'<div class="search"><input id="q" type="search" placeholder="Cari di semua kelompok…" aria-label="Cari aplikasi"></div>{secs}')
+    js = """(function(){
+var tabs=document.querySelectorAll('.tabs a[data-g]'),q=document.getElementById('q');
+function show(g){tabs.forEach(function(t){t.toggleAttribute('aria-current',t.dataset.g===g);if(t.dataset.g===g)t.setAttribute('aria-current','page')});
+ document.querySelectorAll('.grp').forEach(function(s){s.hidden=s.id!=='g-'+g})}
+tabs.forEach(function(t){t.onclick=function(e){e.preventDefault();if(q)q.value='';filter();show(t.dataset.g);history.replaceState(null,'','#g-'+t.dataset.g)}});
+if(location.hash.indexOf('#g-')===0)show(location.hash.slice(3));
+var none=document.createElement('p');none.className='card empty small';none.textContent='Tidak ada aplikasi yang cocok.';none.hidden=true;
+var first=document.querySelector('.grp');if(first)first.parentNode.insertBefore(none,first);
+function filter(){var v=q?q.value.trim().toLowerCase():'',total=0;
+ document.querySelectorAll('.grp').forEach(function(s){var n=0,firstRow=null;
+  s.querySelectorAll('.row').forEach(function(r){var m=!v||r.dataset.name.indexOf(v)>=0;r.style.display=m?'':'none';r.style.borderTop='';
+   if(m){n++;if(!firstRow){firstRow=r}}});
+  if(firstRow&&v){firstRow.style.borderTop='0';firstRow.style.paddingTop='0'}else if(firstRow){firstRow.style.paddingTop=''}
+  s.querySelector('.grp-t').hidden=!v;s.querySelector('.grp-h').hidden=!!v;
+  if(v)s.hidden=n===0;total+=n});
+ none.hidden=!(v&&total===0);
+ if(!v){var cur=document.querySelector('.tabs a[aria-current]');if(cur)show(cur.dataset.g)}}
+if(q)q.addEventListener('input',filter);})();"""
     body = f"""<p style="margin:0 0 8px"><a href="/apps" class="small">← Semua komputer</a></p>
 <div class="sec-head" style="margin-top:0"><div><h2 style="color:var(--fg);font-size:18px">{E(dev['name'])}</h2>{scan_label(dev['id'])}</div>
 <form method="post" action="/apps/scan">{hidden(csrf, dev=dev['id'], back=dev['id'])}<button class="btn primary sm" data-busy="Memindai…">Pindai sekarang</button></form></div>
@@ -1382,6 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_apps_scan(form, user, ip)
         if path == "/apps/uninstall":
             return self.do_apps_uninstall(form, user, ip)
+        if path == "/apps/dismiss":
+            return self.do_apps_dismiss(form, user, ip)
         with CFG_LOCK:
             if path == "/apps/rules/add":
                 return self.do_rule_add(form, user, ip)
@@ -1475,17 +1609,30 @@ class Handler(BaseHTTPRequestHandler):
         dev = next((d for d in CFG["devices"] if d["id"] == form.get("dev")), None)
         app_id = form.get("app", "")
         app = next((a for a in (SCANS.get(dev["id"]) or {}).get("apps", []) if a.get("id") == app_id), None) if dev else None
-        back = {"dev": form["back"]} if form.get("back") else {}
+        home = form.get("back") == "home"
+        back = {"dev": form["back"]} if form.get("back") and not home else {}
+        dest = "/" if home else "/apps"
         if not dev or not dev.get("agent_secret") or not app:
-            return self.back("/apps", "Aplikasi tidak ditemukan. Pindai ulang komputer ini.", True, **back)
+            return self.back(dest, "Aplikasi tidak ditemukan. Pindai ulang komputer ini.", True, **back)
         if dev["id"] in SCAN_BUSY:
-            return self.back("/apps", "Komputer ini sedang diproses, coba sebentar lagi.", True, **back)
+            return self.back(dest, "Komputer ini sedang diproses, coba sebentar lagi.", True, **back)
         SCAN_BUSY.add(dev["id"])
         try:
             ok, msg = uninstall_app(dev, app_id, user)
         finally:
             SCAN_BUSY.discard(dev["id"])
-        return self.back("/apps", msg, not ok, **back)
+        return self.back(dest, msg, not ok, **back)
+
+    def do_apps_dismiss(self, form, user, ip):
+        dev_id, app_id = form.get("dev", ""), form.get("app", "")
+        with SCAN_LOCK:
+            sd = SCANS.get(dev_id)
+            f = (sd or {}).get("failed", {}).pop(app_id, None)
+            if sd is not None and app_id not in sd.setdefault("dismissed", []):
+                sd["dismissed"].append(app_id)
+            save_scans()
+        name = (f or {}).get("name", "Aplikasi")
+        return self.back("/", f"{name} diabaikan dan tidak akan dihapus otomatis lagi di komputer ini.")
 
     def do_rule_add(self, form, user, ip):
         pattern = form.get("pattern", "").strip()

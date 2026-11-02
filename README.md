@@ -113,8 +113,18 @@ Cara pakai:
    - **Hapus otomatis**: aplikasi langsung di-uninstall setiap kali komputer dipindai.
 3. Komputer yang menyala dipindai otomatis setiap 60 menit (bisa diubah, 0 = mati). Bisa juga dipindai kapan saja
    lewat **Pindai** atau **Pindai semua sekarang**.
-4. **Lihat aplikasi** menampilkan semua aplikasi di satu komputer, lengkap dengan pencarian. Di setiap baris ada
-   tombol **Uninstall** dan **Jadikan aturan**.
+4. **Lihat aplikasi** menampilkan semua aplikasi di satu komputer dalam tiga kelompok:
+   - **Dari luar**: dipasang dari installer di luar Store. Label **Dipasang sendiri** berarti terpasang di satu
+     akun tanpa hak admin, biasanya dipasang sendiri oleh siswa.
+   - **Store**: dipasang dari Microsoft Store oleh pengguna.
+   - **Bawaan**: ikut Windows atau pabrikan, misalnya aplikasi sistem, driver, dan runtime.
+
+   Pencarian berlaku untuk semua kelompok. Di setiap baris ada tombol **Uninstall** dan **Jadikan aturan**.
+5. Aplikasi yang **gagal dihapus**, baik otomatis maupun manual, muncul di Beranda pada kartu **Perlu ditangani manual**:
+   - **Coba lagi**: menjalankan uninstall sekali lagi.
+   - **Abaikan**: menyembunyikan item itu dan tidak lagi menghapusnya otomatis di komputer tersebut.
+
+   Item hilang sendiri setelah aplikasinya tidak terdeteksi lagi pada pemindaian berikutnya.
 
 Cara uninstall yang dipakai agen:
 - Memakai uninstaller senyap bila tersedia (MSI, Inno Setup, atau *QuietUninstallString*).
