@@ -27,7 +27,8 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 3
+$AgentVersion = 4
+$AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
 function Write-Log([string]$t) {
@@ -308,7 +309,7 @@ function Handle($ctx) {
     }
 
     if ($path -eq '/cmd') {
-        if ($req.ContentLength64 -gt 65536) { Send-Text $ctx 413 'too large'; return }
+        if ($req.ContentLength64 -gt 1048576) { Send-Text $ctx 413 'too large'; return }
         $reader = New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)
         $body = $reader.ReadToEnd(); $reader.Close()
         if (-not (Test-Signed $ctx 'cmd' (Get-Sha256 $body))) { return }
@@ -325,6 +326,26 @@ function Handle($ctx) {
                 $r = Invoke-Uninstall ([string]$c.id)
                 Write-Log "Uninstall diminta $script:By : $($r.msg)"
                 Send-Json $ctx 200 $r
+            }
+            'info' {
+                Send-Json $ctx 200 @{ ok = $true; version = $AgentVersion; host = $env:COMPUTERNAME }
+            }
+            'update' {
+                $code = [string]$c.code
+                $nv = [regex]::Match($code, '(?m)^\$AgentVersion = (\d+)').Groups[1].Value
+                $errs = $null
+                [void][System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$null, [ref]$errs)
+                if (-not $nv -or $code.Length -lt 2000 -or $errs) {
+                    Send-Json $ctx 400 @{ ok = $false; msg = 'Kode agen baru tidak valid, pembaruan dibatalkan.' }; break
+                }
+                if (-not (Get-ScheduledTask -TaskName 'WOL Panel Agent Restart' -ErrorAction SilentlyContinue)) {
+                    Send-Json $ctx 409 @{ ok = $false; msg = 'Tugas restart agen tidak ada, pasang ulang agen sekali.' }; break
+                }
+                Copy-Item -LiteralPath $AgentFile -Destination "$AgentFile.bak" -Force
+                Set-Content -Path $AgentFile -Value $code -Encoding UTF8
+                Write-Log "Diperbarui ke versi $nv oleh $script:By, memulai ulang"
+                Send-Json $ctx 200 @{ ok = $true; msg = "Agen diperbarui ke versi $nv." }
+                Start-ScheduledTask -TaskName 'WOL Panel Agent Restart'
             }
             default { Send-Json $ctx 400 @{ ok = $false; msg = 'Perintah tidak dikenal' } }
         }
@@ -363,6 +384,33 @@ while ($true) {
     icacls $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     $File = Join-Path $Dir 'agent.ps1'
     Set-Content -Path $File -Value $AgentCode -Encoding UTF8
+    Remove-Item -LiteralPath "$File.bak" -Force -ErrorAction SilentlyContinue
+
+    $RestartCode = @'
+# Dipanggil agen setelah memperbarui dirinya: mulai ulang agen, pulihkan cadangan bila agen baru tidak jalan.
+$Task = 'WOL Panel Agent'
+$File = Join-Path $env:ProgramData 'WOLPanelAgent\agent.ps1'
+$Log  = Join-Path $env:ProgramData 'WOLPanelAgent\agent.log'
+function Test-Agent { for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Seconds 1
+    try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:__PORT__/ping' -UseBasicParsing -TimeoutSec 2).Content -eq 'ok') { return $true } } catch {} }
+    return $false }
+function Restart-Agent { Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-ScheduledTask -TaskName $Task }
+Start-Sleep -Seconds 2
+Restart-Agent
+if (-not (Test-Agent) -and (Test-Path -LiteralPath "$File.bak")) {
+    Copy-Item -LiteralPath "$File.bak" -Destination $File -Force
+    Add-Content -Path $Log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  Agen baru gagal jalan, versi lama dipulihkan')
+    Restart-Agent
+}
+'@
+    $RestartFile = Join-Path $Dir 'restart.ps1'
+    Set-Content -Path $RestartFile -Value $RestartCode -Encoding UTF8
+    Unregister-ScheduledTask -TaskName "$Task Restart" -Confirm:$false -ErrorAction SilentlyContinue
+    $raction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RestartFile`""
+    $rprincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName "$Task Restart" -Action $raction -Principal $rprincipal `
+        -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)) `
+        -Description 'Memulai ulang WOL Panel Agent setelah pembaruan otomatis' | Out-Null
 
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$File`""
     $trigger   = New-ScheduledTaskTrigger -AtStartup
@@ -370,7 +418,7 @@ while ($true) {
     $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
                    -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $Task -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-        -Description 'Menerima perintah matikan dari WOL Panel' | Out-Null
+        -Description 'Agen WOL Panel: matikan, pindai aplikasi, pembaruan otomatis' | Out-Null
 
     Remove-NetFirewallRule -DisplayName $Rule -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName $Rule -Direction Inbound -Protocol TCP -LocalPort $Port `

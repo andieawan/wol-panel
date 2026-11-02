@@ -92,11 +92,28 @@ Menghapus agen dari Windows (PowerShell Admin):
 
 ```powershell
 Unregister-ScheduledTask -TaskName 'WOL Panel Agent' -Confirm:$false
+Unregister-ScheduledTask -TaskName 'WOL Panel Agent Restart' -Confirm:$false
 Remove-NetFirewallRule -DisplayName 'WOL Panel Agent'
 Remove-Item "$env:ProgramData\WOLPanelAgent" -Recurse -Force
 ```
 
 Lalu di panel klik **Agen** → **Lepas agen**.
+
+### Pembaruan agen otomatis
+
+Mulai agen versi 4, agen **diperbarui otomatis oleh panel**, jadi tidak perlu dipasang ulang di setiap komputer.
+1. Setelah server panel di-update (`git pull && bash install.sh`), panel mengecek versi agen di setiap komputer
+   yang menyala, setiap menit.
+2. Kalau versinya lebih lama, panel mengirim kode agen terbaru. Kode itu ditandatangani kunci rahasia, jadi hanya
+   panel Anda yang bisa memperbarui.
+3. Agen memeriksa kode baru, menyimpan cadangan, lalu memulai ulang dirinya.
+4. Kalau agen baru gagal berjalan, versi lama dipulihkan otomatis.
+
+Komputer yang sedang mati diperbarui saat berikutnya menyala. Versi agen tampil di **Pengaturan → Komputer**.
+Tombol **Perbarui agen** di sana bisa dipakai untuk memperbarui langsung tanpa menunggu.
+
+Agen versi 1–3 belum punya kemampuan ini, sehingga perlu **dipasang ulang sekali** (tombol **Pasang ulang**).
+Panel menandainya dengan *pasang ulang sekali*.
 
 ### Pemindai aplikasi (menu Aplikasi)
 

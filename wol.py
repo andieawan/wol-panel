@@ -226,7 +226,14 @@ def diagnose(dev):
                             None: "tidak diizinkan di server (jalankan ulang install.sh)"}[pg])
     if dev.get("agent_secret"):
         ok, why = agent_ping(dev)
-        out.append("Agen Matikan: " + ("aktif" if ok else why))
+        if ok:
+            v, t = agent_info(dev), template_version()
+            if v:
+                set_agent_version(dev, v)
+            state = ("terbaru" if v == t else "perlu pasang ulang sekali" if v < MIN_UPDATABLE else f"versi {t} tersedia — diperbarui otomatis") if v else ""
+            out.append(f"Agen: aktif, versi {v or '?'}" + (f" ({state})" if state else ""))
+        else:
+            out.append("Agen: " + why)
     return f"Tes {dev['name']} ({ip}) — " + " · ".join(out)
 
 
@@ -257,7 +264,7 @@ def agent_error(e):
 
 def agent_ping(dev):
     try:
-        with NO_PROXY.open(agent_url(dev, "/ping"), timeout=3) as r:
+        with NO_PROXY.open(agent_url(dev, "/ping"), timeout=2) as r:
             return r.read().strip() == b"ok", "jawaban tidak dikenal"
     except Exception as e:
         return False, agent_error(e)
@@ -410,7 +417,10 @@ def scan_device(dev, user="otomatis", auto=True):
             res = agent_cmd(dev, user, {"action": "scan"}, timeout=90)
             apps = sorted(res.get("apps") or [], key=lambda a: (a.get("name") or "").lower())
             entry = {"time": int(time.time()), "apps": apps, "error": None, "osdate": str(res.get("osdate") or "")}
+            if res.get("version"):
+                set_agent_version(dev, int(res["version"]))
         except AgentOld:
+            set_agent_version(dev, 1)
             entry = {"time": int(time.time()), "apps": (SCANS.get(dev["id"]) or {}).get("apps", []),
                      "error": "Agen versi lama — klik Agen di Pengaturan lalu jalankan ulang perintahnya di komputer ini."}
         except Exception as e:
@@ -502,10 +512,129 @@ def scanner_loop():
     while True:
         time.sleep(60)
         try:
+            maintain_agents()
+        except Exception as e:
+            print("pembaruan agen:", e, file=sys.stderr)
+        try:
             if int(CFG.get("scan_minutes", 60)) > 0:
                 scan_all(only_due=True)
         except Exception as e:
             print("pemindai otomatis:", e, file=sys.stderr)
+
+
+# ------------------------------------------------------- versi & pembaruan agen
+UPDATE_FAIL = {}      # id perangkat -> waktu gagal perbarui terakhir
+UPDATE_RETRY = 3600
+MIN_UPDATABLE = 4     # agen mulai versi ini bisa diperbarui dari panel
+
+
+def template_version():
+    try:
+        with open(AGENT_TEMPLATE, encoding="utf-8") as f:
+            m = re.search(r"^\$AgentVersion = (\d+)", f.read(), re.M)
+        return int(m.group(1)) if m else 0
+    except OSError:
+        return 0
+
+
+def agent_code(dev):
+    """Kode agen saja (isi here-string $AgentCode dari pemasang), sudah terisi kunci/port/IP panel."""
+    script = agent_script(dev)
+    m = re.search(r"\$AgentCode = @'\r?\n(.*?)\r?\n'@", script, re.S)
+    return m.group(1) if m else ""
+
+
+def set_agent_version(dev, v):
+    if dev.get("agent_version") != v:
+        with CFG_LOCK:
+            dev["agent_version"] = v
+            save_config(CFG)
+
+
+def agent_info(dev):
+    """Versi agen. 1 = belum punya perintah JSON, 3 = punya pindai tapi belum bisa diperbarui dari panel."""
+    try:
+        r = agent_cmd(dev, "panel", {"action": "info"}, timeout=10)
+        return int(r.get("version") or 0)
+    except AgentOld:
+        return 1
+    except urllib.error.HTTPError as e:
+        return 3 if e.code == 400 else None
+    except Exception:
+        return None
+
+
+def agent_update(dev, user="otomatis"):
+    target = template_version()
+    code = agent_code(dev)
+    if not code:
+        return False, "Template agen di server tidak terbaca."
+    try:
+        r = agent_cmd(dev, user, {"action": "update", "code": code}, timeout=30)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8-sig")).get("msg") or agent_error(e)
+        except Exception:
+            msg = agent_error(e)
+        UPDATE_FAIL[dev["id"]] = time.time()
+        return False, msg
+    except Exception as e:
+        UPDATE_FAIL[dev["id"]] = time.time()
+        return False, agent_error(e)
+    if not r.get("ok"):
+        UPDATE_FAIL[dev["id"]] = time.time()
+        return False, str(r.get("msg") or "Pembaruan ditolak agen.")
+    for _ in range(30):  # tunggu agen dimulai ulang
+        time.sleep(2)
+        v = agent_info(dev)
+        if v == target:
+            set_agent_version(dev, v)
+            UPDATE_FAIL.pop(dev["id"], None)
+            write_log(user, "perbarui-agen", f"{dev['id']}:versi {v}", "-")
+            return True, f"Agen {dev['name']} diperbarui ke versi {v}."
+    UPDATE_FAIL[dev["id"]] = time.time()
+    v = agent_info(dev)
+    if v:
+        set_agent_version(dev, v)
+    return False, "Agen tidak kembali dengan versi baru (versi lama dipulihkan otomatis bila gagal). Lihat agent.log di komputer itu."
+
+
+def maintain_agent(dev):
+    if not dev.get("agent_secret") or not dev.get("ip") or not agent_ping(dev)[0]:
+        return
+    target = template_version()
+    v = dev.get("agent_version")
+    if v is None or v < target:
+        v = agent_info(dev) or v
+        if v:
+            set_agent_version(dev, v)
+    if (v and MIN_UPDATABLE <= v < target and CFG.get("auto_update_agent", True)
+            and time.time() - UPDATE_FAIL.get(dev["id"], 0) > UPDATE_RETRY and dev["id"] not in SCAN_BUSY):
+        SCAN_BUSY.add(dev["id"])
+        try:
+            agent_update(dev)
+        finally:
+            SCAN_BUSY.discard(dev["id"])
+
+
+def maintain_agents():
+    devs = [d for d in list(CFG.get("devices", [])) if d.get("agent_secret") and d.get("ip")]
+    if devs:
+        with ThreadPoolExecutor(max_workers=min(16, len(devs))) as ex:
+            list(ex.map(maintain_agent, devs))
+
+
+def agent_badge(dev):
+    if not dev.get("agent_secret"):
+        return ""
+    v, t = dev.get("agent_version"), template_version()
+    if v is None:
+        return ' <span class="tag">Agen</span>'
+    if v < MIN_UPDATABLE:
+        return f' <span class="tag warn" title="Agen ini belum bisa diperbarui dari panel">Agen v{v} · pasang ulang sekali</span>'
+    if v < t:
+        return f' <span class="tag warn">Agen v{v} · ada versi {t}</span>'
+    return f' <span class="tag ok">Agen v{v}</span>'
 
 
 def new_agent_token(dev_id):
@@ -867,7 +996,7 @@ LOG_LABELS = {
     "lepas-agen": "Melepas agen",
     "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
-    "aturan-aplikasi": "Mengubah aturan aplikasi",
+    "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
 }
 
 
@@ -964,7 +1093,7 @@ def log_list(n=8):
             continue
         ts, who, act, target, ip = r[:5]
         label = LOG_LABELS.get(act, act)
-        if act.startswith(("uninstall", "hapus-otomatis")) and ":" in target:
+        if act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen")) and ":" in target:
             did, info = target.split(":", 1)
             label += f" di {names.get(did, did)} — {info}"
         elif act in ("pindai", "aturan-aplikasi"):
@@ -1087,12 +1216,16 @@ def settings_devices(user, csrf, q):
     rows = []
     for d in CFG["devices"]:
         has_agent = bool(d.get("agent_secret"))
-        tag = ' <span class="tag ok">Bisa dimatikan</span>' if has_agent else ""
+        tag = agent_badge(d)
+        v = d.get("agent_version")
+        upd = (f'<form method="post" action="/devices/agent-update">{hidden(csrf, id=d["id"])}'
+               f'<button class="btn sm primary" data-busy="Memperbarui…">Perbarui agen</button></form>'
+               if v and MIN_UPDATABLE <= v < template_version() else "")
         rows.append(f"""<div class="row"><div class="row-main"><b>{E(d['name'])}</b>{tag}
 <div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div></div>
 <div class="acts"><a class="btn sm" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>
 <form method="post" action="/devices/test">{hidden(csrf, id=d['id'])}<button class="btn sm" data-busy="Mengetes…" title="Cek ARP, ping, port, dan agen">Tes</button></form>
-<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Agar komputer bisa dimatikan dari panel">{'Agen' if has_agent else 'Pasang agen'}</button></form>
+{upd}<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Pasang / pasang ulang agen di komputer ini">{'Pasang ulang' if has_agent else 'Pasang agen'}</button></form>
 {del_form('/devices/delete', csrf, d['name'] + ' akan dihapus dari panel. Data di komputer itu tidak terpengaruh.', 'Hapus ' + d['name'] + '?', id=d['id'])}</div></div>""")
     listing = (f'<div class="card"><div class="list">{"".join(rows)}</div></div>' if rows else
                f'<div class="card empty">{icon("monitor")}<p class="small" style="margin:8px 0 0">Belum ada komputer.</p></div>')
@@ -1512,6 +1645,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.back("/settings", diagnose(dev))
         if path == "/apps/scan":
             return self.do_apps_scan(form, user, ip)
+        if path == "/devices/agent-update":
+            dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
+            if not dev or not dev.get("agent_secret"):
+                return self.back("/settings", "Komputer ini belum dipasangi agen.", True)
+            if dev["id"] in SCAN_BUSY:
+                return self.back("/settings", "Komputer ini sedang diproses, coba sebentar lagi.", True)
+            SCAN_BUSY.add(dev["id"])
+            try:
+                ok, msg = agent_update(dev, user)
+            finally:
+                SCAN_BUSY.discard(dev["id"])
+            return self.back("/settings", msg, not ok)
         if path == "/apps/uninstall":
             return self.do_apps_uninstall(form, user, ip)
         if path == "/apps/dismiss":
@@ -1703,7 +1848,9 @@ class Handler(BaseHTTPRequestHandler):
         if not dev.get("agent_secret"):
             dev["agent_secret"] = secrets.token_hex(32)
             dev.setdefault("agent_port", AGENT_PORT)
-            save_config(CFG)
+        dev.pop("agent_version", None)  # dicek ulang setelah dipasang
+        UPDATE_FAIL.pop(dev["id"], None)
+        save_config(CFG)
         write_log(user, "token-agen", dev["id"], ip)
         self.redirect("/settings?" + urlencode({"agent": dev["id"], "tok": new_agent_token(dev["id"])}) + "#agent")
 
@@ -1713,6 +1860,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.back("/settings", "Komputer tidak ditemukan.", True)
         dev.pop("agent_secret", None)
         dev.pop("agent_port", None)
+        dev.pop("agent_version", None)
         for t, (did, _) in list(AGENT_TOKENS.items()):
             if did == dev["id"]:
                 AGENT_TOKENS.pop(t, None)
