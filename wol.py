@@ -2725,8 +2725,11 @@ class Handler(BaseHTTPRequestHandler):
             if not tu:  # tanyakan langsung ke VM (cepat), tanpa harus klik Cek dulu
                 tu = vm_term_user(vm)
             if not tu:
-                return self._send(200, json.dumps({"error": "VM ini belum memakai versi terbaru. Di menu Server: Lainnya → Pasang ulang, "
-                                                             "lalu jalankan perintahnya di VM lewat sudo -i dari user Anda (mis. andi)."}), "application/json")
+                hv = int(((VMSTATE.get(vm["id"]) or {}).get("data") or {}).get("version") or 0)
+                msg = ("wol-update di VM ini perlu diperbarui. Di menu Server klik Perbarui wol-update pada VM ini, lalu buka terminal lagi."
+                       if hv >= VM_SELF_UPDATE_MIN else
+                       "wol-update di VM ini versi lama. Di menu Server: Lainnya → Pasang ulang, lalu jalankan perintahnya di VM lewat sudo -i.")
+                return self._send(200, json.dumps({"error": msg}), "application/json")
             vm = {**vm, "user": tu}  # masuk sebagai user biasa di VM, bukan root
             try:
                 ensure_term_key()

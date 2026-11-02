@@ -11,7 +11,7 @@
 #   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=4
+WOL_UPDATE_VERSION=5
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -19,6 +19,23 @@ APP_DIR=""
 TERM_USER=""
 WOL_UPDATE_SRC="https://raw.githubusercontent.com/andieawan/wol-panel/main/vm-update.sh"
 [ -f /etc/wol-update.conf ] && . /etc/wol-update.conf
+
+# Migrasi dari versi lama (tanpa TERM_USER): terminal web pindah dari root ke user biasa,
+# root tetap bisa lewat sudo -i. Berjalan sekali, otomatis setelah "Perbarui wol-update".
+if [ -z "$TERM_USER" ] && [ "$(id -u)" = 0 ] && [ -w /etc/wol-update.conf ]; then
+  TERM_USER="$(awk -F: '$3>=1000 && $3<60000 && $7 !~ /(nologin|false)$/ {print $1; exit}' /etc/passwd)"
+  [ -n "$TERM_USER" ] || TERM_USER=root
+  if [ "$TERM_USER" != root ] && grep -q 'wol-panel-terminal$' /root/.ssh/authorized_keys 2>/dev/null; then
+    th="$(getent passwd "$TERM_USER" | cut -d: -f6)"; tg="$(id -gn "$TERM_USER")"
+    install -d -m 700 -o "$TERM_USER" -g "$tg" "$th/.ssh"; touch "$th/.ssh/authorized_keys"
+    sed -i '/wol-panel-terminal$/d' "$th/.ssh/authorized_keys"
+    grep 'wol-panel-terminal$' /root/.ssh/authorized_keys >> "$th/.ssh/authorized_keys"
+    chown "$TERM_USER:$tg" "$th/.ssh/authorized_keys"; chmod 600 "$th/.ssh/authorized_keys"
+    sed -i '/wol-panel-terminal$/d' /root/.ssh/authorized_keys
+  fi
+  echo "TERM_USER=\"$TERM_USER\"" >> /etc/wol-update.conf
+fi
+
 CMD="${SSH_ORIGINAL_COMMAND:-${1:-status}}"
 CMD="${CMD%% *}"
 

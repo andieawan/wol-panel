@@ -225,6 +225,9 @@ Terminal **masuk sebagai user biasa di VM, bukan root**. Usernya adalah user yan
 root, ketik `sudo -i` di terminal; sudo akan meminta password user tersebut di VM. Root hanya dipakai langsung bila VM
 tidak punya user biasa. User yang dipakai tampil di pilihan VM, misalnya `absensi (andi@192.168.10.22)`.
 
+VM yang dipasang sebelum fitur ini (wol-update v4) cukup diklik **Perbarui wol-update** di menu Server: wol-update v5
+memindahkan kunci terminal dari root ke user biasa pertama di VM secara otomatis, tanpa pasang ulang.
+
 Untuk mencabut izin, klik **Cabut terminal** di Server, lalu jalankan perintah pasang yang muncul di VM itu.
 Kunci terminalnya akan dihapus dari VM.
 
