@@ -115,16 +115,30 @@ def magic_packet(mac):
 
 def send_wol(dev):
     pkt = magic_packet(dev["mac"])
-    target = dev.get("broadcast") or "255.255.255.255"
+    # kirim ke broadcast subnet DAN broadcast umum: jika netmask server berbeda,
+    # broadcast subnet bisa dianggap alamat biasa dan paket tidak pernah keluar
+    targets = []
+    for t in (dev.get("broadcast"), "255.255.255.255"):
+        if t and t not in targets:
+            targets.append(t)
     ports = [int(dev.get("port", 9))]
     if ports[0] == 9:
         ports.append(7)  # sebagian kartu jaringan hanya mendengar port 7
+    sent, errors = 0, []
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for _ in range(3):
-            for p in ports:
-                s.sendto(pkt, (target, p))
+            for t in targets:
+                for p in ports:
+                    try:
+                        s.sendto(pkt, (t, p))
+                        sent += 1
+                    except OSError as e:
+                        errors.append(f"{t}: {e.strerror or e}")
             time.sleep(0.1)
+    if not sent:
+        raise OSError("; ".join(sorted(set(errors))))
+    return targets
 
 
 MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
