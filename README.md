@@ -192,6 +192,25 @@ sed -i '/wol-panel-update$/d' /root/.ssh/authorized_keys
 rm -f /usr/local/sbin/wol-update /etc/wol-update.conf
 ```
 
+### Terminal web (menu Terminal)
+
+Terminal web adalah shell root ke VM langsung dari browser, jadi tidak perlu PuTTY. Karena aksesnya sangat besar,
+terminal dibatasi ketat:
+- **Hanya admin.**
+- **Hanya dari jaringan sekolah.** Terminal ditolak bila panel dibuka lewat NPMplus/internet; buka panel langsung
+  di `http://IP-container:8080`.
+- **Wajib mengetik ulang password** setiap 30 menit.
+- **Izin per VM.** Di **Server**, klik **Izinkan terminal**, lalu jalankan perintah pasang yang muncul di VM itu.
+  Kunci terminal terpisah dari kunci update dan hanya diterima dari IP panel.
+- **Semua tampilan sesi direkam** di `/opt/wol-panel/vmlogs/terminal/`.
+- **Ditutup otomatis** setelah 30 menit tanpa aktivitas.
+
+Untuk mencabut izin, klik **Cabut terminal** di Server, lalu jalankan perintah pasang yang muncul di VM itu.
+Kunci terminalnya akan dihapus dari VM.
+
+Komponen tampilan terminal memakai [xterm.js](https://xtermjs.org) (lisensi MIT, lihat `static/XTERM-LICENSE.txt`).
+Komponen ini disimpan di panel, jadi tidak memerlukan internet.
+
 ## 4. Akses dari luar sekolah
 
 Pilih salah satu:

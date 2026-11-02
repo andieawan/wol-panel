@@ -20,6 +20,7 @@ mkdir -p "$DIR"
 install -m 755 "$(dirname "$0")/wol.py" "$DIR/wol.py"
 install -m 644 "$(dirname "$0")/windows-agent.ps1" "$DIR/windows-agent.ps1"
 install -m 644 "$(dirname "$0")/vm-update.sh" "$DIR/vm-update.sh"
+install -d "$DIR/static" && install -m 644 "$(dirname "$0")"/static/* "$DIR/static/"
 
 if [ ! -f "$DIR/config.json" ]; then
   echo "== Buat akun admin WOL Panel =="

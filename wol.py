@@ -15,6 +15,7 @@ Perintah terminal:
   python3 wol.py serve             jalankan panel web
 """
 import base64
+import fcntl
 import fnmatch
 import getpass
 import hashlib
@@ -25,10 +26,13 @@ import json
 import os
 import re
 import secrets
+import signal
+import struct
 import shutil
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
 import urllib.error
@@ -807,10 +811,165 @@ def check_all_vms(only_due=True):
             print("cek VM gagal", vm["id"], e, file=sys.stderr)
 
 
+# ------------------------------------------------------- terminal web (dibatasi)
+TERM_KEY = os.path.join(SSH_DIR, "terminal_ed25519")
+TERM_LOG_DIR = os.path.join(BASE, "vmlogs", "terminal")
+TERM_UNLOCK = {}      # hash token login -> kedaluwarsa (setelah ketik ulang password)
+TERM_UNLOCK_TTL = 30 * 60
+TERM_IDLE = 30 * 60
+TERM_MAX_BUF = 1 << 20
+TERMS = {}            # id sesi -> TermSession
+TERMS_LOCK = threading.Lock()
+
+
+def ensure_term_key():
+    if not os.path.exists(TERM_KEY):
+        os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "wol-panel-terminal", "-f", TERM_KEY], check=True)
+    with open(TERM_KEY + ".pub", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def tok_hash(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def term_unlocked(tok):
+    exp = TERM_UNLOCK.get(tok_hash(tok), 0)
+    if exp > time.time():
+        TERM_UNLOCK[tok_hash(tok)] = time.time() + TERM_UNLOCK_TTL  # diperpanjang selama dipakai
+        return True
+    TERM_UNLOCK.pop(tok_hash(tok), None)
+    return False
+
+
+class TermSession:
+    def __init__(self, vm, user, tok):
+        self.id = secrets.token_urlsafe(16)
+        self.vm, self.user, self.owner = vm, user, tok_hash(tok)
+        self.buf = bytearray()
+        self.base = 0                     # posisi byte pertama di buf
+        self.cond = threading.Condition()
+        self.alive = True
+        self.rc = None
+        self.started = self.last = time.time()
+        os.makedirs(TERM_LOG_DIR, exist_ok=True)
+        self.log_path = os.path.join(TERM_LOG_DIR, f"{vm['id']}-{time.strftime('%Y%m%d-%H%M%S')}-{user}.log")
+        self.log = open(self.log_path, "ab")
+        self.log.write(f"# Terminal {vm['name']} ({vm['host']}) dibuka oleh {user} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        import pty
+        self.master, slave = pty.openpty()
+        self.resize(30, 100)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TERM": "xterm-256color", "LANG": "C.UTF-8", "HOME": BASE}
+
+        def child_setup():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        cmd = ["ssh", "-tt", "-i", TERM_KEY, "-p", str(int(vm.get("port", 22))),
+               "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+               "-o", f"UserKnownHostsFile={os.path.join(SSH_DIR, 'known_hosts')}", "-o", "ConnectTimeout=8",
+               "-o", "ServerAliveInterval=30", "-o", "LogLevel=ERROR", f"{vm.get('user', 'root')}@{vm['host']}"]
+        self.proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, env=env,
+                                     preexec_fn=child_setup, close_fds=True)
+        os.close(slave)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        while True:
+            try:
+                data = os.read(self.master, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            self._append(data)
+        self.rc = self.proc.wait()
+        msg = "\r\n[panel] Sesi selesai." if self.rc in (0, None) else \
+              f"\r\n[panel] Koneksi terputus (kode {self.rc}). Pastikan terminal sudah diizinkan di VM ini."
+        self._append(msg.encode())
+        with self.cond:
+            self.alive = False
+            self.cond.notify_all()
+        try:
+            self.log.write(f"\n# Ditutup — {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+            self.log.close()
+        except Exception:
+            pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+    def _append(self, data):
+        with self.cond:
+            self.buf += data
+            if len(self.buf) > TERM_MAX_BUF:
+                cut = len(self.buf) - TERM_MAX_BUF
+                del self.buf[:cut]
+                self.base += cut
+            self.cond.notify_all()
+        try:
+            self.log.write(data)
+            self.log.flush()
+        except Exception:
+            pass
+
+    def read(self, since, wait=20):
+        end = time.time() + wait
+        with self.cond:
+            while self.alive and self.base + len(self.buf) <= since and time.time() < end:
+                self.cond.wait(max(0.0, end - time.time()))
+            start = max(since, self.base)
+            data = bytes(self.buf[start - self.base:])
+            return data, self.base + len(self.buf), self.alive
+
+    def write(self, data):
+        self.last = time.time()
+        if self.alive:
+            try:
+                os.write(self.master, data)
+            except OSError:
+                pass
+
+    def resize(self, rows, cols):
+        try:
+            fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", max(5, min(rows, 300)), max(20, min(cols, 500)), 0, 0))
+        except OSError:
+            pass
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGHUP)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def term_reaper():
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with TERMS_LOCK:
+            items = list(TERMS.items())
+        for sid, t in items:
+            if t.alive and now - t.last > TERM_IDLE:
+                t._append(b"\r\n[panel] Ditutup otomatis: tidak ada aktivitas 30 menit.")
+                t.close()
+            if not t.alive and now - t.last > 600:
+                with TERMS_LOCK:
+                    TERMS.pop(sid, None)
+
+
 def vm_install_script(vm):
     with open(VM_TEMPLATE, encoding="utf-8") as f:
         helper = f.read()
     pub = ensure_ssh_key()
+    term_pub = ensure_term_key() if vm.get("terminal") else ""
     panel_ip = local_ip_for(vm["host"])
     if "WOLEOF" in helper:
         raise ValueError("template vm-update.sh tidak valid")
@@ -820,6 +979,7 @@ set -e
 [ "$(id -u)" -eq 0 ] || {{ echo "Jalankan sebagai root: sudo -i lalu ulangi perintahnya."; exit 1; }}
 PANEL_IP='{panel_ip}'
 PUBKEY='{pub}'
+TERM_PUBKEY='{term_pub}'
 
 echo "==> Memasang /usr/local/sbin/wol-update"
 cat > /usr/local/sbin/wol-update <<'WOLEOF'
@@ -840,14 +1000,25 @@ echo "    Folder aplikasi: ${{APP_DIR:-(tidak ditemukan — hanya update OS)}}"
 echo "==> Memasang kunci SSH panel (hanya untuk wol-update, hanya dari $PANEL_IP)"
 command -v sshd >/dev/null 2>&1 || {{ apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null; }}
 install -d -m 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
-grep -v 'wol-panel-update$' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
+grep -v -e 'wol-panel-update$' -e 'wol-panel-terminal$' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
 echo "restrict,from=\\"$PANEL_IP\\",command=\\"/usr/local/sbin/wol-update\\" $PUBKEY wol-panel-update" >> /root/.ssh/authorized_keys.tmp
+if [ -n "$TERM_PUBKEY" ]; then
+  # terminal web: shell root, hanya dari IP panel
+  echo "from=\\"$PANEL_IP\\",no-agent-forwarding,no-port-forwarding,no-X11-forwarding $TERM_PUBKEY wol-panel-terminal" >> /root/.ssh/authorized_keys.tmp
+  echo "==> Terminal web DIIZINKAN untuk VM ini (hanya dari $PANEL_IP)"
+else
+  echo "==> Terminal web tidak diizinkan untuk VM ini"
+fi
 mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
 
-if [ "$(sshd -T 2>/dev/null | awk '/^permitrootlogin/{{print $2}}')" = "no" ] && ! grep -q 'WOL Panel' /etc/ssh/sshd_config; then
-  printf '\\n# WOL Panel: root hanya boleh menjalankan perintah terkunci, hanya dari IP panel\\nMatch Address %s\\n    PermitRootLogin forced-commands-only\\n' "$PANEL_IP" >> /etc/ssh/sshd_config
-  echo "    sshd_config: izin root terbatas untuk $PANEL_IP ditambahkan"
+# Izin login root khusus IP panel bila sshd menolak root secara umum
+sed -i '/^# >>> WOL Panel/,/^# <<< WOL Panel/d; /^# WOL Panel: root hanya/,+2d' /etc/ssh/sshd_config
+if [ "$(sshd -T -C user=root,host=x,addr=203.0.113.1 2>/dev/null | awk '/^permitrootlogin/{{print $2}}')" = "no" ]; then
+  MODE=forced-commands-only; [ -n "$TERM_PUBKEY" ] && MODE=prohibit-password
+  printf '\\n# >>> WOL Panel (dikelola otomatis)\\nMatch Address %s\\n    PermitRootLogin %s\\n# <<< WOL Panel\\n' "$PANEL_IP" "$MODE" >> /etc/ssh/sshd_config
+  echo "    sshd_config: root dari $PANEL_IP diizinkan ($MODE)"
 fi
+sshd -t || {{ echo "Konfigurasi sshd tidak valid, dibatalkan."; exit 1; }}
 systemctl enable ssh >/dev/null 2>&1 || true
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
@@ -1229,6 +1400,8 @@ LOG_LABELS = {
     "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
+    "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
+    "terminal-gagal": "Password terminal salah", "terminal-buka-kunci": "Membuka kunci terminal",
     "tambah-vm": "Menambah VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
     "vm-os-upgrade": "Update OS", "vm-os-upgrade-gagal": "Update OS gagal", "vm-app-update": "Update aplikasi",
     "vm-app-update-gagal": "Update aplikasi gagal", "vm-reboot": "Reboot", "vm-reboot-gagal": "Reboot gagal",
@@ -1271,6 +1444,8 @@ def shell(user, csrf, active, content, q, script=""):
     if is_admin(user):
         links.append(("/apps", "Aplikasi"))
         links.append(("/servers", "Server"))
+        if any(v.get("terminal") for v in CFG.get("vms", [])):
+            links.append(("/terminal", "Terminal"))
         links.append(("/settings", "Pengaturan"))
     links.append(("/account", "Akun"))
     nav = "".join(f'<a href="{h}"{" aria-current=page" if h == active else ""}>{t}</a>' for h, t in links)
@@ -1329,7 +1504,7 @@ def log_list(n=8):
             continue
         ts, who, act, target, ip = r[:5]
         label = LOG_LABELS.get(act, act)
-        if act.startswith("vm-") and ":" in target:
+        if (act.startswith("vm-") or act.startswith("terminal")) and ":" in target:
             label += " " + target.split(":", 1)[1]
         elif act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen")) and ":" in target:
             did, info = target.split(":", 1)
@@ -1843,6 +2018,13 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                                 f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit.", f"Update aplikasi di {vm['name']}?"))
             btns.append(act("reboot", "Reboot", "danger" if d.get("reboot") == "1" else "quiet",
                             f"{vm['name']} akan restart 1 menit lagi. Aplikasi di VM ini tidak bisa diakses selama restart.", f"Reboot {vm['name']}?"))
+        if vm.get("terminal"):
+            btns.insert(1, f'<a class="btn sm" href="/terminal?vm={quote(vm["id"])}">Terminal</a>')
+            btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel tidak lagi bisa membuka terminal ke " + vm["name"] + ". Jalankan perintah pasang yang muncul di VM itu untuk mencabut kunci terminalnya.", "Cabut", "Cabut izin terminal?")}>'
+                        f'{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Cabut terminal</button></form>')
+        else:
+            btns.append(f'<form method="post" action="/servers/terminal" {confirm("Panel akan bisa membuka shell root ke " + vm["name"] + " dari jaringan sekolah. Setelah ini jalankan perintah pasang yang muncul di VM itu.", "Izinkan", "Izinkan terminal?")}>'
+                        f'{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Izinkan terminal</button></form>')
         btns.append(f'<form method="post" action="/servers/install">{hidden(csrf, id=vm["id"])}<button class="btn sm quiet">Pasang ulang</button></form>')
         btns.append(del_form("/servers/delete", csrf, f"{vm['name']} dihapus dari panel. Akses SSH panel di VM tetap ada sampai dihapus dari /root/.ssh/authorized_keys.",
                              f"Hapus {vm['name']}?", id=vm["id"]))
@@ -1910,6 +2092,76 @@ document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e
     return shell(user, csrf, "/servers", body, q, js)
 
 
+TERM_JS = """
+(function(){
+var el=document.getElementById('term');if(!el)return;
+var csrf=el.dataset.csrf,sid=null,since=0,alive=false,q=[],sending=false;
+var stat=document.getElementById('tstat'),sel=document.getElementById('tvm'),openBtn=document.getElementById('topen'),closeBtn=document.getElementById('tclose');
+var term=new Terminal({cursorBlink:true,fontSize:14,scrollback:5000,fontFamily:'ui-monospace,"Cascadia Mono",Consolas,monospace',
+  theme:{background:'#0d1117',foreground:'#d1d9e0',cursor:'#d1d9e0',selectionBackground:'#264f78'}});
+var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);fit.fit();
+term.writeln('Pilih VM lalu klik Buka. Sesi direkam dan ditutup otomatis setelah 30 menit tanpa aktivitas.');
+function setStat(t,cls){stat.textContent=t;stat.className='pill '+(cls||'')}
+function post(url,body,type){return fetch(url,{method:'POST',headers:{'X-CSRF':csrf,'Content-Type':type||'application/x-www-form-urlencoded'},body:body})}
+function b64(s){var bin=atob(s),u=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u}
+function poll(){if(!sid)return;var my=sid;
+ fetch('/terminal/out?sid='+encodeURIComponent(my)+'&since='+since,{cache:'no-store'}).then(function(r){
+  if(r.status===401||r.status===403){throw new Error('auth')}return r.json()}).then(function(j){
+  if(my!==sid)return;if(j.d)term.write(b64(j.d));since=j.n;
+  if(j.alive){poll()}else{alive=false;setStat('Terputus','');openBtn.disabled=false;closeBtn.disabled=true;sel.disabled=false}
+ }).catch(function(e){if(e.message==='auth'){setStat('Sesi kunci habis — muat ulang halaman','bad');return}setTimeout(poll,2000)})}
+function flush(){if(sending||!q.length||!sid)return;sending=true;var data=q.join('');q=[];
+ post('/terminal/in?sid='+encodeURIComponent(sid),data,'text/plain;charset=utf-8').finally(function(){sending=false;flush()})}
+term.onData(function(d){if(!alive)return;q.push(d);flush()});
+var rt;function resize(){fit.fit();if(!sid)return;clearTimeout(rt);rt=setTimeout(function(){
+ post('/terminal/resize','sid='+encodeURIComponent(sid)+'&rows='+term.rows+'&cols='+term.cols)},150)}
+window.addEventListener('resize',resize);
+openBtn.onclick=function(){openBtn.disabled=true;sel.disabled=true;setStat('Menyambungkan…','wait');term.reset();
+ post('/terminal/open','vm='+encodeURIComponent(sel.value)+'&rows='+term.rows+'&cols='+term.cols).then(function(r){return r.json()}).then(function(j){
+  if(!j.sid){term.writeln('\\r\\n'+(j.error||'Gagal membuka terminal.'));setStat('Gagal','bad');openBtn.disabled=false;sel.disabled=false;return}
+  sid=j.sid;since=0;alive=true;closeBtn.disabled=false;setStat('Tersambung ke '+sel.options[sel.selectedIndex].text,'on');term.focus();poll();
+ })};
+closeBtn.onclick=function(){if(sid)post('/terminal/close','sid='+encodeURIComponent(sid));closeBtn.disabled=true};
+window.addEventListener('beforeunload',function(){if(sid&&alive)navigator.sendBeacon&&fetch('/terminal/close',{method:'POST',keepalive:true,
+ headers:{'X-CSRF':csrf,'Content-Type':'application/x-www-form-urlencoded'},body:'sid='+encodeURIComponent(sid)})});
+})();
+"""
+
+
+def terminal_page(user, csrf, q, lan_ok, unlocked, panel_url=""):
+    vms = [v for v in CFG.get("vms", []) if v.get("terminal")]
+    head = '<div class="sec-head"><h2>Terminal</h2></div>'
+    if not lan_ok:
+        body = (head + f'<div class="card">{icon("alert")} <b>Terminal hanya bisa dibuka dari jaringan sekolah.</b>'
+                '<p class="mut small" style="margin:8px 0 0">Untuk keamanan, terminal ditolak bila panel dibuka lewat internet / NPMplus. '
+                f'Buka panel langsung dari komputer di jaringan sekolah{": " + E(panel_url) if panel_url else ""}.</p></div>')
+        return shell(user, csrf, "/terminal", body, q)
+    if not vms:
+        body = (head + f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada VM yang diizinkan terminal</h3>'
+                '<p class="small" style="margin:0 0 14px">Di menu Server, klik <b>Izinkan terminal</b> pada VM, lalu jalankan perintah pasangnya di VM itu.</p>'
+                '<a class="btn primary" href="/servers">Buka Server</a></div>')
+        return shell(user, csrf, "/terminal", body, q)
+    if not unlocked:
+        body = head + f"""<section class="card" style="max-width:420px"><h2>Konfirmasi password</h2>
+<p class="mut small" style="margin:0 0 12px">Terminal memberi akses root ke VM. Ketik ulang password akun <b>{E(user)}</b> untuk membukanya selama 30 menit.</p>
+<form method="post" action="/terminal/unlock">{hidden(csrf)}<input type="text" name="username" value="{E(user)}" autocomplete="username" hidden>
+<label>Password<input name="p" type="password" required autofocus autocomplete="current-password"></label>
+<button class="btn primary" data-busy="Memeriksa…">Buka terminal</button></form></section>"""
+        return shell(user, csrf, "/terminal", body, q)
+    pre = q.get("vm", [""])[0]
+    opts = "".join(f'<option value="{E(v["id"])}"{" selected" if v["id"] == pre else ""}>{E(v["name"])} ({E(v["host"])})</option>' for v in vms)
+    body = f"""<link rel="stylesheet" href="/static/xterm.css">
+<div class="sec-head"><h2>Terminal</h2><span id="tstat" class="pill">Belum tersambung</span></div>
+<div class="card" style="padding:12px">
+<div class="inline" style="margin-bottom:10px"><label style="flex:1 1 220px;margin:0">VM<select id="tvm" style="margin-top:4px">{opts}</select></label>
+<button class="btn primary" id="topen" type="button">Buka</button><button class="btn" id="tclose" type="button" disabled>Putuskan</button></div>
+<div id="term" data-csrf="{csrf}" style="height:min(70vh,560px);background:#0d1117;border-radius:9px;padding:6px;overflow:hidden"></div>
+<p class="mut small" style="margin:10px 0 0">Masuk sebagai root. Semua tampilan sesi direkam di panel (<span class="mono">vmlogs/terminal/</span>).
+Salin: pilih teks · Tempel: Ctrl+Shift+V / klik kanan.</p></div>
+<script src="/static/xterm.js"></script><script src="/static/xterm-addon-fit.js"></script>"""
+    return shell(user, csrf, "/terminal", body.replace('"wrap"', '"wrap"'), q, TERM_JS)
+
+
 def account_page(user, csrf, q):
     body = f"""<div class="sec-head"><h2>Akun</h2></div><section class="card"><h2>Ganti password</h2>
 <form method="post" action="/account">{hidden(csrf)}
@@ -1957,7 +2209,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+                         "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
         for k, v in (extra or []):
             self.send_header(k, v)
         self.end_headers()
@@ -1986,6 +2238,14 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/login":
             return self._send(200, login_page())
+        if url.path in ("/static/xterm.js", "/static/xterm-addon-fit.js", "/static/xterm.css"):
+            try:
+                with open(os.path.join(BASE, url.path.lstrip("/")), "rb") as f:
+                    data = f.read()
+            except OSError:
+                return self._send(404, "Tidak ditemukan")
+            ctype = "text/css; charset=utf-8" if url.path.endswith(".css") else "application/javascript; charset=utf-8"
+            return self._send(200, data, ctype, [("Cache-Control", "public, max-age=86400")])
         m = re.fullmatch(r"/vm/([A-Za-z0-9_-]{20,64})\.sh", url.path)
         if m:  # skrip pasang akses update untuk VM (token sementara)
             ent = VM_TOKENS.get(m.group(1))
@@ -2029,6 +2289,22 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin(user):
                 return self.redirect("/")
             return self._send(200, servers_page(user, csrf, q))
+        if url.path == "/terminal":
+            if not is_admin(user):
+                return self.redirect("/")
+            panel = f"http://{self.headers.get('Host', '').split(':')[0] or 'IP-panel'}:{int(CFG.get('port', 8080))}"
+            return self._send(200, terminal_page(user, csrf, q, self.lan_direct(), term_unlocked(tok),
+                                                 "" if self.lan_direct() else "http://<IP container panel>:" + str(int(CFG.get('port', 8080)))))
+        if url.path == "/terminal/out":
+            t = self.term_session(user, tok, q.get("sid", [""])[0])
+            if not t:
+                return self._send(403, '{"error":"sesi"}', "application/json")
+            try:
+                since = int(q.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            data, nxt, alive = t.read(since)
+            return self._send(200, json.dumps({"d": base64.b64encode(data).decode(), "n": nxt, "alive": alive}), "application/json")
         if url.path == "/api/vmjob":
             if not is_admin(user):
                 return self._send(403, "{}", "application/json")
@@ -2048,14 +2324,18 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 20_000:
             return self._send(413, "Terlalu besar")
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True).items()}
+        raw = self.rfile.read(n)
         path = urlparse(self.path).path
+        form = {} if path == "/terminal/in" else \
+            {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True).items()}
         ip = self.client_ip()
 
         if path == "/login":
             return self.do_login(form, ip)
 
         user, tok = self.session()
+        if path.startswith("/terminal/") and path != "/terminal/unlock":
+            return self.do_terminal_api(path, raw, form, user, tok)
         if not user:
             return self.redirect("/login")
         if not hmac.compare_digest(form.get("csrf", ""), csrf_for(tok)):
@@ -2083,6 +2363,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_vm_check(form, user, ip)
         if path == "/servers/run":
             return self.do_vm_run(form, user, ip)
+        if path == "/terminal/unlock":
+            if not self.lan_direct():
+                return self.back("/terminal", "Terminal hanya bisa dibuka dari jaringan sekolah.", True)
+            now = time.time()
+            recent = [t for t in FAILS.get(ip, []) if now - t < FAIL_WINDOW]
+            FAILS[ip] = recent
+            if len(recent) >= FAIL_LIMIT:
+                return self.back("/terminal", "Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi.", True)
+            if not check_password(form.get("p", ""), CFG["users"][user]["hash"]):
+                FAILS[ip].append(now)
+                write_log(user, "terminal-gagal", "-", ip)
+                time.sleep(1)
+                return self.back("/terminal", "Password salah.", True)
+            TERM_UNLOCK[tok_hash(tok)] = now + TERM_UNLOCK_TTL
+            write_log(user, "terminal-buka-kunci", "-", ip)
+            return self.redirect("/terminal")
         if path == "/devices/agent-update":
             dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
             if not dev or not dev.get("agent_secret"):
@@ -2108,6 +2404,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_vm_install(form, user, ip)
             if path == "/servers/interval":
                 return self.do_vm_interval(form, user, ip)
+            if path == "/servers/terminal":
+                return self.do_vm_terminal_toggle(form, user, ip)
             if path == "/apps/rules/add":
                 return self.do_rule_add(form, user, ip)
             if path == "/apps/rules/toggle":
@@ -2256,6 +2554,85 @@ class Handler(BaseHTTPRequestHandler):
         if d.get("app"):
             parts.append(f"{d.get('app_behind', '?')} commit baru")
         return self.back("/servers", f"{vm['name']} dicek: " + ", ".join(parts) + ".")
+
+    def lan_direct(self):
+        """True bila permintaan datang langsung dari jaringan lokal (bukan lewat reverse proxy / internet)."""
+        if any(self.headers.get(h) for h in ("X-Forwarded-For", "X-Real-IP", "Forwarded", "X-Forwarded-Host")):
+            return False
+        try:
+            a = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return a.is_private or a.is_loopback
+
+    def term_session(self, user, tok, sid):
+        if not user or not is_admin(user) or not self.lan_direct() or not term_unlocked(tok):
+            return None
+        t = TERMS.get(sid)
+        return t if t and t.owner == tok_hash(tok) else None
+
+    def do_terminal_api(self, path, raw, form, user, tok):
+        if not user or not is_admin(user):
+            return self._send(401, '{"error":"login"}', "application/json")
+        if not hmac.compare_digest(self.headers.get("X-CSRF", ""), csrf_for(tok)):
+            return self._send(403, '{"error":"csrf"}', "application/json")
+        if not self.lan_direct():
+            return self._send(403, '{"error":"Terminal hanya dari jaringan sekolah."}', "application/json")
+        if not term_unlocked(tok):
+            return self._send(403, '{"error":"Ketik ulang password (muat ulang halaman)."}', "application/json")
+        q = parse_qs(urlparse(self.path).query)
+        if path == "/terminal/open":
+            vm = next((v for v in CFG["vms"] if v["id"] == form.get("vm") and v.get("terminal")), None)
+            if not vm:
+                return self._send(200, json.dumps({"error": "VM ini belum diizinkan terminal."}), "application/json")
+            try:
+                ensure_term_key()
+                t = TermSession(vm, user, tok)
+                t.resize(int(form.get("rows") or 30), int(form.get("cols") or 100))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": f"Gagal membuka SSH: {e}"}), "application/json")
+            with TERMS_LOCK:
+                TERMS[t.id] = t
+            write_log(user, "terminal", f"{vm['id']}:{vm['name']}", self.client_ip())
+            return self._send(200, json.dumps({"sid": t.id}), "application/json")
+        sid = q.get("sid", [""])[0] or form.get("sid", "")
+        t = self.term_session(user, tok, sid)
+        if not t:
+            return self._send(403, '{"error":"sesi"}', "application/json")
+        if path == "/terminal/in":
+            t.write(raw[:65536])
+        elif path == "/terminal/resize":
+            try:
+                t.resize(int(form.get("rows") or 30), int(form.get("cols") or 100))
+            except ValueError:
+                pass
+        elif path == "/terminal/close":
+            t.last = time.time()
+            t.close()
+        else:
+            return self._send(404, "{}", "application/json")
+        return self._send(200, '{"ok":true}', "application/json")
+
+    def do_vm_terminal_toggle(self, form, user, ip):
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        if not vm:
+            return self.back("/servers", "VM tidak ditemukan.", True)
+        vm["terminal"] = not vm.get("terminal")
+        if vm["terminal"]:
+            try:
+                ensure_term_key()
+            except Exception as e:
+                vm["terminal"] = False
+                return self.back("/servers", f"Gagal membuat kunci terminal: {e}", True)
+        else:  # tutup sesi yang masih terbuka ke VM ini
+            for t in list(TERMS.values()):
+                if t.vm["id"] == vm["id"]:
+                    t.close()
+        save_config(CFG)
+        write_log(user, "terminal-izin" if vm["terminal"] else "terminal-cabut", f"{vm['id']}:{vm['name']}", ip)
+        self.redirect("/servers?" + urlencode({"install": vm["id"], "tok": new_vm_token(vm["id"]),
+                                               "msg": ("Terminal diizinkan di panel. " if vm["terminal"] else "Izin terminal dicabut di panel. ")
+                                               + "Jalankan perintah di bawah pada VM itu agar kuncinya ikut diperbarui."}) + "#install")
 
     def do_vm_run(self, form, user, ip):
         vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
@@ -2584,6 +2961,7 @@ def main():
         print(f"WOL Panel berjalan di http://{addr[0]}:{addr[1]}")
         load_scans()
         load_vmstate()
+        threading.Thread(target=term_reaper, daemon=True).start()
         threading.Thread(target=scanner_loop, daemon=True).start()
         ThreadingHTTPServer(addr, Handler).serve_forever()
         return
