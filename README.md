@@ -90,7 +90,12 @@ buka panel dan remote desktop memakai IP lokal seperti di sekolah.
 | Lampu LAN mati saat PC off | ErP/Deep Sleep masih aktif di BIOS |
 | Bisa bangun dari Sleep, tidak dari Shutdown | Fast Startup masih aktif, atau BIOS tidak mendukung WOL dari S5 |
 | Tidak pernah bangun | MAC salah, atau desktop beda jaringan/VLAN dengan server |
-| Status selalu "Mati" padahal menyala | Port cek tertutup firewall — ganti `check_ports` atau izinkan ping |
+| Status selalu "Mati" padahal menyala | Klik **Tes** di Pengaturan. Jika "ARP: tidak ada jawaban", IP salah atau komputer beda jaringan dengan server. Jika arping/ping "tidak diizinkan", jalankan ulang `install.sh` |
+| Tes menulis "MAC TIDAK cocok" | IP yang diisi dipakai perangkat lain — cek IP & MAC dengan `ipconfig /all` di komputer tersebut |
+| Status "Menyala" padahal komputer sedang Sleep | Kartu jaringan Intel dengan *ARP Offload* tetap menjawab ARP saat Sleep. Tombol Hidupkan tetap bisa dipakai |
+
+Status dicek berurutan: port (misalnya 3389), lalu ARP, lalu ping. ARP tetap dijawab Windows walau ping
+diblokir firewall, tapi hanya berfungsi jika server dan komputer berada di jaringan (subnet) yang sama.
 
 **Desktop beda VLAN/subnet dengan server** (misalnya desktop di jaringan lab/kantor yang dipisah MikroTik):
 paket broadcast tidak menyeberang router. Solusinya pasang interface tambahan container di VLAN desktop,

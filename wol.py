@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -125,22 +126,79 @@ def send_wol(dev):
             time.sleep(0.1)
 
 
+MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
+
+
+def check_port(ip, port):
+    try:
+        socket.create_connection((ip, int(port)), timeout=0.8).close()
+        return True
+    except OSError:
+        return False
+
+
+def check_arp(ip):
+    """Kirim ARP request (hanya untuk satu jaringan/subnet yang sama).
+    Windows tetap menjawab ARP walau ping diblokir firewall.
+    Hasil: (True/False/None, mac_yang_menjawab). None = arping tidak tersedia/gagal jalan."""
+    exe = shutil.which("arping")
+    if not exe:
+        return None, None
+    try:
+        r = subprocess.run([exe, "-c", "1", "-w", "1", ip], capture_output=True, text=True, timeout=4)
+    except Exception:
+        return None, None
+    m = MAC_RE.search(r.stdout)
+    if m:
+        return True, normalize_mac(m.group(1))
+    if "Operation not permitted" in r.stderr or "permission" in r.stderr.lower():
+        return None, None
+    return False, None
+
+
+def check_ping(ip):
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", "1", ip], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            return True
+        if "not permitted" in r.stderr or "permission" in r.stderr.lower():
+            return None
+        return False
+    except Exception:
+        return None
+
+
 def is_online(dev):
     ip = dev.get("ip")
     if not ip:
         return None
-    for p in dev.get("check_ports", [3389]):
-        try:
-            socket.create_connection((ip, int(p)), timeout=0.8).close()
-            return True
-        except OSError:
-            pass
-    try:
-        r = subprocess.run(["ping", "-c", "1", "-W", "1", ip],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-        return r.returncode == 0
-    except Exception:
-        return False
+    if any(check_port(ip, p) for p in dev.get("check_ports", [])):
+        return True
+    arp, _ = check_arp(ip)
+    if arp:
+        return True
+    return bool(check_ping(ip))
+
+
+def diagnose(dev):
+    ip = dev.get("ip")
+    if not ip:
+        return "IP komputer belum diisi, status tidak bisa dicek."
+    out = []
+    for p in dev.get("check_ports", []):
+        out.append(f"Port {p}: {'terbuka' if check_port(ip, p) else 'tertutup'}")
+    arp, mac = check_arp(ip)
+    if arp is None:
+        out.append("ARP: arping belum terpasang / tidak diizinkan (jalankan ulang install.sh)")
+    elif arp:
+        cocok = mac == normalize_mac(dev["mac"])
+        out.append(f"ARP: dijawab oleh {mac} ({'MAC cocok' if cocok else 'MAC TIDAK cocok — cek IP/MAC yang diisi'})")
+    else:
+        out.append("ARP: tidak ada jawaban (komputer mati, IP salah, atau beda jaringan)")
+    pg = check_ping(ip)
+    out.append("Ping: " + {True: "menjawab", False: "tidak menjawab (wajar jika diblokir Windows Firewall)",
+                            None: "tidak diizinkan di server (jalankan ulang install.sh)"}[pg])
+    return f"Tes {dev['name']} ({ip}) — " + " · ".join(out)
 
 
 def all_status():
@@ -281,7 +339,6 @@ async function refresh(){
       const [cls,txt]=waking?['wait','Sedang dihidupkan…']:fmt[v];
       b.className='badge '+cls; b.lastElementChild.textContent=txt;
       if(v===true) b.dataset.waking='0';
-      const btn=document.getElementById('btn-'+id); if(btn) btn.disabled=(v===true);
     }
   }catch(e){}
 }
@@ -361,7 +418,9 @@ def settings_page(user, csrf, q):
 
     rows = []
     for d in CFG["devices"]:
-        dl = del_form("/devices/delete", csrf, f"Hapus {d['name']}?", id=d["id"])
+        dl = (f'<form method="post" action="/devices/test">{hidden(csrf, id=d["id"])}'
+              f'<button class="ghost" title="Cek port, ARP, dan ping">Tes</button></form>'
+              + del_form("/devices/delete", csrf, f"Hapus {d['name']}?", id=d["id"]))
         rows.append(f"""<tr><td><b>{E(d['name'])}</b><div class="mut">{E(d['id'])}</div></td>
 <td><code>{E(d['mac'])}</code></td><td>{E(d.get('ip') or '-')}</td>
 <td><div class="acts"><a class="btn ghost" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>{dl}</div></td></tr>""")
@@ -385,7 +444,8 @@ def settings_page(user, csrf, q):
 <label>Port WOL<input name="port" type="number" min="1" max="65535" value="{dv('port', '9')}"></label>
 <label>Port untuk cek status (pisahkan koma)<input name="check_ports" value="{dv('check_ports', '3389')}" placeholder="3389"></label>
 </div>
-<p class="mut" style="margin-top:0">3389 = Remote Desktop, 22 = SSH. Jika port tertutup, status dicek lewat ping.</p>
+<p class="mut" style="margin-top:0">3389 = Remote Desktop, 22 = SSH (boleh dikosongkan). Status juga dicek lewat ARP dan ping,
+jadi tetap terdeteksi walau Remote Desktop tidak aktif. Pakai tombol <b>Tes</b> untuk melihat hasil tiap cara cek.</p>
 <button>{'Simpan perubahan' if ed else 'Tambah komputer'}</button>
 {'<a class="btn ghost" href="/settings">Batal</a>' if ed else ''}</form>"""
 
@@ -545,6 +605,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if not is_admin(user):
             return self._send(403, page("Ditolak", "<p>Hanya admin yang boleh mengubah pengaturan.</p>"))
+        if path == "/devices/test":
+            dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
+            if not dev:
+                return self.back("/settings", "Komputer tidak ditemukan.", True)
+            return self.back("/settings", diagnose(dev))
         with CFG_LOCK:
             if path == "/devices/save":
                 return self.do_device_save(form, user, ip)
