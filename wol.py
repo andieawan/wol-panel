@@ -60,6 +60,8 @@ AGENT_PORT = 8765
 AGENT_TOKENS = {}  # token sekali-pakai untuk unduh pemasang agen -> (id perangkat, kedaluwarsa)
 AGENT_TOKEN_TTL = 900
 JOIN_TEMPLATE = os.path.join(BASE, "windows-join.ps1")
+DEFAULT_GROUP = "Komputer pengguna"
+GROUP_SUGGEST = ("Komputer pengguna", "Komputer lab", "Komputer kantor")
 JOIN_TTL = 24 * 3600   # perintah "Tambah lewat skrip" berlaku 24 jam, boleh dipakai di banyak komputer
 PENDING_MAX = 300
 SHUTDOWN_DELAY = 10  # detik peringatan di layar sebelum komputer mati
@@ -126,6 +128,26 @@ def normalize_mac(mac):
 
 def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:32] or "pc"
+
+
+def clean_group(text):
+    g = re.sub(r"\s+", " ", str(text or "")).strip()[:40]
+    return g or DEFAULT_GROUP
+
+
+def device_groups():
+    """Kategori komputer berurutan sesuai kemunculan pertama di daftar komputer."""
+    out = []
+    for d in CFG.get("devices", []):
+        g = clean_group(d.get("group"))
+        if g not in out:
+            out.append(g)
+    return out
+
+
+def group_datalist(dl_id):
+    opts = list(dict.fromkeys(device_groups() + list(GROUP_SUGGEST)))
+    return f'<datalist id="{dl_id}">' + "".join(f'<option value="{E(o)}">' for o in opts) + "</datalist>"
 
 
 def is_admin(user):
@@ -1240,7 +1262,8 @@ def register_pending(data, from_ip):
         return None, "daftar tunggu di panel penuh, tambahkan/abaikan dulu yang ada"
     ent = {"mac": mac, "host": host, "ip": ip, "prefix": prefix, "adapter": str(data.get("adapter", ""))[:100],
            "wifi": bool(data.get("wifi")), "wol": bool(data.get("wol")), "fast": bool(data.get("fast")),
-           "time": int(time.time()), "from": from_ip, "agent_secret": secrets.token_hex(32), "agent_port": AGENT_PORT}
+           "time": int(time.time()), "from": from_ip, "agent_secret": secrets.token_hex(32), "agent_port": AGENT_PORT,
+           "group": clean_group((CFG.get("join") or {}).get("group"))}
     CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != mac] + [ent]
     save_config(CFG)
     return ent, None
@@ -1262,7 +1285,8 @@ def approve_pending(ent, name=""):
         did, i = base, 2
         while any(d["id"] == did for d in CFG["devices"]):
             did, i = f"{base}-{i}", i + 1
-        dev = {"id": did, "name": name, "mac": ent["mac"], "port": 9, "check_ports": [], "remote_url": DEFAULT_REMOTE, **upd}
+        dev = {"id": did, "name": name, "group": clean_group(ent.get("group")), "mac": ent["mac"], "port": 9,
+               "check_ports": [], "remote_url": DEFAULT_REMOTE, **upd}
         CFG["devices"].append(dev)
         new = True
     CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != ent["mac"]]
@@ -1345,7 +1369,7 @@ def build_device(form, others):
     remote = form.get("remote_url", "").strip() or DEFAULT_REMOTE
     if not re.match(r"^https?://[^\s\"'<>]+$", remote) or len(remote) > 300:
         return None, "Link remote harus diawali http:// atau https://"
-    return {"id": did, "name": name, "mac": mac, "ip": ip, "prefix": prefix, "broadcast": bc,
+    return {"id": did, "name": name, "group": clean_group(form.get("group")), "mac": mac, "ip": ip, "prefix": prefix, "broadcast": bc,
             "port": port, "check_ports": checks, "remote_url": remote}, None
 
 
@@ -1468,6 +1492,14 @@ border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;display:gri
 
 /* device card */
 .dev{display:grid;gap:14px}
+.devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
+.devgrid>.card{margin:0}
+.htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
+.htabs .cnt{font-size:12px;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--card);color:var(--mut);box-shadow:inset 0 0 0 1px var(--line)}
+.htabs a[aria-current=page] .cnt{background:var(--off-soft)}
+.htabs .cnt.on{color:var(--ok);background:var(--ok-soft);box-shadow:none}
+@media (max-width:520px){.devgrid .dev-acts{gap:8px;flex-wrap:nowrap}.devgrid .dev-acts>*{flex:1 1 auto}.devgrid .dev-acts .push{margin:0}
+.devgrid .dev-acts>a.quiet{flex:0 0 auto;width:auto}.devgrid .dev{gap:12px;padding:14px}}
 .dev-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
 .dev-head h2{font-size:17px}
 .meta{color:var(--mut);font-size:13px;display:flex;gap:4px 12px;flex-wrap:wrap;margin-top:2px}
@@ -1623,12 +1655,29 @@ JS_STATUS = """
       for(var id in s){var c=document.getElementById('dev-'+id);if(c)apply(c,s[id]);}
     }catch(e){}
   }
+  // tab kategori di Beranda
+  var htabs=document.querySelectorAll('.htabs a[data-g]');
+  function showTab(g){var ok=false;htabs.forEach(function(t){if(t.dataset.g===g)ok=true});if(!ok)return;
+    htabs.forEach(function(t){if(t.dataset.g===g)t.setAttribute('aria-current','page');else t.removeAttribute('aria-current')});
+    document.querySelectorAll('.hgrp').forEach(function(s){s.hidden=s.id!==g});
+    try{localStorage.setItem('wol-tab',document.getElementById(g).dataset.label)}catch(e){}}
+  htabs.forEach(function(t){t.onclick=function(e){e.preventDefault();showTab(t.dataset.g);history.replaceState(null,'',location.pathname+location.search+'#'+t.dataset.g)}});
+  if(htabs.length){var nav=document.querySelector('.htabs'),want=nav.dataset.focus||(location.hash||'').slice(1);
+    if(!want){try{var l=localStorage.getItem('wol-tab');document.querySelectorAll('.hgrp').forEach(function(s){if(s.dataset.label===l)want=s.id})}catch(e){}}
+    showTab(want||htabs[0].dataset.g)}
+  function counts(){htabs.forEach(function(t){var sec=document.getElementById(t.dataset.g),c=t.querySelector('.cnt');if(!sec||!c)return;
+    var all=sec.querySelectorAll('.dev'),on=0,isSrv=!all.length;
+    if(isSrv){all=sec.querySelectorAll('[id^="hvm-"]');all.forEach(function(e){if(e.querySelector('.pill.on'))on++})}
+    else all.forEach(function(e){if(e.dataset.state==='on')on++});
+    c.textContent=on+'/'+all.length;c.classList.toggle('on',on>0);c.title=on+' dari '+all.length+(isSrv?' aktif':' menyala')})}
+  var _apply=apply;apply=function(c,s){_apply(c,s);counts()};
   refresh();setInterval(refresh,5000);
   async function vms(){
     try{
       var v=await (await fetch('/api/vmstatus',{cache:'no-store'})).json();
       for(var k in v){var e=document.getElementById('hvm-'+k);if(!e||e.dataset.busy)continue;
         var pl=e.querySelector('.pill');pl.className='pill '+(v[k]?'on':'bad');pl.lastChild.textContent=v[k]?'Aktif':'Tidak terjangkau';}
+      counts();
     }catch(e){}
   }
   if(document.querySelector('[id^="hvm-"]')){vms();setInterval(vms,15000)}
@@ -1834,7 +1883,7 @@ def home_servers(csrf):
         note = " WOL Panel diupdate paling akhir lalu restart sebentar." if any(is_panel_vm(vm) for vm, _ in plans) else ""
         upd = (f'<form method="post" action="/servers/update-all" {confirm(lines + "." + note + " Aplikasi yang diupdate tidak bisa diakses ±1 menit.", "Update semua", f"Update {len(plans)} VM?")}>'
                f'{hidden(csrf, back="home")}<button class="btn sm primary" data-busy="Memulai…">Update semua ({len(plans)})</button></form>')
-    return (f'<div class="sec-head"><h2>Server</h2><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{upd}'
+    return (f'<div class="sec-head" style="margin-top:0"><h2 style="white-space:nowrap">{len(vms)} server</h2><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{upd}'
             f'<form method="post" action="/servers/check">{hidden(csrf, id="semua", back="home")}<button class="btn sm" data-busy="Memulai…">Cek semua</button></form>'
             f'<a class="small" href="/servers">Buka Server</a></div></div>'
             f'<div class="card"><div class="list">{"".join(rows)}</div></div>')
@@ -1843,6 +1892,7 @@ def home_servers(csrf):
 def home_page(user, csrf, q):
     waking, stopping = q.get("waking", [""])[0], q.get("stopping", [""])[0]
     cards = []
+    by_group = {}
     for d in CFG.get("devices", []):
         did = E(d["id"])
         pending = "wake" if d["id"] == waking else "stop" if d["id"] == stopping else ""
@@ -1864,9 +1914,10 @@ def home_page(user, csrf, q):
 <p class="dev-note" aria-live="polite"></p>
 <div class="dev-acts">
 <form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="btn primary" data-busy="Mengirim…">{icon('power')}Hidupkan</button></form>
-<a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote {icon('ext')}</a>
+<a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer" title="Buka remote desktop">Remote {icon('ext')}</a>
 {stop}{edit}</div></article>""")
-    if not cards:
+        by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
+    if not by_group:
         tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
             else '<p class="small">Hubungi admin untuk menambahkan komputer.</p>'
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada komputer</h3>'
@@ -1898,12 +1949,33 @@ def home_page(user, csrf, q):
                          f'<p class="mut small" style="margin:12px 0 0">Uninstall manual lewat Settings → Apps di komputer tersebut, lalu klik Pindai di menu Aplikasi. '
                          f'Item hilang sendiri setelah aplikasinya tidak terdeteksi lagi.</p>{more}</div>')
     servers = home_servers(csrf) if is_admin(user) else ""
+    # ---- tab per kategori (+ Server untuk admin)
+    focus = waking or stopping
+    tabs = []
+    for i, (g, gc) in enumerate(by_group.items()):
+        gid = f"k{i}"
+        if focus and any(f'id="dev-{E(focus)}"' in c for c in gc):
+            focus = gid
+        tabs.append((gid, g, len(gc), f'<div class="devgrid">{"".join(gc)}</div>'))
+    if servers:
+        tabs.append(("srv", "Server", len(CFG.get("vms", [])), servers))
+    if len(tabs) > 1:
+        nav = "".join(f'<a href="#{gid}" data-g="{gid}"><span>{E(label)}</span> <span class="cnt" data-n="{n}">{n}</span></a>'
+                      for gid, label, n, _ in tabs)
+        secs = "".join(f'<section class="hgrp" id="{gid}" data-label="{E(label)}"{"" if i == 0 else " hidden"}>{content}</section>'
+                       for i, (gid, label, n, content) in enumerate(tabs))
+        groups_html = (f'<nav class="tabs htabs" aria-label="Kategori"{f" data-focus={chr(34)}{focus}{chr(34)}" if focus in [t[0] for t in tabs] else ""}>{nav}</nav>{secs}')
+    elif tabs:
+        gid, label, n, content = tabs[0]
+        groups_html = f'<div class="sec-head"><h2>{E(label)}</h2></div><section class="hgrp" id="{gid}">{content}</section>'
+    else:
+        groups_html = "".join(cards)
     log = ""
     if is_admin(user):
         rows = log_list()
         if rows:
             log = f'<div class="sec-head"><h2>Aktivitas terakhir</h2></div><div class="card log"><div class="list">{rows}</div></div>'
-    body = (attention + '<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + servers + log
+    body = (attention + groups_html + log
             + '<p class="foot">Status diperbarui otomatis setiap 5 detik.</p>')
     return shell(user, csrf, "/", body, q, JS_STATUS)
 
@@ -1960,7 +2032,7 @@ def settings_devices(user, csrf, q):
                f'<button class="btn sm primary" data-busy="Memperbarui…">Perbarui agen</button></form>'
                if v and MIN_UPDATABLE <= v < template_version() else "")
         rows.append(f"""<div class="row"><div class="row-main"><b>{E(d['name'])}</b>{tag}
-<div class="meta"><span>{E(d['ip'] + '/' + str(d.get('prefix') or 24)) if d.get('ip') else 'IP belum diisi'}</span><span class="mono">{E(d['mac'])}</span></div></div>
+<div class="meta"><span>{E(clean_group(d.get('group')))}</span><span>{E(d['ip'] + '/' + str(d.get('prefix') or 24)) if d.get('ip') else 'IP belum diisi'}</span><span class="mono">{E(d['mac'])}</span></div></div>
 <div class="acts"><a class="btn sm" href="/settings?edit={quote(d['id'])}#form-dev">Ubah</a>
 <form method="post" action="/devices/test">{hidden(csrf, id=d['id'])}<button class="btn sm" data-busy="Mengetes…" title="Cek ARP, ping, port, dan agen">Tes</button></form>
 {upd}<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Pasang / pasang ulang agen di komputer ini">{'Pasang ulang' if has_agent else 'Pasang agen'}</button></form>
@@ -1986,7 +2058,11 @@ def settings_devices(user, csrf, q):
     open_form = " open" if (ed or f or "new" in q or not CFG["devices"]) else ""
     title = f"Ubah {E(ed['name'])}" if ed else "Tambah komputer manual"
     form = f"""<form method="post" action="/devices/save">{hidden(csrf, orig=ed['id'] if ed else '')}
+<div class="grid">
 <label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="mis. Komputer Lab 1"></label>
+<label>Kategori<input name="group" value="{dv('group', DEFAULT_GROUP)}" list="dl-group" maxlength="40" placeholder="{DEFAULT_GROUP}">
+<span class="hint">Jadi tab di Beranda. Ketik baru atau pilih, mis. Komputer lab.</span></label>{group_datalist("dl-group")}
+</div>
 <div class="grid">
 <label>MAC address<input name="mac" value="{dv('mac')}" required class="mono" placeholder="mis. 3C:7C:3F:12:34:56" autocapitalize="characters" spellcheck="false">
 <span class="hint">Dari <span class="mono">ipconfig /all</span>, bagian Ethernet → Physical Address.</span></label>
@@ -2030,6 +2106,8 @@ def settings_devices(user, csrf, q):
         t = time.strftime("%d/%m %H:%M", time.localtime(p["time"]))
         name_in = "" if same else (f'<input name="name" value="{E(p["host"])}" maxlength="60" aria-label="Nama komputer" '
                                    f'style="width:180px;padding:6px 8px">')
+        if not same:
+            notes.insert(0, f'<span class="tag">{E(clean_group(p.get("group")))}</span>')
         prow.append(f"""<div class="row"><div class="row-main"><b>{E(p['host'])}</b> {''.join(notes)}
 <div class="meta"><span>{E(p['ip'])}/{p['prefix']}</span><span class="mono">{E(p['mac'])}</span><span>{E(p.get('adapter', ''))}</span><span>daftar {E(t)}</span></div></div>
 <div class="acts" style="align-items:center"><form method="post" action="/devices/pending-add" style="display:flex;align-items:center;gap:6px;margin:0">{hidden(csrf, mac=p['mac'])}{name_in}
@@ -2052,14 +2130,16 @@ def settings_devices(user, csrf, q):
 <li>Komputer muncul di <b>Menunggu ditambahkan</b> di halaman ini; klik <b>Tambahkan</b>.</li></ol>
 <div class="cmd"><input id="joincmd" readonly value="{E(cmd)}" aria-label="Perintah daftar komputer">
 <button class="btn" type="button" data-copy="joincmd">{icon('copy')}Salin</button></div>
-<p class="mut small" style="margin:10px 0 12px">Bisa dipakai di banyak komputer sampai {E(until)}. Skrip mendeteksi nama, IP, subnet dan MAC, menyalakan
+<p class="mut small" style="margin:10px 0 12px">Komputer masuk kategori <b>{E(clean_group(j.get('group')))}</b>. Bisa dipakai di banyak komputer sampai {E(until)}. Skrip mendeteksi nama, IP, subnet dan MAC, menyalakan
 pengaturan Wake-on-LAN di Windows, memasang agen, lalu mendaftar ke panel. Komputer baru masuk panel setelah Anda klik Tambahkan.
 Wake-on-LAN di BIOS tetap perlu diaktifkan manual.</p>
 <div class="acts"><form method="post" action="/devices/join-revoke">{hidden(csrf)}<button class="btn sm quiet danger">Cabut perintah</button></form></div>"""
     else:
         join_body = f"""<p class="small" style="margin:0 0 12px">Jalankan satu perintah di komputer client: nama, IP, subnet dan MAC terdeteksi otomatis,
 pengaturan Wake-on-LAN di Windows dinyalakan, agen terpasang, lalu komputer muncul di sini tinggal ditambahkan.</p>
-<form method="post" action="/devices/join-new">{hidden(csrf)}<button class="btn primary">Buat perintah</button></form>"""
+<form method="post" action="/devices/join-new" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
+<label style="margin:0;flex:0 1 240px">Kategori<input name="group" value="Komputer lab" list="dl-jgroup" maxlength="40"></label>{group_datalist("dl-jgroup")}
+<button class="btn primary">Buat perintah</button></form>"""
     join_card = f"""<details class="card" id="join"{' open' if j else ''} style="padding:0">
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah lewat skrip (otomatis)</summary>
 <div style="padding:0 16px 16px">{join_body}</div></details>"""
@@ -2905,7 +2985,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/devices/agent-remove":
                 return self.do_agent_remove(form, user, ip)
             if path == "/devices/join-new":
-                CFG["join"] = {"tok": secrets.token_urlsafe(24), "exp": int(time.time()) + JOIN_TTL, "by": user}
+                CFG["join"] = {"tok": secrets.token_urlsafe(24), "exp": int(time.time()) + JOIN_TTL, "by": user,
+                               "group": clean_group(form.get("group") or "Komputer lab")}
                 save_config(CFG)
                 write_log(user, "buat-perintah-daftar", "-", ip)
                 return self.redirect("/settings?tab=komputer#join")
@@ -3363,7 +3444,7 @@ class Handler(BaseHTTPRequestHandler):
         others = [d for d in CFG["devices"] if d["id"] != orig]
         dev, err = build_device(form, others)
         if err:
-            keep = {f"f_{k}": form.get(k, "") for k in ("name", "id", "mac", "ip", "subnet", "broadcast", "port", "check_ports", "remote_url")}
+            keep = {f"f_{k}": form.get(k, "") for k in ("name", "group", "id", "mac", "ip", "subnet", "broadcast", "port", "check_ports", "remote_url")}
             if orig:
                 keep["edit"] = orig
             return self.back("/settings", err, True, **keep)

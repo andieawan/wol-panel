@@ -3,7 +3,7 @@
 Panel web ringan untuk menghidupkan komputer desktop lewat Wake-on-LAN (WOL).
 Berjalan di server (container LXC kecil di Proxmox sudah cukup), satu file Python, tanpa database.
 
-Alurnya: **buka panel → klik Hidupkan → tunggu status "Menyala" (30–90 detik) → klik Buka Remote.**
+Alurnya: **buka panel → klik Hidupkan → tunggu status "Menyala" (30–90 detik) → klik Remote.**
 
 ---
 
@@ -52,10 +52,12 @@ masuk sebagai admin, lalu buka menu **Pengaturan**.
 
 Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layanan:
 
-- **Komputer**: tambah, ubah, hapus. Isi nama, MAC address, IP, dan subnet (`24` atau `255.255.255.0`). ID dibuat otomatis
-  jika dikosongkan. Komputer boleh berada di subnet lain dari panel (lihat *Komputer di subnet lain* di bawah). Cara
+- **Komputer**: tambah, ubah, hapus. Isi nama, kategori, MAC address, IP, dan subnet (`24` atau `255.255.255.0`). ID dibuat
+  otomatis jika dikosongkan. **Kategori** (mis. *Komputer pengguna*, *Komputer lab*, *Lab 2*) menjadi tab di Beranda, jadi
+  yang tampil hanya satu kategori setiap kali. Admin juga melihat tab **Server**. Tiap tab menunjukkan jumlah yang
+  menyala, mis. *Komputer lab 5/20*, dan tab terakhir yang dibuka diingat. Komputer boleh berada di subnet lain dari panel (lihat *Komputer di subnet lain* di bawah). Cara
   paling cepat: **Tambah lewat skrip** (di bawah).
-  Setiap komputer punya tombol **Buka Remote** di Beranda; bawaannya membuka Chrome Remote Desktop
+  Setiap komputer punya tombol **Remote** di Beranda; bawaannya membuka Chrome Remote Desktop
   (remotedesktop.google.com/access), linknya bisa diganti per komputer.
 - **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
   - *Admin*: bisa menyalakan komputer dan mengubah pengaturan.
@@ -76,7 +78,8 @@ systemctl restart wol-panel
 
 ### Tambah komputer lewat skrip
 
-Cocok untuk lab yang komputernya banyak. Di **Pengaturan → Komputer → Tambah lewat skrip**, klik **Buat perintah**,
+Cocok untuk lab yang komputernya banyak. Di **Pengaturan → Komputer → Tambah lewat skrip**, pilih kategorinya
+(mis. *Komputer lab*) lalu klik **Buat perintah**,
 lalu di tiap komputer client buka **Terminal (Admin)** dan tempel perintahnya:
 
 ```powershell
