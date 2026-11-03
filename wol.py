@@ -66,6 +66,7 @@ JOIN_TTL = 24 * 3600   # perintah "Tambah lewat skrip" berlaku 24 jam, boleh dip
 PENDING_MAX = 300
 SHUTDOWN_DELAY = 10  # detik peringatan di layar sebelum komputer mati
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 # ---------------------------------------------------------------- konfigurasi
@@ -148,6 +149,19 @@ def device_groups():
 def group_datalist(dl_id):
     opts = list(dict.fromkeys(device_groups() + list(GROUP_SUGGEST)))
     return f'<datalist id="{dl_id}">' + "".join(f'<option value="{E(o)}">' for o in opts) + "</datalist>"
+
+
+def can_access(user, dev):
+    """Admin: semua komputer. Pengguna: komputer yang diizinkan admin (data lama tanpa daftar = semua)."""
+    rec = CFG["users"].get(user) or {}
+    if rec.get("role") == "admin":
+        return True
+    allowed = rec.get("devices", "*")
+    return allowed == "*" or dev["id"] in allowed
+
+
+def user_devices(user):
+    return [d for d in CFG.get("devices", []) if can_access(user, d)]
 
 
 def is_admin(user):
@@ -1302,8 +1316,8 @@ def vm_online_all():
     return {v["id"]: r for v, r in zip(vms, res)}
 
 
-def all_status():
-    devs = list(CFG.get("devices", []))
+def all_status(devs=None):
+    devs = list(CFG.get("devices", []) if devs is None else devs)
     if not devs:
         return {}
     with ThreadPoolExecutor(max_workers=min(16, len(devs))) as ex:
@@ -1685,7 +1699,7 @@ JS_STATUS = """
 """
 
 LOG_LABELS = {
-    "login": "Masuk ke panel", "nyalakan": "Menyalakan", "matikan": "Mematikan",
+    "login": "Masuk ke panel", "login-admin-luar-ditolak": "Admin ditolak: masuk dari luar jaringan sekolah", "nyalakan": "Menyalakan", "matikan": "Mematikan",
     "simpan-perangkat": "Menyimpan data komputer", "hapus-perangkat": "Menghapus komputer",
     "simpan-pengguna": "Menyimpan pengguna", "hapus-pengguna": "Menghapus pengguna",
     "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
@@ -1765,8 +1779,10 @@ def del_form(action, csrf, text, title="Hapus?", **fields):
             f'{hidden(csrf, **fields)}<button class="btn quiet danger sm">Hapus</button></form>')
 
 
-def login_page(err=""):
+def login_page(err="", external=False):
     e = (f'<div class="flash err" role="alert">{icon("alert")}<div>{E(err)}</div></div>') if err else ""
+    if external:
+        e += '<p class="mut small" style="margin:0 0 12px">Dari luar jaringan sekolah hanya akun pengguna yang bisa masuk. Admin masuk lewat jaringan sekolah atau VPN.</p>'
     return page("Masuk – WOL Panel", f"""<main class="login"><div class="card" style="padding:24px">
 <span class="logo">{icon('power')}</span><h1>WOL Panel</h1>
 <p class="mut">Masuk untuk menyalakan atau mematikan komputer.</p>{e}
@@ -1893,7 +1909,7 @@ def home_page(user, csrf, q):
     waking, stopping = q.get("waking", [""])[0], q.get("stopping", [""])[0]
     cards = []
     by_group = {}
-    for d in CFG.get("devices", []):
+    for d in user_devices(user):
         did = E(d["id"])
         pending = "wake" if d["id"] == waking else "stop" if d["id"] == stopping else ""
         stop = ""
@@ -1919,7 +1935,7 @@ def home_page(user, csrf, q):
         by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
     if not by_group:
         tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
-            else '<p class="small">Hubungi admin untuk menambahkan komputer.</p>'
+            else '<p class="small">Belum ada komputer yang diizinkan untuk akun ini. Hubungi admin.</p>'
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada komputer</h3>'
                      f'<p class="small" style="margin:0 0 14px">Tambahkan komputer yang ingin dinyalakan lewat panel ini.</p>{tip}</div>')
     attention = ""
@@ -2153,23 +2169,49 @@ def settings_users(user, csrf, q):
     rows = []
     for u, v in sorted(CFG["users"].items()):
         me = ' <span class="tag acc">Anda</span>' if u == user else ""
-        role = "Admin" if v.get("role") == "admin" else "Pengguna"
+        if v.get("role") == "admin":
+            role = "Admin · semua komputer & server · hanya jaringan sekolah/VPN"
+        else:
+            acc = v.get("devices", "*")
+            role = "Pengguna · " + ("semua komputer" if acc == "*" else f"{len(acc)} komputer" if acc else "belum ada komputer")
         dl = "" if u == user else del_form("/users/delete", csrf, f"{u} tidak bisa masuk ke panel lagi.", f"Hapus pengguna {u}?", u=u)
         rows.append(f"""<div class="row"><div class="row-main"><b>{E(u)}</b>{me}<div class="mut small">{role}</div></div>
 <div class="acts"><a class="btn sm" href="/settings?tab=pengguna&reset={quote(u)}#form-user">Ubah</a>{dl}</div></div>""")
     sel = lambda r: " selected" if target and CFG["users"][target].get("role") == r else ""
+    # ---- komputer yang boleh diakses (khusus peran Pengguna)
+    cur = (CFG["users"].get(target) or {}).get("devices", "*") if target else []
+    groups = {}
+    for d in CFG.get("devices", []):
+        groups.setdefault(clean_group(d.get("group")), []).append(d)
+    boxes = "".join(
+        f'<fieldset style="border:0;padding:0;margin:0 0 10px"><legend class="small" style="font-weight:600;margin-bottom:4px">{E(g)} '
+        f'<button type="button" class="btn quiet sm grpall" style="padding:2px 8px;font-size:12px">Centang semua</button></legend>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:4px 18px">'
+        + "".join(f'<label class="check" style="margin:0"><input type="checkbox" name="dev_{E(d["id"])}" value="1"'
+                  f'{" checked" if cur != "*" and d["id"] in cur else ""}><span>{E(d["name"])}</span></label>' for d in ds)
+        + '</div></fieldset>' for g, ds in groups.items())
+    access = f"""<div id="acc" style="border-top:1px solid var(--line);margin-top:6px;padding-top:12px">
+<p style="margin:0 0 8px;font-weight:600">Komputer yang boleh diakses</p>
+<label class="check"><input type="checkbox" name="all" value="1" id="accall"{' checked' if cur == '*' else ''}><span>Semua komputer
+<span class="hint">Termasuk komputer yang ditambahkan nanti.</span></span></label>
+<div id="accl">{boxes or '<p class="mut small">Belum ada komputer.</p>'}</div></div>
+<script>(function(){{var r=document.getElementById('role'),a=document.getElementById('acc'),all=document.getElementById('accall'),l=document.getElementById('accl');
+function u(){{a.hidden=r.value==='admin';l.style.opacity=all.checked?.45:1;l.querySelectorAll('input').forEach(function(i){{i.disabled=all.checked}})}}
+r.onchange=u;all.onchange=u;u();
+l.querySelectorAll('.grpall').forEach(function(b){{b.onclick=function(){{var c=b.closest('fieldset').querySelectorAll('input[type=checkbox]'),
+on=[].some.call(c,function(i){{return !i.checked}});c.forEach(function(i){{i.checked=on}})}}}})}})()</script>"""
     uname = (f'<label>Nama pengguna<input value="{E(target)}" readonly><input type="hidden" name="u" value="{E(target)}"></label>' if target else
              f'<label>Nama pengguna<input name="u" required pattern="[A-Za-z0-9._\\-]{{3,32}}" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="mis. guru.tik">'
              f'<span class="hint">3–32 karakter: huruf, angka, titik, minus.</span></label>')
     form = f"""<section class="card" id="form-user"><h2>{('Ubah ' + E(target)) if target else 'Tambah pengguna'}</h2>
 <form method="post" action="/users/save">{hidden(csrf)}
 <div class="grid">{uname}
-<label>Peran<select name="role"><option value="user"{sel('user')}>Pengguna</option><option value="admin"{sel('admin')}>Admin</option></select>
-<span class="hint">Pengguna: menyalakan & mematikan. Admin: juga mengubah pengaturan.</span></label>
-<label>{'Password baru' if target else 'Password'}<input name="p1" type="password" minlength="8" required autocomplete="new-password">
-<span class="hint">Minimal 8 karakter.</span></label>
-<label>Ulangi password<input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
-</div><div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if target else 'Tambah pengguna'}</button>
+<label>Peran<select name="role" id="role"><option value="user"{sel('user')}>Pengguna</option><option value="admin"{sel('admin')}>Admin</option></select>
+<span class="hint">Pengguna: hanya komputer yang dicentang, boleh dari subdomain. Admin: semua komputer & server, hanya dari jaringan sekolah/VPN.</span></label>
+<label>{'Password baru' if target else 'Password'}<input name="p1" type="password" minlength="8"{'' if target else ' required'} autocomplete="new-password">
+<span class="hint">{'Kosongkan bila tidak diganti.' if target else 'Minimal 8 karakter.'}</span></label>
+<label>Ulangi password<input name="p2" type="password" minlength="8"{'' if target else ' required'} autocomplete="new-password"></label>
+</div>{access}<div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if target else 'Tambah pengguna'}</button>
 {'<a class="btn quiet" href="/settings?tab=pengguna">Batal</a>' if target else ''}</div></form></section>"""
     return f'<div class="sec-head"><h2>Daftar pengguna</h2></div><div class="card"><div class="list">{"".join(rows)}</div></div>{form}'
 
@@ -2179,6 +2221,9 @@ def settings_general(user, csrf, q):
 <label class="check"><input type="checkbox" name="trust_proxy" value="1" {'checked' if CFG.get('trust_proxy') else ''}>
 <span>Panel diakses lewat reverse proxy (NPMplus / Nginx)
 <span class="hint">Centang jika panel dibuka lewat subdomain di NPMplus, agar IP asli pengunjung tercatat dan pembatasan login bekerja benar.</span></span></label>
+<label>IP reverse proxy (opsional)<input name="proxy_ips" value="{E(', '.join(CFG.get('proxy_ips', [])))}" placeholder="mis. 192.168.10.5" spellcheck="false">
+<span class="hint">IP container NPMplus. Semua akses dari IP ini dianggap dari luar: hanya akun pengguna yang bisa masuk.
+Tanpa diisi pun, akses lewat proxy sudah dikenali dari header X-Forwarded-For.</span></label>
 <label style="max-width:220px">Lama sesi login<input name="session_hours" type="number" min="1" max="720" value="{int(CFG.get('session_hours', 12))}">
 <span class="hint">Dalam jam (1–720).</span></label>
 <button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
@@ -2727,6 +2772,8 @@ class Handler(BaseHTTPRequestHandler):
         if COOKIE in c:
             tok = c[COOKIE].value
             u = verify_session(tok)
+            if u and is_admin(u) and not self.lan_direct():
+                return None, None  # akun admin hanya dari jaringan sekolah / VPN
             if u:
                 return u, tok
         return None, None
@@ -2769,7 +2816,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/login":
-            return self._send(200, login_page())
+            return self._send(200, login_page(external=not self.lan_direct()))
         if url.path in ("/static/xterm.js", "/static/xterm-addon-fit.js", "/static/xterm.css"):
             try:
                 with open(os.path.join(BASE, url.path.lstrip("/")), "rb") as f:
@@ -2780,7 +2827,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, data, ctype, [("Cache-Control", "public, max-age=86400")])
         m = re.fullmatch(r"/vm/([A-Za-z0-9_-]{20,64})\.sh", url.path)
         if m:  # skrip pasang akses update untuk VM (token sementara)
-            ent = VM_TOKENS.get(m.group(1))
+            ent = VM_TOKENS.get(m.group(1)) if self.lan_direct() else None
             vm = ent and ent[1] > time.time() and next((v for v in CFG["vms"] if v["id"] == ent[0]), None)
             if not vm:
                 return self._send(200, "echo 'Perintah sudah kedaluwarsa. Buat ulang dari WOL Panel: Server -> Pasang ulang.'; exit 1\n",
@@ -2797,7 +2844,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, join_script(self.request.getsockname()[0], j["tok"]), "text/plain; charset=utf-8")
         m = re.fullmatch(r"/agent/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
         if m:  # unduh pemasang agen memakai token sementara (tanpa login, diambil dari komputer tujuan)
-            ent = AGENT_TOKENS.get(m.group(1))
+            ent = AGENT_TOKENS.get(m.group(1)) if self.lan_direct() else None
             dev = ent and ent[1] > time.time() and next((d for d in CFG["devices"] if d["id"] == ent[0]), None)
             if not dev or not dev.get("agent_secret"):
                 return self._send(200, "Write-Host 'Perintah sudah kedaluwarsa. Buat ulang dari WOL Panel: Pengaturan -> Agen.' -ForegroundColor Red\n",
@@ -2814,7 +2861,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             return self._send(200, home_page(user, csrf, q))
         if url.path == "/api/status":
-            return self._send(200, json.dumps(all_status()), "application/json")
+            st = all_status(user_devices(user))
+            return self._send(200, json.dumps(st), "application/json")
         if url.path == "/api/vmstatus":  # dicek terpisah agar status server tidak menunggu cek komputer
             return self._send(200, json.dumps(vm_online_all() if is_admin(user) else {}), "application/json")
         if url.path == "/account":
@@ -3014,20 +3062,24 @@ class Handler(BaseHTTPRequestHandler):
         recent = [t for t in FAILS.get(ip, []) if now - t < FAIL_WINDOW]
         FAILS[ip] = recent
         if len(recent) >= FAIL_LIMIT:
-            return self._send(429, login_page("Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi."))
+            return self._send(429, login_page("Terlalu banyak percobaan gagal. Coba lagi 10 menit lagi.", not self.lan_direct()))
         u, p = form.get("u", ""), form.get("p", "")
         rec = CFG["users"].get(u)
-        if rec and check_password(p, rec["hash"]):
+        ok = rec and check_password(p, rec["hash"])
+        if ok and rec.get("role") == "admin" and not self.lan_direct():
+            write_log(u, "login-admin-luar-ditolak", "-", ip)
+            ok = False  # admin dari luar ditolak dengan pesan yang sama (tidak membocorkan password benar)
+        if ok:
             FAILS.pop(ip, None)
             write_log(u, "login", "-", ip)
             return self.redirect("/", [self.cookie_header(make_session(u), int(CFG.get("session_hours", 12)) * 3600)])
         FAILS[ip].append(now)
         time.sleep(1)
-        return self._send(401, login_page("Nama pengguna atau password salah."))
+        return self._send(401, login_page("Nama pengguna atau password salah.", not self.lan_direct()))
 
     def do_wake(self, form, user, ip):
         dev = next((d for d in CFG.get("devices", []) if d["id"] == form.get("id")), None)
-        if not dev:
+        if not dev or not can_access(user, dev):
             return self.back("/", "Komputer tidak dikenal.", True)
         if time.time() - WAKE_COOLDOWN.get(dev["id"], 0) < 10:
             return self.back("/", "Perintah baru saja dikirim, tunggu sebentar.", waking=dev["id"])
@@ -3042,6 +3094,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_shutdown(self, form, user, ip):
         dev = next((d for d in CFG.get("devices", []) if d["id"] == form.get("id")), None)
+        if dev and not can_access(user, dev):
+            return self.back("/", "Komputer tidak dikenal.", True)
         if not dev or not dev.get("agent_secret") or not dev.get("ip"):
             return self.back("/", "Komputer ini belum dipasangi agen Matikan.", True)
         key = "stop:" + dev["id"]
@@ -3149,14 +3203,16 @@ class Handler(BaseHTTPRequestHandler):
         return self.back("/servers", f"{vm['name']} dicek: " + ", ".join(parts) + ".")
 
     def lan_direct(self):
-        """True bila permintaan datang langsung dari jaringan lokal (bukan lewat reverse proxy / internet)."""
+        """True bila permintaan datang langsung dari jaringan lokal / VPN (bukan lewat reverse proxy / internet)."""
         if any(self.headers.get(h) for h in ("X-Forwarded-For", "X-Real-IP", "Forwarded", "X-Forwarded-Host")):
             return False
+        if self.client_address[0] in CFG.get("proxy_ips", []):
+            return False  # semua yang lewat reverse proxy (subdomain) dianggap dari luar
         try:
             a = ipaddress.ip_address(self.client_address[0])
         except ValueError:
             return False
-        return a.is_private or a.is_loopback
+        return a.is_private or a.is_loopback or a in CGNAT  # CGNAT: VPN seperti Tailscale
 
     def term_session(self, user, tok, sid, ended_ok=False):
         if not user or not is_admin(user) or not self.lan_direct():
@@ -3458,6 +3514,10 @@ class Handler(BaseHTTPRequestHandler):
                     if did == old["id"]:
                         AGENT_TOKENS[t] = (dev["id"], exp)
             CFG["devices"] = [dev if d["id"] == orig else d for d in CFG["devices"]]
+            if old["id"] != dev["id"]:
+                for rec in CFG["users"].values():
+                    if isinstance(rec.get("devices"), list) and old["id"] in rec["devices"]:
+                        rec["devices"] = [dev["id"] if x == old["id"] else x for x in rec["devices"]]
             msg = f"{dev['name']} berhasil diperbarui."
         else:
             CFG["devices"].append(dev)
@@ -3472,6 +3532,9 @@ class Handler(BaseHTTPRequestHandler):
         if not dev:
             return self.back("/settings", "Komputer tidak ditemukan.", True)
         CFG["devices"] = [d for d in CFG["devices"] if d["id"] != did]
+        for rec in CFG["users"].values():
+            if isinstance(rec.get("devices"), list):
+                rec["devices"] = [x for x in rec["devices"] if x != did]
         save_config(CFG)
         write_log(user, "hapus-perangkat", did, ip)
         return self.back("/settings", f"{dev['name']} dihapus.")
@@ -3482,19 +3545,26 @@ class Handler(BaseHTTPRequestHandler):
         p1, p2 = form.get("p1", ""), form.get("p2", "")
         if not USER_RE.match(u):
             return self.back("/settings", "Nama pengguna 3–32 karakter: huruf, angka, titik, minus, garis bawah.", True, f_u=u, tab="pengguna")
-        if len(p1) < 8 or p1 != p2:
-            return self.back("/settings", "Password minimal 8 karakter dan harus sama di kedua kolom.", True, f_u=u, tab="pengguna")
         rec = CFG["users"].get(u)
+        if (p1 or p2 or not rec) and (len(p1) < 8 or p1 != p2):
+            return self.back("/settings", "Password minimal 8 karakter dan harus sama di kedua kolom.", True, f_u=u, tab="pengguna")
         if rec and rec.get("role") == "admin" and role != "admin" and admin_count() <= 1:
             return self.back("/settings", "Harus ada minimal satu admin.", True, f_u=u, tab="pengguna")
         existed = rec is not None
-        CFG["users"][u] = {"hash": hash_password(p1), "role": role, "sv": (rec or {}).get("sv", 0) + (1 if existed else 0)}
+        new = {"hash": hash_password(p1) if p1 else rec["hash"], "role": role,
+               "sv": (rec or {}).get("sv", 0) + (1 if existed and p1 else 0)}
+        if role == "user":
+            ids = {d["id"] for d in CFG.get("devices", [])}
+            new["devices"] = "*" if form.get("all") == "1" else [i for i in (k[4:] for k in form if k.startswith("dev_")) if i in ids]
+        CFG["users"][u] = new
         save_config(CFG)
         write_log(user, "simpan-pengguna", u, ip)
         if u == user:  # mengubah akun sendiri -> perbarui sesi
             return self.redirect("/settings?" + urlencode({"msg": "Akun Anda diperbarui.", "tab": "pengguna"}),
                                  [self.cookie_header(make_session(u), int(CFG.get("session_hours", 12)) * 3600)])
-        return self.back("/settings", f"Pengguna {u} {'diperbarui' if existed else 'ditambahkan'}.", tab="pengguna")
+        acc = new.get("devices")
+        extra = "" if role == "admin" else " Akses: " + ("semua komputer." if acc == "*" else f"{len(acc)} komputer." if acc else "belum ada komputer, centang di Ubah.")
+        return self.back("/settings", f"Pengguna {u} {'diperbarui' if existed else 'ditambahkan'}.{extra}", tab="pengguna")
 
     def do_user_delete(self, form, user, ip):
         u = form.get("u", "")
@@ -3517,6 +3587,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except ValueError:
             return self.back("/settings", "Lama sesi harus 1–720 jam.", True, tab="umum")
+        ips = [x for x in re.split(r"[,\s]+", form.get("proxy_ips", "")) if x]
+        try:
+            ips = [str(ipaddress.ip_address(x)) for x in ips]
+        except ValueError:
+            return self.back("/settings", "IP reverse proxy tidak valid.", True, tab="umum")
+        if self.client_address[0] in ips:
+            return self.back("/settings", "IP itu adalah IP Anda sekarang; admin akan terkunci. Buka panel langsung lewat IP-nya.", True, tab="umum")
+        CFG["proxy_ips"] = ips
         CFG["trust_proxy"] = form.get("trust_proxy") == "1"
         CFG["session_hours"] = hours
         save_config(CFG)

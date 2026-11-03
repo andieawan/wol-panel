@@ -59,10 +59,13 @@ Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layana
   paling cepat: **Tambah lewat skrip** (di bawah).
   Setiap komputer punya tombol **Remote** di Beranda; bawaannya membuka Chrome Remote Desktop
   (remotedesktop.google.com/access), linknya bisa diganti per komputer.
-- **Pengguna**: tambah akun, reset password, hapus. Ada dua peran:
-  - *Admin*: bisa menyalakan komputer dan mengubah pengaturan.
-  - *Pengguna*: hanya bisa menyalakan dan mematikan komputer.
-- **Umum**: mode reverse proxy (NPMplus) dan lama sesi login.
+- **Pengguna**: tambah akun, ubah akses, ganti password (boleh dikosongkan saat mengubah), hapus. Ada dua peran:
+  - *Admin*: semua komputer, server/VM, terminal, dan pengaturan. **Hanya bisa masuk dari jaringan sekolah atau VPN**
+    (buka panel lewat IP langsung, mis. `http://192.168.10.13:8080`).
+  - *Pengguna*: hanya menyalakan dan mematikan **komputer yang dicentang admin** (atau *Semua komputer*, termasuk yang
+    ditambahkan nanti). Boleh masuk lewat subdomain dari luar sekolah. Komputer lain tidak tampil dan tidak bisa
+    dinyalakan walau dicoba lewat alamat langsung. Akun pengguna lama tetap mendapat akses ke semua komputer sampai diubah.
+- **Umum**: mode reverse proxy (NPMplus), IP reverse proxy, dan lama sesi login.
 
 Setiap akun bisa mengganti passwordnya sendiri di menu **Akun**. Riwayat login, perintah menyalakan,
 dan perubahan pengaturan tampil di Beranda untuk admin.
@@ -297,11 +300,19 @@ Komponen ini disimpan di panel, jadi tidak memerlukan internet.
 
 Pilih salah satu:
 
-**A. Lewat subdomain + NPMplus (paling praktis)**
+**A. Lewat subdomain + NPMplus — untuk akun Pengguna**
 1. Cloudflare: buat record `wol.smkibupakusari.sch.id` → IP publik sekolah.
-2. NPMplus: Proxy Host baru → forward ke `192.168.10.20:8080`, aktifkan SSL (Let's Encrypt) + *Force SSL*.
-3. Di panel: **Pengaturan → Umum**, centang *Panel diakses lewat reverse proxy*, lalu Simpan.
-4. Disarankan tambah lapisan kedua: *Access List* di NPMplus (basic auth atau batasi IP).
+2. NPMplus: Proxy Host baru → forward ke `IP-panel:8080`, aktifkan SSL (Let's Encrypt) + *Force SSL*.
+3. Di panel: **Pengaturan → Umum**, centang *Panel diakses lewat reverse proxy*, isi **IP reverse proxy** dengan IP
+   container NPMplus, lalu Simpan.
+
+Semua yang datang lewat subdomain dianggap dari luar. Di sana **akun admin tidak bisa masuk** (pesannya sama dengan
+password salah agar tidak membocorkan apa pun, dan percobaannya tercatat di Riwayat), sesi admin yang sudah ada juga
+ditolak, dan unduhan pemasang agen / skrip VM / skrip daftar komputer tidak dilayani. Terminal tetap hanya untuk
+admin dari jaringan sekolah.
+
+**B. Lewat VPN — untuk admin** — WireGuard di MikroTik atau Tailscale (alamat `100.64.x.x` dikenali sebagai VPN).
+Setelah tersambung VPN, buka panel lewat IP lokalnya (bukan subdomain), seperti di sekolah.
 
 **B. Lewat VPN (paling aman)** — WireGuard di MikroTik atau Tailscale. Setelah tersambung VPN,
 buka panel dan remote desktop memakai IP lokal seperti di sekolah.
