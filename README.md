@@ -64,7 +64,9 @@ Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layana
     (buka panel lewat IP langsung, mis. `http://192.168.10.13:8080`).
   - *Pengguna*: hanya menyalakan dan mematikan **komputer yang dicentang admin** (atau *Semua komputer*, termasuk yang
     ditambahkan nanti). Boleh masuk lewat subdomain dari luar sekolah. Komputer lain tidak tampil dan tidak bisa
-    dinyalakan walau dicoba lewat alamat langsung. Akun pengguna lama tetap mendapat akses ke semua komputer sampai diubah.
+    dinyalakan walau dicoba lewat alamat langsung. Tampilannya sederhana: satu **tombol power bulat besar** per
+    komputer (abu-abu = mati, tekan untuk menghidupkan; hijau = menyala, tekan untuk mematikan; kuning berkedip =
+    sedang diproses) dan tombol Buka Remote. Akun pengguna lama tetap mendapat akses ke semua komputer sampai diubah.
 - **Umum**: mode reverse proxy (NPMplus), IP reverse proxy, dan lama sesi login.
 
 Setiap akun bisa mengganti passwordnya sendiri di menu **Akun**. Riwayat login, perintah menyalakan,

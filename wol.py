@@ -1506,6 +1506,29 @@ border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;display:gri
 
 /* device card */
 .dev{display:grid;gap:14px}
+.pw{justify-items:center;text-align:center;gap:10px;padding:22px 18px}
+.pw h2{font-size:18px;margin:0}
+.pw form,.pw .pwr-on{display:grid;justify-items:center;gap:20px;margin:14px 0 4px}
+.pw .a-stop,.pw .pwr-on{display:none}
+.pw[data-state=on] .a-stop,.pw[data-state=on] .pwr-on{display:grid}
+.pwr{width:150px;height:150px;border-radius:50%;border:2px solid var(--line);background:var(--card);color:var(--mut);
+ display:grid;place-items:center;cursor:pointer;box-shadow:0 0 0 10px var(--off-soft),var(--shadow);
+ transition:background .2s,color .2s,box-shadow .2s,transform .1s;-webkit-tap-highlight-color:transparent}
+.pwr svg{width:64px;height:64px;stroke-width:2.2}
+button.pwr:hover{color:var(--acc);border-color:var(--acc)}
+button.pwr:active{transform:scale(.96)}
+button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
+.pw[data-state=on] .pwr{background:var(--ok);border-color:var(--ok);color:#fff;box-shadow:0 0 0 10px var(--ok-soft),var(--shadow)}
+.pw[data-state=on] button.pwr:hover{background:var(--err);border-color:var(--err)}
+.pw[data-state=wake] .pwr,.pw[data-state=stop] .pwr{background:var(--warn);border-color:var(--warn);color:#fff;cursor:wait;
+ animation:pwr-pulse 1.4s ease-in-out infinite}
+@keyframes pwr-pulse{0%,100%{box-shadow:0 0 0 10px var(--warn-soft)}50%{box-shadow:0 0 0 20px var(--warn-soft)}}
+@media (prefers-reduced-motion:reduce){.pw .pwr{animation:none!important}}
+.pwr-t{font-size:13px;color:var(--mut);font-weight:600}
+.pw[data-state=wake] .pwr-t,.pw[data-state=stop] .pwr-t,.pw[data-state=checking] .pwr-t{visibility:hidden}
+.pw .a-remote{margin-top:4px}
+.pw[data-state=on] .a-remote{background:var(--acc);border-color:var(--acc);color:#fff}
+.devgrid:has(> .pw:only-child){grid-template-columns:minmax(0,420px);justify-content:center}
 .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
 .devgrid>.card{margin:0}
 .htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
@@ -1655,8 +1678,11 @@ JS_STATUS = """
     card.querySelector('.dev-note').textContent=N[st]||'';
     var w=card.querySelector('.a-wake button');
     if(w){var busy=st==='wake'||st==='stop';w.disabled=busy;
-      w.innerHTML=st==='wake'?'<span class="spin"></span>Menyalakan…':w.dataset.label;}
+      if(!w.classList.contains('pwr'))w.innerHTML=st==='wake'?'<span class="spin"></span>Menyalakan…':w.dataset.label;}
   }
+  document.querySelectorAll('.pw form').forEach(function(f){f.addEventListener('submit',function(){
+    if(f.dataset.confirm&&f.dataset.confirmed!=='1')return;  // tunggu konfirmasi
+    var c=f.closest('.dev');c.dataset.state=f.classList.contains('a-wake')?'wake':'stop'})});
   document.querySelectorAll('.dev').forEach(function(c){
     var w=c.querySelector('.a-wake button');if(w)w.dataset.label=w.innerHTML;
     if(c.dataset.pending)apply(c,null);
@@ -1923,6 +1949,20 @@ def home_page(user, csrf, q):
             if nf:
                 warn = f'<div style="margin-top:6px"><a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a></div>'
         edit = (f'<a class="btn quiet sm" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a>' if is_admin(user) else "")
+        if not is_admin(user):  # pengguna biasa: satu tombol power besar
+            off = (f'<form class="a-stop" method="post" action="/shutdown" '
+                   f'{confirm(d["name"] + " akan mati 10 detik setelah ini. Simpan dulu pekerjaan di komputer itu.", "Matikan", "Matikan " + d["name"] + "?")}>'
+                   f'{hidden(csrf, id=d["id"])}<button class="pwr" aria-label="Matikan {E(d["name"])}">{icon("power")}</button>'
+                   f'<span class="pwr-t">Tekan untuk mematikan</span></form>' if d.get("agent_secret") else
+                   f'<div class="pwr-on"><span class="pwr" aria-hidden="true">{icon("power")}</span><span class="pwr-t">Menyala</span></div>')
+            cards.append(f"""<article class="card dev pw" id="dev-{did}" data-state="checking" data-pending="{pending}">
+<h2>{E(d['name'])}</h2><span class="pill"><span class="dot"></span><span>Mengecek…</span></span>
+<form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="pwr" aria-label="Hidupkan {E(d['name'])}">{icon('power')}</button>
+<span class="pwr-t">Tekan untuk menghidupkan</span></form>{off}
+<p class="dev-note" aria-live="polite"></p>
+<a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote {icon('ext')}</a></article>""")
+            by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
+            continue
         cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
 <div class="dev-head"><div><h2>{E(d['name'])}</h2>
 <div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}</div>
