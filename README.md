@@ -126,6 +126,12 @@ sebagai alamat broadcast:
 Lalu di panel, **Ubah** komputer → **Pengaturan lanjutan** → **Alamat WOL tambahan**: `192.168.20.254`. Paket yang
 dikirim ke IP itu diteruskan MikroTik sebagai broadcast di subnet lab.
 
+Status Menyala/Mati untuk komputer beda subnet tidak bisa memakai ARP (ARP tidak menembus router). Panel memakai
+port agen (8765, hanya dibuka untuk IP panel), port cek, dan ping. Jadi pasang agen di komputer itu, atau isi *Port
+untuk cek status* (mis. 3389). Pastikan firewall MikroTik (chain forward) mengizinkan IP panel ke subnet itu:
+UDP 7 & 9 (WOL), TCP 8765 (agen), dan ICMP, dan tidak ada masquerade/srcnat untuk lalu lintas antar subnet lokal
+(agen hanya menerima IP panel).
+
 ### Mematikan komputer dari panel
 
 WOL hanya bisa menyalakan. Untuk tombol **Matikan**, komputer Windows perlu dipasangi agen kecil

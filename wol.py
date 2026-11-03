@@ -299,15 +299,28 @@ def check_ping(ip):
         return None
 
 
+def same_subnet(dev):
+    """True bila panel satu subnet dengan komputer (ARP hanya bekerja di subnet yang sama)."""
+    net = dev_network(dev)
+    try:
+        return bool(net) and ipaddress.IPv4Address(local_ip_for(dev["ip"])) in net
+    except (OSError, ValueError):
+        return True
+
+
 def is_online(dev):
     ip = dev.get("ip")
     if not ip:
         return None
-    if any(check_port(ip, p) for p in dev.get("check_ports", [])):
+    ports = list(dev.get("check_ports", []))
+    if dev.get("agent_secret"):  # port agen hanya dibuka untuk IP panel: tembus antar subnet
+        ports.append(int(dev.get("agent_port", AGENT_PORT)))
+    if any(check_port(ip, p) for p in ports):
         return True
-    arp, _ = check_arp(ip)
-    if arp:
-        return True
+    if same_subnet(dev):
+        arp, _ = check_arp(ip)
+        if arp:
+            return True
     return bool(check_ping(ip))
 
 
@@ -318,8 +331,11 @@ def diagnose(dev):
     out = []
     for p in dev.get("check_ports", []):
         out.append(f"Port {p}: {'terbuka' if check_port(ip, p) else 'tertutup'}")
-    arp, mac = check_arp(ip)
-    if arp is None:
+    arp, mac = check_arp(ip) if same_subnet(dev) else ("beda", None)
+    if arp == "beda":
+        out.append(f"ARP: tidak dipakai (beda subnet dengan panel); status dicek lewat port agen"
+                   f"{' & port cek' if dev.get('check_ports') else ''} dan ping")
+    elif arp is None:
         out.append("ARP: arping belum terpasang / tidak diizinkan (jalankan ulang install.sh)")
     elif arp:
         cocok = mac == normalize_mac(dev["mac"])
