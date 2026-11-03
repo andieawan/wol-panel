@@ -219,6 +219,10 @@ tiap VM urutannya *Perbarui wol-update → Update OS → Update aplikasi*, hanya
 berhenti bila satu langkah gagal. VM-VM berjalan bersamaan; VM WOL Panel sendiri diproses paling akhir karena panel
 restart sebentar setelah diupdate. Daftar yang akan dijalankan tampil di jendela konfirmasi.
 
+Ringkasan server juga tampil di **Beranda** (khusus admin): status aktif/tidak terjangkau (dicek tiap 15 detik lewat
+port SSH), OS, lama menyala, disk, jumlah pembaruan, perlu reboot, proses yang sedang berjalan, plus tombol **Cek semua**,
+**Update semua**, **Terminal**, dan **Kelola**.
+
 Cara menyambungkan VM:
 1. **Server → Tambah VM**: isi nama dan IP VM. Panel menampilkan satu perintah.
 2. Di konsol VM (Proxmox → Console), masuk sebagai root, tempel perintah itu, lalu Enter.

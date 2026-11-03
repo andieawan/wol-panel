@@ -1269,6 +1269,15 @@ def approve_pending(ent, name=""):
     return dev, new
 
 
+def vm_online_all():
+    vms = list(CFG.get("vms", []))
+    if not vms:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(16, len(vms))) as ex:
+        res = list(ex.map(lambda v: check_port(v["host"], int(v.get("port", 22))), vms))
+    return {v["id"]: r for v, r in zip(vms, res)}
+
+
 def all_status():
     devs = list(CFG.get("devices", []))
     if not devs:
@@ -1615,6 +1624,14 @@ JS_STATUS = """
     }catch(e){}
   }
   refresh();setInterval(refresh,5000);
+  async function vms(){
+    try{
+      var v=await (await fetch('/api/vmstatus',{cache:'no-store'})).json();
+      for(var k in v){var e=document.getElementById('hvm-'+k);if(!e||e.dataset.busy)continue;
+        var pl=e.querySelector('.pill');pl.className='pill '+(v[k]?'on':'bad');pl.lastChild.textContent=v[k]?'Aktif':'Tidak terjangkau';}
+    }catch(e){}
+  }
+  if(document.querySelector('[id^="hvm-"]')){vms();setInterval(vms,15000)}
 })();
 """
 
@@ -1754,6 +1771,75 @@ def log_list(n=8):
     return "".join(rows)
 
 
+def home_servers(csrf):
+    """Ringkasan Server / VM di Beranda (admin): status, pembaruan, dan pintasan."""
+    vms = CFG.get("vms", [])
+    if not vms:
+        return ""
+    rows = []
+    for vm in vms:
+        st = VMSTATE.get(vm["id"]) or {}
+        d = st.get("data") or {}
+        job = VM_JOBS.get(vm["id"])
+        running = bool(job and job.get("end") is None)
+        tags = []
+        if running:
+            tags.append(f'<span class="tag warn">{E(VM_ACTIONS.get(job["action"], job["action"]))} berjalan…</span>')
+        elif time.time() - st.get("rebooting", 0) < 900:
+            tags.append('<span class="tag warn">Sedang restart…</span>')
+        if st.get("error"):
+            tags.append(f'<span class="tag bad" title="{E(st["error"])}">Cek gagal</span>')
+        elif d:
+            up, sec = int(d.get("upgradable") or 0), int(d.get("security") or 0)
+            if up:
+                tags.append(f'<span class="tag {"bad" if sec else "warn"}">{up} pembaruan OS' + (f" · {sec} keamanan" if sec else "") + "</span>")
+            b = d.get("app_behind")
+            if d.get("app") and b not in (None, "", "0", "?"):
+                tags.append(f'<span class="tag warn">{E(b)} commit baru</span>')
+            if d.get("reboot") == "1":
+                tags.append('<span class="tag bad">Perlu reboot</span>')
+            hv = int(d.get("version") or 0)
+            if hv and hv < vm_template_version():
+                tags.append(f'<span class="tag warn">wol-update v{hv}</span>')
+            if not tags:
+                tags.append('<span class="tag ok">Terbaru</span>')
+        else:
+            tags.append('<span class="tag">Belum dicek</span>')
+        lj = st.get("last_job")
+        if lj and lj.get("rc") not in (0, None) and not running:
+            tags.append(f'<span class="tag bad">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} gagal</span>')
+        meta = [E(vm["host"])]
+        if d.get("os"):
+            meta.append(E(d["os"]))
+        if d.get("uptime"):
+            meta.append(fmt_uptime(d["uptime"]))
+        if d.get("disk"):
+            meta.append(f"disk {E(d['disk'])}")
+        if st.get("checked"):
+            meta.append("dicek " + fmt_time(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["checked"]))))
+        term = (f'<a class="btn sm" href="/terminal?vm={quote(vm["id"])}">Terminal</a>' if vm.get("terminal") else "")
+        busy = ' data-busy="1"' if running else ""
+        pill = ('<span class="pill wait"><span class="dot"></span><span>Sedang diproses</span></span>' if running else
+                '<span class="pill"><span class="dot"></span><span>Mengecek…</span></span>')
+        rows.append(f"""<div class="row" id="hvm-{E(vm['id'])}"{busy}><div class="row-main">
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><b>{E(vm['name'])}</b>{pill}</div>
+<div class="meta">{''.join(f'<span>{m}</span>' for m in meta)}</div>
+<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">{''.join(tags)}</div></div>
+<div class="acts">{term}<a class="btn sm" href="/servers#vm-{quote(vm['id'])}">Kelola</a></div></div>""")
+    plans = [(vm, vm_update_plan(vm)) for vm in vms if not vm_job_running(vm["id"])]
+    plans = [(vm, st) for vm, st in plans if st]
+    upd = ""
+    if plans:
+        lines = "; ".join(f"{vm['name']}: " + ", ".join(VM_ACTIONS[a] for a in st) for vm, st in plans)
+        note = " WOL Panel diupdate paling akhir lalu restart sebentar." if any(is_panel_vm(vm) for vm, _ in plans) else ""
+        upd = (f'<form method="post" action="/servers/update-all" {confirm(lines + "." + note + " Aplikasi yang diupdate tidak bisa diakses ±1 menit.", "Update semua", f"Update {len(plans)} VM?")}>'
+               f'{hidden(csrf, back="home")}<button class="btn sm primary" data-busy="Memulai…">Update semua ({len(plans)})</button></form>')
+    return (f'<div class="sec-head"><h2>Server</h2><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{upd}'
+            f'<form method="post" action="/servers/check">{hidden(csrf, id="semua", back="home")}<button class="btn sm" data-busy="Memulai…">Cek semua</button></form>'
+            f'<a class="small" href="/servers">Buka Server</a></div></div>'
+            f'<div class="card"><div class="list">{"".join(rows)}</div></div>')
+
+
 def home_page(user, csrf, q):
     waking, stopping = q.get("waking", [""])[0], q.get("stopping", [""])[0]
     cards = []
@@ -1811,12 +1897,13 @@ def home_page(user, csrf, q):
                          f'<div class="card" style="border-color:color-mix(in srgb,var(--err) 40%,var(--line))"><div class="list">{"".join(rows)}</div>'
                          f'<p class="mut small" style="margin:12px 0 0">Uninstall manual lewat Settings → Apps di komputer tersebut, lalu klik Pindai di menu Aplikasi. '
                          f'Item hilang sendiri setelah aplikasinya tidak terdeteksi lagi.</p>{more}</div>')
+    servers = home_servers(csrf) if is_admin(user) else ""
     log = ""
     if is_admin(user):
         rows = log_list()
         if rows:
             log = f'<div class="sec-head"><h2>Aktivitas terakhir</h2></div><div class="card log"><div class="list">{rows}</div></div>'
-    body = (attention + '<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + log
+    body = (attention + '<div class="sec-head"><h2>Komputer</h2></div>' + "".join(cards) + servers + log
             + '<p class="foot">Status diperbarui otomatis setiap 5 detik.</p>')
     return shell(user, csrf, "/", body, q, JS_STATUS)
 
@@ -2648,6 +2735,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, home_page(user, csrf, q))
         if url.path == "/api/status":
             return self._send(200, json.dumps(all_status()), "application/json")
+        if url.path == "/api/vmstatus":  # dicek terpisah agar status server tidak menunggu cek komputer
+            return self._send(200, json.dumps(vm_online_all() if is_admin(user) else {}), "application/json")
         if url.path == "/account":
             return self._send(200, account_page(user, csrf, q))
         if url.path == "/settings":
@@ -2746,11 +2835,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_vm_run(form, user, ip)
         if path == "/servers/update-all":
             n = sum(1 for vm in CFG.get("vms", []) if not vm_job_running(vm["id"]) and vm_update_plan(vm))
+            dest = "/" if form.get("back") == "home" else "/servers"
             if not n:
-                return self.back("/servers", "Tidak ada pembaruan. Klik Cek semua dulu untuk memastikan.")
+                return self.back(dest, "Tidak ada pembaruan. Klik Cek semua dulu untuk memastikan.")
             write_log(user, "vm-update-semua", f"{n} VM", ip)
             threading.Thread(target=update_all_vms, args=(user,), daemon=True).start()
-            return self.back("/servers", f"Update {n} VM dimulai. Proses tiap VM tampil di kartunya masing-masing.")
+            return self.back(dest, f"Update {n} VM dimulai. Proses tiap VM tampil di kartunya masing-masing (menu Server).")
         if path == "/terminal/unlock":  # dipanggil dari layar login di dalam terminal
             reply = lambda d: self._send(200, json.dumps(d), "application/json")
             if not self.lan_direct():
@@ -2957,7 +3047,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_vm_check(self, form, user, ip):
         if form.get("id") == "semua":
             threading.Thread(target=check_all_vms, kwargs={"only_due": False}, daemon=True).start()
-            return self.back("/servers", "Pengecekan semua VM berjalan di latar belakang. Muat ulang halaman ini dalam 1 menit.")
+            return self.back("/" if form.get("back") == "home" else "/servers",
+                             "Pengecekan semua VM berjalan di latar belakang. Muat ulang halaman ini dalam 1 menit.")
         vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
         if not vm:
             return self.back("/servers", "VM tidak ditemukan.", True)
