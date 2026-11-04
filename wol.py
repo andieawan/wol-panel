@@ -1545,14 +1545,16 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .pw .a-remote{margin-top:4px}
 .pw[data-state=on] .a-remote{background:var(--acc);border-color:var(--acc);color:#fff}
 .devgrid:has(> .pw:only-child){grid-template-columns:minmax(0,420px);justify-content:center}
+.adm{display:flex;gap:14px;margin-top:6px}.adm form{margin:0}
+.lnk{background:none;border:0;padding:2px 0;font:inherit;font-size:13px;font-weight:600;color:var(--acc);cursor:pointer;text-decoration:none}
+.lnk:hover{text-decoration:underline}.lnk:disabled{color:var(--mut);cursor:wait}
 .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
 .devgrid>.card{margin:0}
 .htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
 .htabs .cnt{font-size:12px;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--card);color:var(--mut);box-shadow:inset 0 0 0 1px var(--line)}
 .htabs a[aria-current=page] .cnt{background:var(--off-soft)}
 .htabs .cnt.on{color:var(--ok);background:var(--ok-soft);box-shadow:none}
-@media (max-width:520px){.devgrid .dev-acts{gap:8px;flex-wrap:nowrap}.devgrid .dev-acts>*{flex:1 1 auto}.devgrid .dev-acts .push{margin:0}
-.devgrid .dev-acts>a.quiet{flex:0 0 auto;width:auto}.devgrid .dev{gap:12px;padding:14px}}
+@media (max-width:520px){.devgrid .dev-acts{gap:8px;flex-wrap:nowrap}.devgrid .dev-acts>*{flex:1 1 auto}.devgrid .dev-acts .push{margin:0}.devgrid .dev{gap:12px;padding:14px}}
 .dev-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
 .dev-head h2{font-size:17px}
 .meta{color:var(--mut);font-size:13px;display:flex;gap:4px 12px;flex-wrap:wrap;margin-top:2px}
@@ -1964,7 +1966,9 @@ def home_page(user, csrf, q):
             nf = len(flagged(d["id"]))
             if nf:
                 warn = f'<div style="margin-top:6px"><a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a></div>'
-        edit = (f'<a class="btn quiet sm" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a>' if is_admin(user) else "")
+        edit = (f'<div class="adm"><form method="post" action="/devices/test">{hidden(csrf, id=d["id"], back="home")}'
+                f'<button class="lnk" data-busy="Mengetes…" title="Cek port, ARP, ping, dan agen">Tes</button></form>'
+                f'<a class="lnk" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a></div>' if is_admin(user) else "")
         if not is_admin(user):  # pengguna biasa: satu tombol power besar
             off = (f'<form class="a-stop" method="post" action="/shutdown" '
                    f'{confirm(d["name"] + " akan mati 10 detik setelah ini. Simpan dulu pekerjaan di komputer itu.", "Matikan", "Matikan " + d["name"] + "?")}>'
@@ -1981,13 +1985,13 @@ def home_page(user, csrf, q):
             continue
         cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
 <div class="dev-head"><div><h2>{E(d['name'])}</h2>
-<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}</div>
+<div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}{edit}</div>
 <span class="pill"><span class="dot"></span><span>Mengecek…</span></span></div>
 <p class="dev-note" aria-live="polite"></p>
 <div class="dev-acts">
 <form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="btn primary" data-busy="Mengirim…">{icon('power')}Hidupkan</button></form>
 <a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer" title="Buka remote desktop">Remote {icon('ext')}</a>
-{stop}{edit}</div></article>""")
+{stop}</div></article>""")
         by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
     if not by_group:
         tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
@@ -3008,9 +3012,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, page("Ditolak", "<p>Hanya admin yang boleh mengubah pengaturan.</p>"))
         if path == "/devices/test":
             dev = next((d for d in CFG["devices"] if d["id"] == form.get("id")), None)
+            dest = "/" if form.get("back") == "home" else "/settings"
             if not dev:
-                return self.back("/settings", "Komputer tidak ditemukan.", True)
-            return self.back("/settings", diagnose(dev))
+                return self.back(dest, "Komputer tidak ditemukan.", True)
+            return self.back(dest, diagnose(dev))
         if path == "/apps/scan":
             return self.do_apps_scan(form, user, ip)
         if path == "/servers/check":
