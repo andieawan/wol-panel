@@ -52,7 +52,10 @@ masuk sebagai admin, lalu buka menu **Pengaturan**.
 
 Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layanan:
 
-- **Komputer**: tambah, ubah, hapus. Isi nama, kategori, MAC address, IP, dan subnet (`24` atau `255.255.255.0`). ID dibuat
+- **Komputer desktop** dan **Komputer lab** (dua tab terpisah): tambah, ubah, hapus. Masing-masing punya daftar,
+  *Menunggu ditambahkan*, *Tambah lewat skrip* (perintahnya terpisah, jadi komputer langsung masuk tab yang benar),
+  *Cari di jaringan*, dan tambah manual. Jenis bisa dipindah lewat **Ubah → Jenis**. Komputer lama otomatis masuk
+  *Komputer lab* bila kategorinya mengandung kata "lab". Isi nama, kategori, MAC address, IP, dan subnet (`24` atau `255.255.255.0`). ID dibuat
   otomatis jika dikosongkan. **Kategori** (mis. *Komputer pengguna*, *Komputer lab*, *Lab 2*) menjadi tab di Beranda, jadi
   yang tampil hanya satu kategori setiap kali. Admin juga melihat tab **Server**. Tiap tab menunjukkan jumlah yang
   menyala, mis. *Komputer lab 5/20*, dan tab terakhir yang dibuka diingat. Komputer boleh berada di subnet lain dari panel (lihat *Komputer di subnet lain* di bawah). Cara

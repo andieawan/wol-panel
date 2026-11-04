@@ -83,6 +83,12 @@ def migrate(cfg):
     cfg.setdefault("vms", [])
     cfg.setdefault("vm_check_hours", 6)
     cfg.setdefault("pending", [])
+    for d in cfg.get("devices", []) + cfg.get("pending", []):
+        d.setdefault("kind", "lab" if "lab" in str(d.get("group", "")).lower() else "desktop")
+    if cfg.get("join"):  # perintah daftar lama (satu untuk semua) -> per jenis
+        j = cfg.pop("join")
+        cfg.setdefault("joins", {})["lab" if "lab" in str(j.get("group", "")).lower() else "desktop"] = j
+    cfg.setdefault("joins", {})
     for r in cfg.get("app_rules", []):  # aturan lama yang terlanjur menyimpan karakter rusak
         r["pattern"] = clean_text(r.get("pattern"))   # komputer yang mendaftar lewat skrip, menunggu ditambahkan admin
     return cfg
@@ -153,18 +159,34 @@ def clean_group(text):
     return g or DEFAULT_GROUP
 
 
-def device_groups():
+KINDS = {"desktop": "Komputer desktop", "lab": "Komputer lab"}
+KIND_GROUP = {"desktop": "Komputer pengguna", "lab": "Komputer Lab"}
+KIND_SUGGEST = {"desktop": ("Komputer pengguna", "Komputer kantor", "Komputer guru"), "lab": ("Komputer Lab", "Lab 1", "Lab 2")}
+KIND_TAB = {"desktop": "komputer", "lab": "lab"}
+
+
+def dev_kind(d):
+    """'lab' atau 'desktop'. Data lama tanpa jenis: dari nama kategorinya."""
+    k = d.get("kind")
+    if k in KINDS:
+        return k
+    return "lab" if "lab" in clean_group(d.get("group")).lower() else "desktop"
+
+
+def device_groups(kind=None):
     """Kategori komputer berurutan sesuai kemunculan pertama di daftar komputer."""
     out = []
     for d in CFG.get("devices", []):
+        if kind and dev_kind(d) != kind:
+            continue
         g = clean_group(d.get("group"))
         if g not in out:
             out.append(g)
     return out
 
 
-def group_datalist(dl_id):
-    opts = list(dict.fromkeys(device_groups() + list(GROUP_SUGGEST)))
+def group_datalist(dl_id, kind=None):
+    opts = list(dict.fromkeys(device_groups(kind) + list(KIND_SUGGEST.get(kind) or GROUP_SUGGEST)))
     return f'<datalist id="{dl_id}">' + "".join(f'<option value="{E(o)}">' for o in opts) + "</datalist>"
 
 
@@ -1285,9 +1307,18 @@ def agent_script(dev):
 
 
 # ------------------------------------------------------- tambah komputer lewat skrip
-def join_active():
-    j = CFG.get("join") or {}
+def join_active(kind):
+    j = (CFG.get("joins") or {}).get(kind) or {}
     return j if j.get("tok") and j.get("exp", 0) > time.time() else None
+
+
+def join_by_token(tok):
+    """(jenis, perintah) yang tokennya cocok dan masih berlaku, atau (None, None)."""
+    for kind in KINDS:
+        j = join_active(kind)
+        if j and hmac.compare_digest(j["tok"], tok):
+            return kind, j
+    return None, None
 
 
 def panel_lan_ip():
@@ -1304,7 +1335,7 @@ def join_script(panel_ip, tok):
                .replace("__PANEL_IP__", panel_ip).replace("__TOKEN__", tok))
 
 
-def register_pending(data, from_ip):
+def register_pending(data, from_ip, kind="lab", join=None):
     """Data dari skrip di komputer client -> daftar tunggu. Mengembalikan (entri, pesan_error)."""
     try:
         mac = normalize_mac(str(data.get("mac", "")))
@@ -1319,15 +1350,15 @@ def register_pending(data, from_ip):
     ent = {"mac": mac, "host": host, "ip": ip, "prefix": prefix, "adapter": str(data.get("adapter", ""))[:100],
            "wifi": bool(data.get("wifi")), "wol": bool(data.get("wol")), "fast": bool(data.get("fast")),
            "time": int(time.time()), "from": from_ip, "agent_secret": secrets.token_hex(32), "agent_port": AGENT_PORT,
-           "group": clean_group((CFG.get("join") or {}).get("group"))}
+           "kind": kind, "group": clean_group((join or {}).get("group") or KIND_GROUP[kind])}
     CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != mac] + [ent]
     save_config(CFG)
     return ent, None
 
 
-def subnet_wol_addr(net, skip=None):
+def subnet_wol_addr(net, skip=None, pool=None):
     """Alamat WOL tambahan (mis. IP ARP-broadcast di router) yang sudah dipakai komputer lain di subnet ini."""
-    for d in CFG.get("devices", []):
+    for d in (CFG.get("devices", []) if pool is None else pool):
         n = dev_network(d)
         if d is not skip and n == net and d.get("broadcast") and d["broadcast"] != str(net.broadcast_address):
             return d["broadcast"]
@@ -1350,7 +1381,7 @@ def approve_pending(ent, name=""):
         did, i = base, 2
         while any(d["id"] == did for d in CFG["devices"]):
             did, i = f"{base}-{i}", i + 1
-        dev = {"id": did, "name": name, "group": clean_group(ent.get("group")), "mac": ent["mac"], "port": 9,
+        dev = {"id": did, "name": name, "kind": dev_kind(ent), "group": clean_group(ent.get("group")), "mac": ent["mac"], "port": 9,
                "check_ports": [], "remote_url": DEFAULT_REMOTE, **upd}
         CFG["devices"].append(dev)
         new = True
@@ -1377,9 +1408,11 @@ def agent_fp(secret):
     return hashlib.sha256(f"wol-fp|{secret}".encode()).hexdigest()[:16]
 
 
-def default_scan_nets():
+def default_scan_nets(kind=None):
     nets = []
     for d in list(CFG.get("devices", [])) + list(CFG.get("pending", [])):
+        if kind and dev_kind(d) != kind:
+            continue
         n = dev_network(d) if "id" in d else ipaddress.IPv4Network(f"{d['ip']}/{d['prefix']}", strict=False)
         if n and str(n) not in nets:
             nets.append(str(n))
@@ -1541,8 +1574,8 @@ def build_device(form, others):
     except ValueError:
         return None, "Subnet tidak valid. Contoh: 24 atau 255.255.255.0 (boleh 8–30)."
     bc = form.get("broadcast", "").strip()
-    if not bc:
-        bc = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False).broadcast_address) if ip else "255.255.255.255"
+    if not bc:  # ikut Alamat WOL tambahan komputer lain di subnet yang sama (mis. ARP-broadcast router)
+        bc = subnet_wol_addr(ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False), pool=others) if ip else "255.255.255.255"
     try:
         ipaddress.IPv4Address(bc)
     except ValueError:
@@ -1557,7 +1590,8 @@ def build_device(form, others):
     remote = form.get("remote_url", "").strip() or DEFAULT_REMOTE
     if not re.match(r"^https?://[^\s\"'<>]+$", remote) or len(remote) > 300:
         return None, "Link remote harus diawali http:// atau https://"
-    return {"id": did, "name": name, "group": clean_group(form.get("group")), "mac": mac, "ip": ip, "prefix": prefix, "broadcast": bc,
+    kind = next((k for k in (form.get("set_kind"), form.get("kind")) if k in KINDS), "desktop")
+    return {"id": did, "name": name, "kind": kind, "group": clean_group(form.get("group") or KIND_GROUP[kind]), "mac": mac, "ip": ip, "prefix": prefix, "broadcast": bc,
             "port": port, "check_ports": checks, "remote_url": remote}, None
 
 
@@ -2164,7 +2198,7 @@ def home_page(user, csrf, q):
         n = len(CFG["pending"])
         attention += (f'<div class="card" style="border-color:var(--acc);display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
                       f'<span><b>{n} komputer</b> mendaftar lewat skrip dan menunggu ditambahkan.</span>'
-                      f'<a class="btn sm primary" href="/settings?tab=komputer#pending">Lihat</a></div>')
+                      f'<a class="btn sm primary" href="/settings?tab={KIND_TAB[dev_kind(CFG["pending"][0])]}#pending">Lihat</a></div>')
     if is_admin(user):
         fl = failures()
         if fl:
@@ -2219,19 +2253,36 @@ def home_page(user, csrf, q):
 
 def settings_page(user, csrf, q):
     tab = q.get("tab", [""])[0]
-    if any(k in q for k in ("edit", "agent", "new")) or any(k.startswith("f_") and k != "f_u" for k in q):
+    one = lambda k: q.get(k, [""])[0]
+    dev = next((d for d in CFG["devices"] if d["id"] in (one("edit"), one("agent"))), None)
+    if dev:
+        tab = KIND_TAB[dev_kind(dev)]
+    elif one("f_kind") in KINDS:
+        tab = KIND_TAB[one("f_kind")]
+    elif tab not in ("komputer", "lab") and ("new" in q or any(k.startswith("f_") and k != "f_u" for k in q)):
         tab = "komputer"
     if "reset" in q or "f_u" in q:
         tab = "pengguna"
-    if tab not in ("komputer", "pengguna", "umum"):
+    if tab not in ("komputer", "lab", "pengguna", "umum"):
         tab = "komputer"
+    cnt = lambda k: sum(1 for d in CFG["devices"] if dev_kind(d) == k)
+    pend = lambda k: sum(1 for p in CFG.get("pending", []) if dev_kind(p) == k)
+    label = lambda k: KINDS[k] + f' <span class="tag">{cnt(k)}</span>' + (f' <span class="tag warn" title="Menunggu ditambahkan">+{pend(k)}</span>' if pend(k) else "")
     tabs = "".join(f'<a href="/settings?tab={k}"{" aria-current=page" if k == tab else ""}>{t}</a>'
-                   for k, t in (("komputer", "Komputer"), ("pengguna", "Pengguna"), ("umum", "Umum")))
-    body = {"komputer": settings_devices, "pengguna": settings_users, "umum": settings_general}[tab](user, csrf, q)
+                   for k, t in (("komputer", label("desktop")), ("lab", label("lab")), ("pengguna", "Pengguna"), ("umum", "Umum")))
+    if tab in ("komputer", "lab"):
+        kind = "lab" if tab == "lab" else "desktop"
+        body = settings_devices(user, csrf, q, kind)
+        # semua formulir di tab ini membawa jenisnya, agar setelah disimpan kembali ke tab yang sama
+        tag = f'name="csrf" value="{csrf}">'
+        body = body.replace(tag, tag + f'<input type="hidden" name="kind" value="{kind}">')
+    else:
+        body = {"pengguna": settings_users, "umum": settings_general}[tab](user, csrf, q)
     return shell(user, csrf, "/settings", f'<nav class="tabs" aria-label="Bagian pengaturan">{tabs}</nav>{body}', q)
 
 
-def settings_devices(user, csrf, q):
+def settings_devices(user, csrf, q, kind="desktop"):
+    tabq = f"/settings?tab={KIND_TAB[kind]}"
     edit_id = q.get("edit", [""])[0]
     ed = next((d for d in CFG["devices"] if d["id"] == edit_id), None)
     f = {k: v[0] for k, v in q.items() if k.startswith("f_")}
@@ -2257,11 +2308,13 @@ def settings_devices(user, csrf, q):
 <div class="cmd"><input id="agentcmd" readonly value="{E(cmd)}" aria-label="Perintah pasang agen">
 <button class="btn" type="button" data-copy="agentcmd">{icon('copy')}Salin</button></div>
 <p class="mut small" style="margin:10px 0 12px">Perintah berlaku 15 menit. Agen hanya menerima perintah dari panel ini, dan setiap perintah ditandatangani kunci rahasia.</p>
-<div class="acts"><a class="btn sm" href="/settings">Selesai</a>{remove}</div></section>"""
+<div class="acts"><a class="btn sm" href="{tabq}">Selesai</a>{remove}</div></section>"""
 
     # ---- daftar komputer
     rows = []
     for d in CFG["devices"]:
+        if dev_kind(d) != kind:
+            continue
         has_agent = bool(d.get("agent_secret"))
         tag = agent_badge(d)
         v = d.get("agent_version")
@@ -2275,7 +2328,8 @@ def settings_devices(user, csrf, q):
 {upd}<form method="post" action="/devices/agent">{hidden(csrf, id=d['id'])}<button class="btn sm" title="Pasang / pasang ulang agen di komputer ini">{'Pasang ulang' if has_agent else 'Pasang agen'}</button></form>
 {del_form('/devices/delete', csrf, d['name'] + ' akan dihapus dari panel. Data di komputer itu tidak terpengaruh.', 'Hapus ' + d['name'] + '?', id=d['id'])}</div></div>""")
     listing = (f'<div class="card"><div class="list">{"".join(rows)}</div></div>' if rows else
-               f'<div class="card empty">{icon("monitor")}<p class="small" style="margin:8px 0 0">Belum ada komputer.</p></div>')
+               f'<div class="card empty">{icon("monitor")}<p class="small" style="margin:8px 0 0">Belum ada {KINDS[kind].lower()}. '
+               f'Tambahkan lewat skrip, cari di jaringan, atau tambah manual di bawah.</p></div>')
 
     # ---- form tambah / ubah
     src = ed or {}
@@ -2292,14 +2346,19 @@ def settings_devices(user, csrf, q):
     if net and bcast == str(net.broadcast_address):
         bcast = ""  # sama dengan hasil otomatis dari IP + subnet
     adv_open = " open" if (f and any(f.get("f_" + k) for k in ("id", "broadcast", "check_ports", "remote_url"))) else ""
-    open_form = " open" if (ed or f or "new" in q or not CFG["devices"]) else ""
-    title = f"Ubah {E(ed['name'])}" if ed else "Tambah komputer manual"
+    open_form = " open" if (ed or f or "new" in q) else ""
+    title = f"Ubah {E(ed['name'])}" if ed else f"Tambah {KINDS[kind].lower()} manual"
+    cur_kind = f.get("f_kind") if f.get("f_kind") in KINDS else (dev_kind(ed) if ed else kind)
+    opts = "".join(f'<option value="{k}"' + (" selected" if k == cur_kind else "") + f'>{v}</option>' for k, v in KINDS.items())
+    kind_sel = ("" if not ed else f'<label style="max-width:260px">Jenis<select name="set_kind">{opts}</select>'
+                f'<span class="hint">Pindahkan ke tab Komputer desktop / Komputer lab.</span></label>')
     form = f"""<form method="post" action="/devices/save">{hidden(csrf, orig=ed['id'] if ed else '')}
 <div class="grid">
-<label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="mis. Komputer Lab 1"></label>
-<label>Kategori<input name="group" value="{dv('group', DEFAULT_GROUP)}" list="dl-group" maxlength="40" placeholder="{DEFAULT_GROUP}">
-<span class="hint">Jadi tab di Beranda. Ketik baru atau pilih, mis. Komputer lab.</span></label>{group_datalist("dl-group")}
+<label>Nama komputer<input name="name" value="{dv('name')}" required maxlength="60" placeholder="{'mis. LAB1-PC05' if kind == 'lab' else 'mis. PC Tata Usaha'}"></label>
+<label>Kategori<input name="group" value="{dv('group', KIND_GROUP[kind])}" list="dl-group" maxlength="40" placeholder="{KIND_GROUP[kind]}">
+<span class="hint">Jadi tab di Beranda. Ketik baru atau pilih{', mis. Lab 1' if kind == 'lab' else ', mis. Komputer kantor'}.</span></label>{group_datalist("dl-group", kind)}
 </div>
+{kind_sel}
 <div class="grid">
 <label>MAC address<input name="mac" value="{dv('mac')}" required class="mono" placeholder="mis. 3C:7C:3F:12:34:56" autocapitalize="characters" spellcheck="false">
 <span class="hint">Dari <span class="mono">ipconfig /all</span>, bagian Ethernet → Physical Address.</span></label>
@@ -2321,13 +2380,13 @@ def settings_devices(user, csrf, q):
 <span class="hint">Kosongkan untuk memakai Chrome Remote Desktop.</span></label>
 </details>
 <div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if ed else 'Tambah komputer'}</button>
-{'<a class="btn quiet" href="/settings">Batal</a>' if (ed or f) else ''}</div></form>"""
+{f'<a class="btn quiet" href="{tabq}">Batal</a>' if (ed or f) else ''}</div></form>"""
     form_card = f"""<details class="card" id="form-dev"{open_form} style="padding:0">
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}{title}</summary>
 <div style="padding:0 16px 16px">{form}</div></details>"""
 
     # ---- daftar tunggu & tambah lewat skrip
-    pend = CFG.get("pending", [])
+    pend = [p for p in CFG.get("pending", []) if dev_kind(p) == kind]
     prow = []
     for p in sorted(pend, key=lambda x: x["host"].lower()):
         same = next((d for d in CFG["devices"] if d["mac"] == p["mac"]), None)
@@ -2358,16 +2417,16 @@ def settings_devices(user, csrf, q):
                         f'<div class="card" style="border-color:var(--acc)"><div class="list">{"".join(prow)}</div>'
                         f'<p class="mut small" style="margin:12px 0 0">Komputer ini menjalankan skrip pendaftaran. Agennya sudah terpasang dan langsung '
                         f'aktif setelah ditambahkan.</p></div>')
-    j = join_active()
+    j = join_active(kind)
     if j:
         cmd = f"irm http://{panel_lan_ip()}:{int(CFG.get('port', 8080))}/join/{j['tok']}.ps1 | iex"
         until = time.strftime("%d/%m/%Y %H:%M", time.localtime(j["exp"]))
         join_body = f"""<ol class="steps"><li>Di komputer client, klik kanan Start lalu pilih <b>Terminal (Admin)</b> / <b>PowerShell (Admin)</b>.</li>
 <li>Tempel perintah di bawah lalu tekan Enter.</li>
-<li>Komputer muncul di <b>Menunggu ditambahkan</b> di halaman ini; klik <b>Tambahkan</b>.</li></ol>
+<li>Komputer muncul di <b>Menunggu ditambahkan</b> di tab <b>{KINDS[kind]}</b>; klik <b>Tambahkan</b>.</li></ol>
 <div class="cmd"><input id="joincmd" readonly value="{E(cmd)}" aria-label="Perintah daftar komputer">
 <button class="btn" type="button" data-copy="joincmd">{icon('copy')}Salin</button></div>
-<p class="mut small" style="margin:10px 0 12px">Komputer masuk kategori <b>{E(clean_group(j.get('group')))}</b>. Bisa dipakai di banyak komputer sampai {E(until)}. Skrip mendeteksi nama, IP, subnet dan MAC, menyalakan
+<p class="mut small" style="margin:10px 0 12px">Perintah khusus <b>{KINDS[kind].lower()}</b>, masuk kategori <b>{E(clean_group(j.get('group')))}</b>. Bisa dipakai di banyak komputer sampai {E(until)}. Skrip mendeteksi nama, IP, subnet dan MAC, menyalakan
 pengaturan Wake-on-LAN di Windows, memasang agen, lalu mendaftar ke panel. Komputer baru masuk panel setelah Anda klik Tambahkan.
 Wake-on-LAN di BIOS tetap perlu diaktifkan manual.</p>
 <div class="acts"><form method="post" action="/devices/join-revoke">{hidden(csrf)}<button class="btn sm quiet danger">Cabut perintah</button></form></div>"""
@@ -2375,14 +2434,14 @@ Wake-on-LAN di BIOS tetap perlu diaktifkan manual.</p>
         join_body = f"""<p class="small" style="margin:0 0 12px">Jalankan satu perintah di komputer client: nama, IP, subnet dan MAC terdeteksi otomatis,
 pengaturan Wake-on-LAN di Windows dinyalakan, agen terpasang, lalu komputer muncul di sini tinggal ditambahkan.</p>
 <form method="post" action="/devices/join-new" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
-<label style="margin:0;flex:0 1 240px">Kategori<input name="group" value="Komputer lab" list="dl-jgroup" maxlength="40"></label>{group_datalist("dl-jgroup")}
+<label style="margin:0;flex:0 1 240px">Kategori<input name="group" value="{KIND_GROUP[kind]}" list="dl-jgroup" maxlength="40"></label>{group_datalist("dl-jgroup", kind)}
 <button class="btn primary">Buat perintah</button></form>"""
     join_card = f"""<details class="card" id="join"{' open' if j else ''} style="padding:0">
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah lewat skrip (otomatis)</summary>
 <div style="padding:0 16px 16px">{join_body}</div></details>"""
 
     # ---- cari komputer beragen di jaringan
-    dz = dict(DISCOVERY)
+    dz = dict(DISCOVERY) if DISCOVERY.get("kind", "lab") == kind else {}
     drows = []
     for r in dz.get("found", []):
         st, ip = r["status"], r["ip"]
@@ -2415,7 +2474,7 @@ pengaturan Wake-on-LAN di Windows dinyalakan, agen terpasang, lalu komputer munc
         else:
             tag = '<span class="tag">MAC tidak terbaca</span>'
         drows.append(f'<div class="row"><div class="row-main"><b>{who}</b> {tag}{meta}</div><div class="acts" style="align-items:center">{act}</div></div>')
-    nets_val = ", ".join(dz.get("nets") or default_scan_nets())
+    nets_val = ", ".join(dz.get("nets") or default_scan_nets(kind))
     if dz.get("running"):
         status = (f'<p class="small" style="margin:12px 0 0"><span class="spin"></span> Memindai {E(", ".join(dz["nets"]))} '
                   f'({dz.get("total", 0)} alamat)… halaman diperbarui otomatis.</p><script>setTimeout(function(){{location.reload()}},3000)</script>')
@@ -2436,7 +2495,7 @@ agennya sudah terpasang: yang belum ada di panel, yang IP-nya berubah, atau yang
 <form method="post" action="/devices/discover" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
 <label style="margin:0;flex:1 1 260px">Subnet<input name="nets" value="{E(nets_val)}" spellcheck="false" placeholder="mis. 192.168.120.0/23">
 <span class="hint">Pisahkan dengan koma. Maksimal {DISCOVER_MAX_HOSTS} alamat sekali cari.</span></label>
-<label style="margin:0;flex:0 1 200px">Kategori untuk yang baru<input name="group" value="{E(dz.get('group') or 'Komputer Lab')}" list="dl-dgroup" maxlength="40"></label>{group_datalist("dl-dgroup")}
+<label style="margin:0;flex:0 1 200px">Kategori untuk yang baru<input name="group" value="{E(dz.get('group') or KIND_GROUP[kind])}" list="dl-dgroup" maxlength="40"></label>{group_datalist("dl-dgroup", kind)}
 <button class="btn primary"{' disabled' if dz.get('running') else ''} data-busy="Memulai…">Cari</button></form>{status}</div></details>"""
 
     return (agent_card + pending_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + disc_card + join_card + form_card)
@@ -3081,7 +3140,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
+    form_kind = "desktop"
+
     def back(self, path, msg, err=False, **extra):
+        if path == "/settings" and "tab" not in extra and self.form_kind == "lab":
+            extra["tab"] = "lab"  # kembali ke tab Komputer lab bila aksinya dari sana
         params = {"msg": msg, **extra}
         if err:
             params["err"] = "1"
@@ -3115,8 +3178,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, vm_install_script(vm), "text/plain; charset=utf-8")
         m = re.fullmatch(r"/join/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
         if m:  # skrip daftar komputer (tanpa login, memakai token Tambah lewat skrip)
-            j = join_active()
-            if not j or not hmac.compare_digest(j["tok"], m.group(1)) or not self.lan_direct():
+            _, j = join_by_token(m.group(1))
+            if not j or not self.lan_direct():
                 return self._send(200, "Write-Host 'Perintah sudah kedaluwarsa atau dicabut. Buat ulang di panel: Pengaturan -> Komputer -> Tambah lewat skrip.' -ForegroundColor Red\n",
                                   "text/plain; charset=utf-8")
             write_log("-", "unduh-skrip-daftar", "-", self.client_ip())
@@ -3203,6 +3266,7 @@ class Handler(BaseHTTPRequestHandler):
         form = {} if path == "/terminal/in" else \
             {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True).items()}
         ip = self.client_ip()
+        self.form_kind = form.get("kind") if form.get("kind") in KINDS else "desktop"
 
         if path == "/login":
             return self.do_login(form, ip)
@@ -3313,13 +3377,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/devices/agent-remove":
                 return self.do_agent_remove(form, user, ip)
             if path == "/devices/join-new":
-                CFG["join"] = {"tok": secrets.token_urlsafe(24), "exp": int(time.time()) + JOIN_TTL, "by": user,
-                               "group": clean_group(form.get("group") or "Komputer lab")}
+                kind = self.form_kind
+                CFG.setdefault("joins", {})[kind] = {"tok": secrets.token_urlsafe(24), "exp": int(time.time()) + JOIN_TTL, "by": user,
+                                                     "group": clean_group(form.get("group") or KIND_GROUP[kind])}
                 save_config(CFG)
-                write_log(user, "buat-perintah-daftar", "-", ip)
-                return self.redirect("/settings?tab=komputer#join")
+                write_log(user, "buat-perintah-daftar", KINDS[kind], ip)
+                return self.redirect(f"/settings?tab={KIND_TAB[kind]}#join")
             if path == "/devices/join-revoke":
-                CFG.pop("join", None)
+                CFG.setdefault("joins", {}).pop(self.form_kind, None)
                 save_config(CFG)
                 write_log(user, "cabut-perintah-daftar", "-", ip)
                 return self.back("/settings", "Perintah daftar dicabut. Komputer yang sudah mendaftar tetap ada di daftar tunggu.")
@@ -3332,9 +3397,10 @@ class Handler(BaseHTTPRequestHandler):
                     nets = parse_scan_nets(form.get("nets", ""))
                 except ValueError as e:
                     return self.back("/settings", f"Subnet tidak valid: {e}.", True)
-                DISCOVERY["group"] = clean_group(form.get("group") or "Komputer Lab")
+                DISCOVERY["kind"] = self.form_kind
+                DISCOVERY["group"] = clean_group(form.get("group") or KIND_GROUP[self.form_kind])
                 threading.Thread(target=run_discovery, args=(nets, user), daemon=True).start()
-                return self.redirect("/settings?tab=komputer#discover")
+                return self.redirect(f"/settings?tab={KIND_TAB[self.form_kind]}#discover")
             if path == "/devices/discover-add":
                 return self.do_discover_add(form, user, ip)
             if path == "/devices/pending-ignore":
@@ -3755,8 +3821,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_join(self, tok, raw, ip):
         reply = lambda t: self._send(200, t, "text/plain; charset=utf-8")
-        j = join_active()
-        if not j or not hmac.compare_digest(j["tok"], tok):
+        kind, j = join_by_token(tok)
+        if not j:
             return reply("Perintah sudah kedaluwarsa atau dicabut. Buat ulang di panel.")
         if not self.lan_direct():
             return reply("Pendaftaran hanya dari jaringan sekolah.")
@@ -3768,7 +3834,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return reply("Data pendaftaran tidak valid.")
         with CFG_LOCK:
-            ent, err = register_pending(data, ip)
+            ent, err = register_pending(data, ip, kind, j)
         if err:
             return reply(f"Gagal: {err}.")
         write_log("-", "daftar-komputer", f"{ent['host']} {ent['ip']}", ip)
@@ -3805,7 +3871,8 @@ class Handler(BaseHTTPRequestHandler):
             while any(d["id"] == did for d in CFG["devices"]):
                 did, i = f"{base}-{i}", i + 1
             # agen sudah ada tapi kuncinya tidak dikenal panel: port agen dipakai untuk cek status
-            dev = {"id": did, "name": name, "group": clean_group(DISCOVERY.get("group") or "Komputer Lab"), "mac": r["mac"],
+            dk = DISCOVERY.get("kind", "lab")
+            dev = {"id": did, "name": name, "kind": dk, "group": clean_group(DISCOVERY.get("group") or KIND_GROUP[dk]), "mac": r["mac"],
                    "ip": r["ip"], "prefix": net.prefixlen, "broadcast": subnet_wol_addr(net), "port": 9,
                    "check_ports": [AGENT_PORT], "remote_url": DEFAULT_REMOTE}
             CFG["devices"].append(dev)
@@ -3817,11 +3884,11 @@ class Handler(BaseHTTPRequestHandler):
         r["status"] = "known"
         r.setdefault("dev_name", r.get("host") or r["ip"])
         save_config(CFG)
-        return self.redirect("/settings?" + urlencode({"msg": msg, "tab": "komputer"}) + "#discover")
+        return self.redirect("/settings?" + urlencode({"msg": msg, "tab": KIND_TAB[DISCOVERY.get("kind", "lab")]}) + "#discover")
 
     def do_pending_add(self, form, user, ip):
         mac = form.get("mac", "")
-        ents = list(CFG["pending"]) if mac == "semua" else [p for p in CFG["pending"] if p["mac"] == mac]
+        ents = [p for p in CFG["pending"] if dev_kind(p) == self.form_kind] if mac == "semua" else [p for p in CFG["pending"] if p["mac"] == mac]
         if not ents:
             return self.back("/settings", "Komputer tidak ada di daftar tunggu.", True)
         names = []
@@ -3838,6 +3905,7 @@ class Handler(BaseHTTPRequestHandler):
         dev, err = build_device(form, others)
         if err:
             keep = {f"f_{k}": form.get(k, "") for k in ("name", "group", "id", "mac", "ip", "subnet", "broadcast", "port", "check_ports", "remote_url")}
+            keep["f_kind"] = form.get("set_kind") or form.get("kind") or "desktop"
             if orig:
                 keep["edit"] = orig
             return self.back("/settings", err, True, **keep)
@@ -3861,7 +3929,7 @@ class Handler(BaseHTTPRequestHandler):
             msg = f"{dev['name']} berhasil ditambahkan."
         save_config(CFG)
         write_log(user, "simpan-perangkat", dev["id"], ip)
-        return self.back("/settings", msg)
+        return self.back("/settings", msg, tab=KIND_TAB[dev["kind"]])
 
     def do_device_delete(self, form, user, ip):
         did = form.get("id", "")
