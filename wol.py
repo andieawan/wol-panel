@@ -82,7 +82,9 @@ def migrate(cfg):
     cfg.setdefault("scan_minutes", 60)
     cfg.setdefault("vms", [])
     cfg.setdefault("vm_check_hours", 6)
-    cfg.setdefault("pending", [])   # komputer yang mendaftar lewat skrip, menunggu ditambahkan admin
+    cfg.setdefault("pending", [])
+    for r in cfg.get("app_rules", []):  # aturan lama yang terlanjur menyimpan karakter rusak
+        r["pattern"] = clean_text(r.get("pattern"))   # komputer yang mendaftar lewat skrip, menunggu ditambahkan admin
     return cfg
 
 
@@ -129,6 +131,21 @@ def normalize_mac(mac):
 
 def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:32] or "pc"
+
+
+BAD_CHARS = re.compile(r"[\x00-\x1f\x7f\ufffd]")
+
+
+def clean_text(text):
+    """Buang karakter kontrol (mis. NUL di ujung nama aplikasi dari registry) dan karakter rusak (U+FFFD)."""
+    return BAD_CHARS.sub("", str(text or "")).strip()
+
+
+def clean_app(a):
+    for k in ("name", "version", "publisher", "scope"):
+        if isinstance(a.get(k), str):
+            a[k] = clean_text(a[k])
+    return a
 
 
 def clean_group(text):
@@ -333,8 +350,8 @@ def diagnose(dev):
         out.append(f"Port {p}: {'terbuka' if check_port(ip, p) else 'tertutup'}")
     arp, mac = check_arp(ip) if same_subnet(dev) else ("beda", None)
     if arp == "beda":
-        out.append(f"ARP: tidak dipakai (beda subnet dengan panel); status dicek lewat port agen"
-                   f"{' & port cek' if dev.get('check_ports') else ''} dan ping")
+        out.append(f"Cek ARP: dilewati, ARP tidak bisa menembus router (beda subnet dengan panel); status dicek lewat agen"
+                   f"{', port cek' if dev.get('check_ports') else ''} dan ping")
     elif arp is None:
         out.append("ARP: arping belum terpasang / tidak diizinkan (jalankan ulang install.sh)")
     elif arp:
@@ -342,6 +359,12 @@ def diagnose(dev):
         out.append(f"ARP: dijawab oleh {mac} ({'MAC cocok' if cocok else 'MAC TIDAK cocok — cek IP/MAC yang diisi'})")
     else:
         out.append("ARP: tidak ada jawaban (komputer mati, IP salah, atau beda jaringan)")
+    net = dev_network(dev)
+    wol_to = [t for t in dict.fromkeys([dev.get("broadcast"), str(net.broadcast_address) if net else None, "255.255.255.255"]) if t]
+    sub_bc = str(net.broadcast_address) if net else None
+    out.append("WOL dikirim ke: " + ", ".join(t + (" (lewat router)" if t == dev.get("broadcast") and t != sub_bc else "") for t in wol_to)
+               + ("" if same_subnet(dev) or (dev.get("broadcast") and dev.get("broadcast") != sub_bc)
+                  else " — beda subnet: isi Alamat WOL tambahan dengan IP ARP-broadcast di router"))
     pg = check_ping(ip)
     out.append("Ping: " + {True: "menjawab", False: "tidak menjawab (wajar jika diblokir Windows Firewall)",
                             None: "tidak diizinkan di server (jalankan ulang install.sh)"}[pg])
@@ -498,6 +521,9 @@ def load_scans():
     try:
         with open(SCAN_PATH, encoding="utf-8") as f:
             SCANS = json.load(f)
+        for s in SCANS.values():
+            for a in s.get("apps", []):
+                clean_app(a)
     except (FileNotFoundError, ValueError):
         SCANS = {}
 
@@ -518,7 +544,7 @@ def rule_regex(pattern):
 
 def match_rule(app):
     for r in CFG.get("app_rules", []):
-        if rule_regex(r["pattern"]).match(app.get("name", "")):
+        if rule_regex(r["pattern"]).match(clean_text(app.get("name", ""))):
             return r
     return None
 
@@ -536,7 +562,7 @@ def scan_device(dev, user="otomatis", auto=True):
     try:
         try:
             res = agent_cmd(dev, user, {"action": "scan"}, timeout=90)
-            apps = sorted(res.get("apps") or [], key=lambda a: (a.get("name") or "").lower())
+            apps = sorted((clean_app(a) for a in res.get("apps") or []), key=lambda a: (a.get("name") or "").lower())
             entry = {"time": int(time.time()), "apps": apps, "error": None, "osdate": str(res.get("osdate") or "")}
             if res.get("version"):
                 set_agent_version(dev, int(res["version"]))
@@ -1342,7 +1368,7 @@ def all_status(devs=None):
 
 
 def write_log(user, action, target, ip):
-    clean = lambda v: re.sub(r"[\t\r\n]+", " ", str(v))
+    clean = lambda v: BAD_CHARS.sub("", re.sub(r"[\t\r\n]+", " ", str(v)))
     line = "\t".join([time.strftime('%Y-%m-%d %H:%M:%S'), clean(user), clean(action), clean(target), clean(ip)]) + "\n"
     with LOG_LOCK, open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line)
@@ -1859,6 +1885,7 @@ def log_list(n=8):
         if len(r) < 5:
             continue
         ts, who, act, target, ip = r[:5]
+        target = clean_text(target)  # baris lama yang terlanjur berisi karakter rusak
         if act == "login":  # tetap tercatat di wol.log, tapi menutupi kejadian penting di Beranda
             continue
         label = LOG_LABELS.get(act, act)
@@ -3419,7 +3446,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.back("/", f"{name} diabaikan dan tidak akan dihapus otomatis lagi di komputer ini.")
 
     def do_rule_add(self, form, user, ip):
-        pattern = form.get("pattern", "").strip()
+        pattern = clean_text(form.get("pattern", ""))
         literal = re.sub(r"[*?\s]", "", pattern)
         back = {"dev": form["dev"]} if form.get("dev") else {}
         if len(literal) < 3 or len(pattern) > 80:
