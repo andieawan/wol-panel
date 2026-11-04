@@ -397,7 +397,13 @@ def diagnose(dev):
             if v:
                 set_agent_version(dev, v)
             state = ("terbaru" if v == t else "perlu pasang ulang sekali" if v < MIN_UPDATABLE else f"versi {t} tersedia — klik Perbarui agen") if v else ""
-            out.append(f"Agen: aktif, versi {v or '?'}" + (f" ({state})" if state else ""))
+            if v:
+                out.append(f"Agen: aktif, versi {v}" + (f" ({state})" if state else ""))
+            else:
+                why = agent_info_why(dev)
+                hint = (" Kemungkinan proses agen lama masih berjalan: restart komputer itu, atau jalankan ulang skrip daftar."
+                        if "kunci" in why else "")
+                out.append(f"Agen: menjawab, tapi perintah panel ditolak — {why or 'jawaban tidak dikenal'}.{hint}")
         else:
             out.append("Agen: " + why)
     return f"Tes {dev['name']} ({ip}) — " + " · ".join(out)
@@ -720,6 +726,17 @@ def set_agent_version(dev, v):
         with CFG_LOCK:
             dev["agent_version"] = v
             save_config(CFG)
+
+
+def agent_info_why(dev):
+    """Alasan perintah bertanda tangan ke agen gagal (untuk Tes), atau '' bila berhasil."""
+    try:
+        agent_cmd(dev, "panel", {"action": "info"}, timeout=10)
+        return ""
+    except AgentOld:
+        return ""
+    except Exception as e:
+        return agent_error(e)
 
 
 def agent_info(dev):

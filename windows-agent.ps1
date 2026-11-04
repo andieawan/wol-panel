@@ -421,6 +421,10 @@ while ($true) {
 
     Write-Host 'Memasang WOL Panel Agent...'
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+    # proses agen lama bisa tetap hidup & memegang port; tanpa ini agen baru gagal mulai dan agen lama (kunci lama) yang menjawab
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WOLPanelAgent*agent.ps1*' -and $_.ProcessId -ne $PID } |
+        ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host "    Agen lama dihentikan (PID $($_.ProcessId))" } catch {} }
     Unregister-ScheduledTask -TaskName $Task -Confirm:$false -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
 
@@ -439,7 +443,10 @@ $Log  = Join-Path $env:ProgramData 'WOLPanelAgent\agent.log'
 function Test-Agent { for ($i = 0; $i -lt 20; $i++) { Start-Sleep -Seconds 1
     try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:__PORT__/ping' -UseBasicParsing -TimeoutSec 2).Content -eq 'ok') { return $true } } catch {} }
     return $false }
-function Restart-Agent { Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-ScheduledTask -TaskName $Task }
+function Restart-Agent { Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WOLPanelAgent*agent.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2; Start-ScheduledTask -TaskName $Task }
 Start-Sleep -Seconds 2
 Restart-Agent
 if (-not (Test-Agent) -and (Test-Path -LiteralPath "$File.bak")) {
