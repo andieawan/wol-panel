@@ -520,6 +520,8 @@ def app_source(app, osdate=""):
         return "store"
     if SYSTEM_NAME.search(name) or OEM_PUBLISHER.match(pub):
         return "bawaan"
+    if app.get("kind") == "shortcut":
+        return "luar"  # tidak terdaftar di Windows: portable / dipasang sendiri, selalu perlu diperiksa
     d = app.get("date") or ""
     if osdate and re.fullmatch(r"\d{8}", d) and re.fullmatch(r"\d{8}", osdate):
         try:
@@ -532,7 +534,40 @@ def app_source(app, osdate=""):
 
 def user_installed(app):
     """Terpasang di profil satu akun (tanpa hak admin) — biasanya dipasang sendiri oleh siswa."""
-    return app.get("kind") != "store" and str(app.get("id", "")).startswith("U:")
+    i = str(app.get("id", ""))
+    if app.get("kind") == "shortcut":
+        return (app.get("scope") or "Semua pengguna") != "Semua pengguna"
+    return app.get("kind") != "store" and (i.startswith("U:") or i.startswith("U32:"))
+
+
+def rule_pattern_for(app):
+    """Pola aturan dari nama aplikasi. Nama akun di dalam nama aplikasi (mis. 'Roblox Player for DKV')
+    diganti '*' supaya aturan berlaku untuk akun mana pun di komputer mana pun."""
+    name = clean_text(app.get("name"))
+    user = clean_text(app.get("scope")) if user_installed(app) else ""
+    if user and len(user) >= 2:
+        new = re.sub(r"(?i)(?<![\w])" + re.escape(user) + r"(?![\w])", "*", name)
+        if new != name and re.sub(r"[*?\s]", "", new):
+            return re.sub(r"\*+", "*", new)
+    return name
+
+
+def generalize_rules(apps):
+    """Aturan lama yang terlanjur memuat nama akun (dibuat sebelum ada rule_pattern_for) diubah jadi berpola '*'."""
+    changed = []
+    for r in CFG.get("app_rules", []):
+        for a in apps:
+            if r["pattern"].lower() == clean_text(a.get("name")).lower():
+                new = rule_pattern_for(a)
+                if new != r["pattern"] and not any(x["pattern"].lower() == new.lower() for x in CFG["app_rules"]):
+                    changed.append((r["pattern"], new))
+                    r["pattern"] = new
+                break
+    if changed:
+        save_config(CFG)
+        for old, new in changed:
+            write_log("otomatis", "aturan-aplikasi", f"{old} → {new}", "-")
+    return changed
 
 
 def note_failure(dev_id, app, ok, msg, by):
@@ -625,6 +660,9 @@ def scan_device(dev, user="otomatis", auto=True):
             entry["dismissed"] = [k for k in old.get("dismissed", []) if k in present]
             SCANS[dev["id"]] = entry
             save_scans()
+        if not entry["error"]:
+            with CFG_LOCK:
+                generalize_rules(entry["apps"])
         if entry["error"]:
             return f"Gagal memindai {dev['name']}: {entry['error']}"
         n_flag = len(flagged(dev["id"]))
@@ -2805,6 +2843,8 @@ def app_meta(a, osdate="", source=True):
         bits.append(f"dipasang di akun {a.get('scope')}")
     elif a.get("kind") != "store":
         bits.append(a.get("scope"))
+    if a.get("kind") == "shortcut" and a.get("target"):
+        bits.append(a["target"])
     if source:
         bits.append(dict(SOURCES)[app_source(a, osdate)])
     return " · ".join(E(b) for b in bits if b)
@@ -3086,8 +3126,11 @@ def apps_device_page(user, csrf, q, dev):
             tag += ' <span class="tag bad">Gagal dihapus</span>'
         if user_installed(a):
             tag += ' <span class="tag acc">Dipasang sendiri</span>'
-        mk = "" if r else (f'<form method="post" action="/apps/rules/add">{hidden(csrf, pattern=a["name"], mode="report", dev=dev["id"])}'
-                           f'<button class="btn quiet sm" title="Tandai aplikasi ini di semua komputer">Jadikan aturan</button></form>')
+        if a.get("kind") == "shortcut":
+            tag += ' <span class="tag warn" title="Tidak terdaftar di daftar aplikasi Windows; ditemukan dari pintasan Start menu (portable / dipasang tanpa installer)">hanya dari pintasan</span>'
+        pat = rule_pattern_for(a)
+        mk = "" if r else (f'<form method="post" action="/apps/rules/add">{hidden(csrf, pattern=pat, mode="report", dev=dev["id"])}'
+                           f'<button class="btn quiet sm" title="Tandai aplikasi ini di semua komputer: aturan &quot;{E(pat)}&quot;">Jadikan aturan</button></form>')
         groups[app_source(a, osdate)].append(
             f'<div class="row" data-name="{E((a.get("name","") + " " + (a.get("publisher") or "")).lower())}">'
             f'<div class="row-main"><b>{E(a["name"])}</b>{tag}<div class="mut small">{app_meta(a, osdate, source=False)}</div></div>'
@@ -4565,6 +4608,10 @@ def main():
         addr = (CFG.get("listen", "0.0.0.0"), int(CFG.get("port", 8080)))
         print(f"WOL Panel berjalan di http://{addr[0]}:{addr[1]}")
         load_scans()
+        try:  # aturan lama berisi nama akun -> berpola '*'
+            generalize_rules([a for sc in SCANS.values() for a in sc.get("apps", [])])
+        except Exception as e:
+            print("aturan:", e, file=sys.stderr)
         load_vmstate()
         threading.Thread(target=term_reaper, daemon=True).start()
         threading.Thread(target=scanner_loop, daemon=True).start()

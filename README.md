@@ -152,6 +152,15 @@ untuk cek status* (mis. 3389). Pastikan firewall MikroTik (chain forward) mengiz
 UDP 7 & 9 (WOL), TCP 8765 (agen), dan ICMP, dan tidak ada masquerade/srcnat untuk lalu lintas antar subnet lokal
 (agen hanya menerima IP panel).
 
+**Aplikasi yang tidak terdaftar di Windows** (portable, atau dipasang tanpa installer) tetap terdeteksi lewat
+pintasannya di Start menu (agen versi 9), dengan label *hanya dari pintasan* dan lokasi file programnya. Bila
+programnya ada di folder profil pengguna, Uninstall menghapus foldernya; bila tidak, panel menunjukkan folder yang
+perlu dihapus manual.
+
+**Aturan untuk aplikasi per akun.** Aplikasi seperti *Roblox Player for DKV* memuat nama akun. **Jadikan aturan**
+otomatis mengganti nama akun dengan `*` (`Roblox Player for *`), jadi aturan berlaku di semua akun dan komputer.
+Aturan lama yang terlanjur memuat nama akun diubah otomatis (tercatat di Aktivitas).
+
 ### Wallpaper (menu Wallpaper)
 
 1. **Unggah gambar** JPG/PNG (maks. 16 MB, sebaiknya seukuran layar, mis. 1920×1080). Gambar tersimpan di

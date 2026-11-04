@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 8
+$AgentVersion = 9
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -82,7 +82,7 @@ $UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
 
 function Get-Profiles {
     Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { -not $_.Special -and $_.LocalPath -and $_.SID -like 'S-1-5-21-*' }
+        Where-Object { -not $_.Special -and $_.LocalPath -and ($_.SID -like 'S-1-5-21-*' -or $_.SID -like 'S-1-12-1-*') }
 }
 
 # Membuka registry pengguna; bila pengguna tidak sedang login, hive-nya dimuat sementara.
@@ -110,22 +110,87 @@ function Read-UninstallKey([string]$path, [string]$idPrefix, [string]$scope, $li
         $v = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
         if (-not $v -or -not $v.DisplayName) { continue }
         if ($v.SystemComponent -eq 1 -or $v.ParentKeyName -or ([string]$v.ReleaseType) -match 'Update|Hotfix') { continue }
+        Add-KnownDir ([string]$v.InstallLocation); Add-KnownDir ([string]$v.DisplayIcon); Add-KnownDir ([string]$v.UninstallString)
         $list.Add([pscustomobject]@{
             id = "$idPrefix|$($k.PSChildName)"; name = ([string]$v.DisplayName).Trim(); version = [string]$v.DisplayVersion
             publisher = [string]$v.Publisher; scope = $scope; kind = 'win32'; date = [string]$v.InstallDate })
     }
 }
 
+# Aplikasi yang hanya punya pintasan di Start menu (portable / tidak terdaftar di daftar Uninstall Windows)
+$script:KnownDirs = New-Object System.Collections.Generic.List[string]
+
+function Add-KnownDir([string]$p) {
+    if (-not $p) { return }
+    $p = $p.Trim()
+    if ($p -match '^"([^"]+)"') { $p = $Matches[1] }
+    $p = (($p.Trim('"') -replace ',\s*-?\d+$', '') -replace '\s+/.*$', '').TrimEnd('\')
+    if ($p -match '(?i)\.(exe|ico|dll)$' -and $p.Contains('\')) { $p = $p.Substring(0, $p.LastIndexOf('\')) }
+    if ($p -match '(?i)\\(_?uninst(all)?(er)?)$') { $p = $p.Substring(0, $p.LastIndexOf('\')) }   # uninstaller di subfolder: pakai folder aplikasinya
+    if (-not $p -or ($p.Split('\') | Where-Object { $_ }).Count -lt 3) { return }   # jangan pakai folder terlalu umum (mis. C:\Program Files)
+    $script:KnownDirs.Add($p.ToLower() + '\')
+}
+
+function Test-StartMenuLink([string]$lnk) {
+    $roots = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\")
+    foreach ($p in Get-Profiles) { $roots += (Join-Path $p.LocalPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs') + '\' }
+    try { $full = [IO.Path]::GetFullPath($lnk) } catch { return $false }
+    if ($full -notlike '*.lnk') { return $false }
+    foreach ($r in $roots) { if ($full.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+
+function Add-ShortcutApps($list) {
+    $sh = New-Object -ComObject WScript.Shell
+    $names = @{}; foreach ($a in $list) { if ($a.name) { $names[([string]$a.name).ToLower()] = $true } }
+    $roots = @(@{ dir = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"; scope = 'Semua pengguna' })
+    foreach ($p in Get-Profiles) { $roots += @{ dir = (Join-Path $p.LocalPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'); scope = (Split-Path $p.LocalPath -Leaf) } }
+    $seen = @{}
+    $win = $env:SystemRoot.ToLower() + '\'
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r.dir)) { continue }
+        foreach ($l in Get-ChildItem -LiteralPath $r.dir -Filter *.lnk -Recurse -ErrorAction SilentlyContinue) {
+            try { $t = [string]$sh.CreateShortcut($l.FullName).TargetPath } catch { continue }
+            if (-not $t -or $t -notmatch '(?i)\.exe$' -or -not (Test-Path -LiteralPath $t -PathType Leaf)) { continue }
+            $tl = $t.ToLower()
+            if ($tl.StartsWith($win) -or $tl -like '*\windowsapps\*' -or $seen[$tl]) { continue }
+            $seen[$tl] = $true
+            $covered = $false
+            foreach ($k in $script:KnownDirs) { if ($tl.StartsWith($k)) { $covered = $true; break } }
+            if ($covered) { continue }
+            $nm = [IO.Path]::GetFileNameWithoutExtension($l.Name)
+            $nl = $nm.ToLower()
+            if ($nl -match 'uninstall|hapus|readme|help|bantuan|website|manual|license') { continue }
+            $dup = $names[$nl]
+            if (-not $dup -and $nl.Length -ge 4) {
+                foreach ($k in $names.Keys) { if ($k.Length -ge 4 -and ($k.Contains($nl) -or $nl.Contains($k))) { $dup = $true; break } }
+            }
+            if ($dup) { continue }
+            $fi = Get-Item -LiteralPath $t
+            $list.Add([pscustomobject]@{
+                id = 'LNK|' + $l.FullName; name = $nm; version = [string]$fi.VersionInfo.ProductVersion
+                publisher = [string]$fi.VersionInfo.CompanyName; scope = $r.scope; kind = 'shortcut'
+                date = $fi.CreationTime.ToString('yyyyMMdd'); target = $t })
+            $names[$nl] = $true
+        }
+    }
+}
+
 function Get-Apps {
     $list = New-Object System.Collections.Generic.List[object]
+    $script:KnownDirs.Clear()
     Read-UninstallKey "HKLM:\$UninstallKey" 'M64' 'Semua pengguna' $list
     Read-UninstallKey "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" 'M32' 'Semua pengguna' $list
     foreach ($p in Get-Profiles) {
         $h = Open-UserHive $p
         if (-not $h) { continue }
-        try { Read-UninstallKey "$($h.Root)\$UninstallKey" "U:$($p.SID)" (Split-Path $p.LocalPath -Leaf) $list }
+        try {
+            Read-UninstallKey "$($h.Root)\$UninstallKey" "U:$($p.SID)" (Split-Path $p.LocalPath -Leaf) $list
+            Read-UninstallKey "$($h.Root)\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" "U32:$($p.SID)" (Split-Path $p.LocalPath -Leaf) $list
+        }
         finally { Close-UserHive $h }
     }
+    try { Add-ShortcutApps $list } catch {}
     try {
         # paket yang ikut terpasang bersama Windows / dari pabrikan (bawaan)
         $prov = @{}
@@ -190,6 +255,24 @@ function Remove-UserShortcuts([string]$profileDir, [string]$root) {
 }
 
 function Invoke-Uninstall([string]$id) {
+    if ($id -like 'LNK|*') {
+        $lnk = $id.Substring(4)
+        if (-not (Test-StartMenuLink $lnk)) { return @{ ok = $false; msg = 'ID aplikasi tidak valid.' } }
+        if (-not (Test-Path -LiteralPath $lnk)) { return @{ ok = $true; msg = 'Pintasan aplikasi sudah tidak ada.' } }
+        $t = [string](New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+        $prof = Get-Profiles | Where-Object { $t -like "$($_.LocalPath)\*" } | Select-Object -First 1
+        $root = if ($prof) { Get-UserAppRoot $t $prof.LocalPath } else { $null }
+        if ($root) {
+            Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$root\*" } | ForEach-Object { try { $_.Kill() } catch {} }
+            Start-Sleep -Milliseconds 800
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-UserShortcuts $prof.LocalPath $root
+            Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $root)) { Write-Log "Hapus paksa (pintasan) $root"; return @{ ok = $true; msg = "Dihapus (folder $root dibersihkan)." } }
+            return @{ ok = $false; msg = 'Sebagian file masih dipakai. Coba lagi setelah pengguna logout.' }
+        }
+        return @{ ok = $false; msg = "Aplikasi ini tidak punya uninstaller terdaftar. Hapus manual foldernya: $(Split-Path $t -Parent)" }
+    }
     if ($id -like 'APPX|*') {
         try { Remove-AppxPackage -Package $id.Substring(5) -AllUsers -ErrorAction Stop; return @{ ok = $true; msg = 'Aplikasi Store dihapus untuk semua pengguna.' } }
         catch { return @{ ok = $false; msg = "Gagal menghapus aplikasi Store: $($_.Exception.Message)" } }
@@ -200,7 +283,16 @@ function Invoke-Uninstall([string]$id) {
     switch -regex ($prefix) {
         '^M64$' { $base = "HKLM:\$UninstallKey" }
         '^M32$' { $base = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' }
-        '^U:(S-1-5-21-[\d-]+)$' {
+        '^U32:(S-1-(?:5-21|12-1)-[\d-]+)$' {
+            $sid = $Matches[1]
+            $p = Get-Profiles | Where-Object { $_.SID -eq $sid } | Select-Object -First 1
+            if (-not $p) { return @{ ok = $false; msg = 'Profil pengguna tidak ditemukan.' } }
+            $profileDir = $p.LocalPath
+            $hive = Open-UserHive $p
+            if (-not $hive) { return @{ ok = $false; msg = 'Registry pengguna tidak bisa dibuka.' } }
+            $base = "$($hive.Root)\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        }
+        '^U:(S-1-(?:5-21|12-1)-[\d-]+)$' {
             $sid = $Matches[1]
             $p = Get-Profiles | Where-Object { $_.SID -eq $sid } | Select-Object -First 1
             if (-not $p) { return @{ ok = $false; msg = 'Profil pengguna tidak ditemukan.' } }
