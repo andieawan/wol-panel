@@ -1883,8 +1883,8 @@ svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-widt
 .nav a[aria-current=page]{color:var(--fg);background:var(--card);box-shadow:inset 0 0 0 1px var(--line)}
 .nav form{margin:0}
 @media (max-width:640px){.top{flex-wrap:nowrap;flex-direction:column;align-items:stretch;gap:4px;padding:0 0 8px}
-.nav{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:0 16px}.nav::-webkit-scrollbar{display:none}
-.nav a,.nav form{flex:none}}
+.top{position:relative}.nav{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:4px}
+.nav a{text-align:center;background:var(--off-soft)}.nav form{position:absolute;top:0;right:0}}
 @media (pointer:coarse){.nav a,.tabs a{min-height:44px;display:flex;align-items:center;justify-content:center}
 input,select{height:44px}
 details.more summary{min-height:44px}}
@@ -1944,7 +1944,7 @@ border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:6px;display:gri
 .dev{display:grid;gap:14px}
 .pw{justify-items:center;text-align:center;gap:10px;padding:22px 18px}
 .pw h2{font-size:18px;margin:0}
-.pw form,.pw .pwr-on{display:grid;justify-items:center;gap:20px;margin:14px 0 4px}
+.pw form,.pw .pwr-on{display:grid;justify-items:center;gap:26px;margin:16px 0 4px}
 .pw .a-stop,.pw .pwr-on{display:none}
 .pw[data-state=on] .a-stop,.pw[data-state=on] .pwr-on{display:grid}
 .pwr{width:150px;height:150px;border-radius:50%;border:2px solid var(--line);background:var(--card);color:var(--mut);
@@ -2039,6 +2039,7 @@ background:var(--ok-soft);color:var(--fg);border:1px solid color-mix(in srgb,var
 .tabs{display:flex;gap:4px;background:var(--off-soft);padding:4px;border-radius:11px;margin-bottom:16px;overflow-x:auto}
 .tabs a{flex:1;text-align:center;padding:8px 12px;border-radius:8px;text-decoration:none;color:var(--mut);font-weight:600;font-size:14px;white-space:nowrap}
 .tabs a[aria-current=page]{background:var(--card);color:var(--fg);box-shadow:var(--shadow),inset 0 0 0 1px var(--line)}
+@media (max-width:560px){.tabs{display:grid;grid-template-columns:1fr 1fr;overflow:visible}.tabs a,.htabs a{justify-content:center}.tabs a:last-child:nth-child(odd){grid-column:1/-1}}
 
 /* forms */
 label{display:block;font-size:13px;font-weight:600;color:var(--fg);margin-bottom:14px}
@@ -2333,7 +2334,7 @@ def log_list(n=8):
             label += f" {target}"
         who = "Sistem" if who in ("-", "cli") else who
         rows.append(f'<div class="row"><div class="row-main"><b>{E(who)}</b> <span class="mut">{E(label)}</span>'
-                    + (f'<div class="mut small mono">{E(ip)}</div>' if ip not in ("-", "") else "")
+                    + (f' <span class="mut small">· {E(ip)}</span>' if ip not in ("-", "") else "")
                     + f'</div><time>{E(fmt_time(ts))}</time></div>')
     return "".join(rows)
 
@@ -2499,7 +2500,11 @@ def home_page(user, csrf, q):
         tabs.append((gid, g, len(gc), f'<div class="devgrid">{"".join(gc)}</div>'))
     if servers:
         tabs.append(("srv", "Server", len(CFG.get("vms", [])), servers))
-    if len(tabs) > 1:
+    if len(tabs) > 1 and not is_admin(user) and sum(t[2] for t in tabs) <= 6:
+        # pengguna biasa dengan sedikit komputer: tampilkan semuanya sekaligus, tanpa perlu pindah tab
+        groups_html = "".join(f'<div class="sec-head"><h2>{E(label)}</h2></div><section class="hgrp" id="{gid}">{content}</section>'
+                              for gid, label, n, content in tabs)
+    elif len(tabs) > 1:
         nav = "".join(f'<a href="#{gid}" data-g="{gid}"><span>{E(label)}</span> <span class="cnt" data-n="{n}">{n}</span></a>'
                       for gid, label, n, _ in tabs)
         secs = "".join(f'<section class="hgrp" id="{gid}" data-label="{E(label)}"{"" if i == 0 else " hidden"}>{content}</section>'
@@ -3090,15 +3095,16 @@ def apps_page(user, csrf, q):
         rrows.append(f'<div class="row"><div class="row-main"><b class="mono">{E(r["pattern"])}</b> {mode}'
                      f'<div class="mut small">Cocok {c[0]} aplikasi di {len(c[1])} komputer</div></div>'
                      f'<div class="acts">{tform}{del_form("/apps/rules/delete", csrf, "Aturan " + r["pattern"] + " akan dihapus. Aplikasi yang sudah terpasang tidak terpengaruh.", "Hapus aturan?", rid=r["id"])}</div></div>')
-    rules_list = f'<div class="list">{"".join(rrows)}</div>' if rrows else '<p class="mut small" style="margin:0">Belum ada aturan.</p>'
-    rule_form = f"""<form method="post" action="/apps/rules/add" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">{hidden(csrf)}
+    rules_list = f'<div class="list">{"".join(rrows)}</div>' if rrows else ''  # kosong: kartu "Cocok dengan aturan" sudah menjelaskan
+    rule_style = ' style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)"' if rrows else ""
+    rule_form = f"""<form method="post" action="/apps/rules/add"{rule_style}>{hidden(csrf)}
 <div class="inline"><label>Nama aplikasi<input name="pattern" required maxlength="80" placeholder="mis. roblox" spellcheck="false"></label>
 <label style="flex:0 1 220px">Tindakan<select name="mode"><option value="report">Laporkan saja</option><option value="auto">Hapus otomatis</option></select></label>
 <button class="btn primary" style="margin-bottom:1px">Tambah aturan</button></div>
 <p class="mut small" style="margin:8px 0 0">Tanpa tanda <span class="mono">*</span> berarti "nama mengandung". Huruf besar/kecil tidak dibedakan.
 Contoh: <span class="mono">roblox</span>, <span class="mono">Google Play Games</span>, <span class="mono">*minecraft*</span>.
 Aplikasi sistem (Windows, driver, .NET, Visual C++, Office, Edge) tidak pernah dihapus otomatis.</p></form>"""
-    interval = f"""<form method="post" action="/apps/interval" class="inline" style="margin-top:14px">{hidden(csrf)}
+    interval = f"""<form method="post" action="/apps/interval" class="inline" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">{hidden(csrf)}
 <label style="flex:0 1 260px">Pindai otomatis setiap (menit)<input name="minutes" type="number" min="0" max="1440" value="{int(CFG.get('scan_minutes', 60))}"></label>
 <button class="btn">Simpan</button></form><p class="mut small" style="margin:6px 0 0">0 = hanya saat tombol Pindai diklik.</p>"""
 
