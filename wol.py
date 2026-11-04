@@ -1755,8 +1755,10 @@ svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-widt
 .brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--fg)}
 .logo{width:34px;height:34px;border-radius:10px;background:var(--acc);color:#fff;display:grid;place-items:center}
 .brand b{font-size:17px}.brand small{display:block;color:var(--mut);font-size:12px;font-weight:400}
-.nav{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
-.nav a{color:var(--mut);text-decoration:none;padding:8px 12px;border-radius:8px;font-weight:500}
+.brand .bname{color:var(--fg);text-decoration:none;display:block}
+.brand .who{display:block;color:var(--mut);font-size:12px;text-decoration:none}.brand .who:hover,.brand .who[aria-current]{color:var(--acc);text-decoration:underline}
+.nav{display:flex;gap:2px;align-items:center;flex-wrap:wrap}
+.nav a{color:var(--mut);text-decoration:none;padding:8px 9px;border-radius:8px;font-weight:500}
 .nav a:hover{color:var(--fg);background:var(--off-soft)}
 .nav a[aria-current=page]{color:var(--fg);background:var(--card);box-shadow:inset 0 0 0 1px var(--line)}
 .nav form{margin:0}
@@ -1846,11 +1848,29 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .adm{display:flex;gap:14px;margin-top:6px}.adm form{margin:0}
 .lnk{background:none;border:0;padding:2px 0;font:inherit;font-size:13px;font-weight:600;color:var(--acc);cursor:pointer;text-decoration:none}
 .lnk:hover{text-decoration:underline}.lnk:disabled{color:var(--mut);cursor:wait}
-.wp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.wp-step{border-top:1px solid var(--line);padding:14px 0 4px}.wp-step:first-of-type{border-top:0;padding-top:4px}
+.wp-step h3{display:flex;align-items:center;gap:8px;font-size:15px;margin:0 0 10px}
+.wp-step h3>span{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--acc);color:#fff;font-size:12px}
+.wp-step h3 .lnk{margin-left:auto}
+.wp-opts{display:grid;grid-template-columns:minmax(0,260px) 1fr;gap:12px 20px;align-items:start}@media(max-width:560px){.wp-opts{grid-template-columns:1fr}}
+.wp-grp{border:0;padding:0;margin:0 0 10px}.wp-grp legend{font-size:13px;font-weight:600;margin-bottom:6px;display:flex;gap:10px;align-items:center}
+.wp-devs{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:2px 16px}
+.wp-dev{margin:0;padding:4px 0}.wp-dev.off{opacity:.7}.wp-dev span{display:flex;flex-wrap:wrap;gap:0 8px;align-items:baseline}
+.wp-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:14px;margin-top:6px}
+.wp-foot p{margin:0}
+.wp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.wp-tile .wp-del{position:absolute;top:6px;right:6px;width:28px;height:28px;border-radius:50%;border:0;background:rgba(0,0,0,.55);color:#fff;
+ font-size:18px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s}
+.wp-tile:hover .wp-del,.wp-tile .wp-del:focus-visible{opacity:1}@media (hover:none){.wp-tile .wp-del{opacity:.85}}
+.wp-tile input:checked+.wp-thumb::after{content:"✓";position:absolute;top:6px;left:6px;width:24px;height:24px;border-radius:50%;
+ background:var(--acc);color:#fff;display:grid;place-items:center;font-size:14px;font-weight:700}
+.wp-thumb{position:relative;width:100%;min-width:0;overflow:hidden;box-sizing:border-box}
+.wp-add .wp-thumb{border-style:dashed;background:transparent;color:var(--acc);font-weight:600;gap:2px}
+.wp-add .plus{font-size:28px;line-height:1}.wp-add:hover .wp-thumb{background:var(--off-soft)}
 .wp-tile{display:grid;gap:6px;margin:0;cursor:pointer;position:relative;min-width:0}.wp-tile input{position:absolute;top:8px;left:8px;width:1px;height:1px;opacity:0;pointer-events:none}
 .wp-thumb{display:grid;place-items:center;aspect-ratio:16/10;border-radius:10px;background:var(--off-soft) center/cover no-repeat;
  border:2px solid var(--line);color:var(--mut);gap:4px;font-size:13px}.wp-thumb svg{width:26px;height:26px}
-.wp-def{background:linear-gradient(135deg,#0b5cad,#4aa3ff);color:#fff;border-color:transparent}
+.wp-def{background:linear-gradient(135deg,#0b5cad,#4aa3ff);color:#fff;border-color:transparent}.wp-def svg{width:34px;height:34px}
 .wp-tile input:checked+.wp-thumb{border-color:var(--acc);box-shadow:0 0 0 3px var(--ring)}
 .wp-tile input:focus-visible+.wp-thumb{outline:3px solid var(--acc);outline-offset:2px}
 .wp-cap{font-size:13px;font-weight:600;display:grid;line-height:1.3}.wp-cap small{font-weight:400;color:var(--mut)}
@@ -2110,11 +2130,13 @@ def shell(user, csrf, active, content, q, script=""):
         if any(v.get("terminal") for v in CFG.get("vms", [])):
             links.append(("/terminal", "Terminal"))
         links.append(("/settings", "Pengaturan"))
-    links.append(("/account", "Akun"))
+    if not is_admin(user):  # menu pengguna biasa masih lega: Akun tetap terlihat
+        links.append(("/account", "Akun"))
     nav = "".join(f'<a href="{h}"{" aria-current=page" if h == active else ""}>{t}</a>' for h, t in links)
+    acc = ' aria-current="page"' if active == "/account" else ""
     return page("WOL Panel", f"""<header class="top">
-<a class="brand" href="/"><span class="logo">{icon('power')}</span><span><b>WOL Panel</b>
-<small>{E(user)} · {'admin' if is_admin(user) else 'pengguna'}</small></span></a>
+<div class="brand"><a href="/" class="logo" aria-label="Beranda">{icon('power')}</a><span><a href="/" class="bname"><b>WOL Panel</b></a>
+<a class="who" href="/account" title="Akun &amp; ganti password"{acc}>{E(user)} · {'admin' if is_admin(user) else 'pengguna'}</a></span></div>
 <nav class="nav" aria-label="Menu">{nav}<form method="post" action="/logout">{hidden(csrf)}
 <button class="btn quiet sm">Keluar</button></form></nav></header>
 <main>{flash(q)}{content}</main>""", script)
@@ -2714,80 +2736,107 @@ def scan_label(dev_id):
 
 def wallpaper_page(user, csrf, q):
     imgs = CFG.get("wallpapers", [])
-    # sumber
+    running = WP_JOB.get("running")
+    # 1. gambar
     tiles = [f'<label class="wp-tile"><input type="radio" name="src" value="default" checked>'
-             f'<span class="wp-thumb wp-def">{icon("monitor")}<b>Bawaan Windows</b></span><span class="wp-cap">Bawaan Windows</span></label>']
+             f'<span class="wp-thumb wp-def" aria-hidden="true">{icon("monitor")}</span>'
+             f'<span class="wp-cap">Bawaan Windows<small>wallpaper asli Windows</small></span></label>']
+    del_forms = []
     for w in imgs:
         dim = f"{w['w']}×{w['h']}" if w.get("w") else w["ext"].upper()
-        tiles.append(f'<label class="wp-tile"><input type="radio" name="src" value="{E(w["id"])}">'
+        small = " · kecil" if w.get("w") and w["w"] < 1280 else ""
+        fid = "del-" + w["id"][:12]
+        del_forms.append(f'<form id="{fid}" method="post" action="/wallpaper/delete" hidden '
+                         f'{confirm(w["name"] + " dihapus dari pustaka. Wallpaper yang sudah terpasang di komputer tidak berubah.", "Hapus", "Hapus gambar?")}>'
+                         f'{hidden(csrf, id=w["id"])}</form>')
+        tiles.append(f'<label class="wp-tile"><input type="radio" name="src" value="{E(w["id"])}" data-name="{E(w["name"])}">'
                      f'<span class="wp-thumb" style="background-image:url(/wp/{E(w["id"])}.{w["ext"]})"></span>'
-                     f'<span class="wp-cap">{E(w["name"])}<small>{dim}</small></span></label>')
+                     f'<span class="wp-cap">{E(w["name"])}<small>{dim}{small}</small></span>'
+                     f'<button type="submit" form="{fid}" class="wp-del" aria-label="Hapus {E(w["name"])}" title="Hapus dari pustaka">×</button></label>')
+    tiles.append('<label class="wp-tile wp-add" for="wpfile"><span class="wp-thumb"><span class="plus">+</span>Unggah gambar</span>'
+                 '<span class="wp-cap"><small>JPG/PNG, maks. 16 MB</small></span></label>')
+    upload_form = (f'<form id="wpup" method="post" action="/wallpaper/upload" enctype="multipart/form-data" hidden>{hidden(csrf)}'
+                   f'<input type="file" id="wpfile" name="file" accept="image/jpeg,image/png"></form>')
     styles = "".join(f'<option value="{k}">{v}</option>' for k, v in WP_STYLES)
-    # komputer per kategori
+    # 3. komputer
     groups = {}
     for d in CFG.get("devices", []):
         groups.setdefault(clean_group(d.get("group")), []).append(d)
-    boxes = []
+    boxes, ready_total = [], 0
     for g, ds in groups.items():
         items = []
         for d in ds:
-            ok = d.get("agent_secret") and d.get("ip")
             v = d.get("agent_version")
-            note = "" if ok else " (belum ada agen)"
-            if ok and v and v < WP_MIN_AGENT:
-                note = f" (agen v{v}, perlu Perbarui agen)"
-            items.append(f'<label class="check" style="margin:0"><input type="checkbox" name="dev_{E(d["id"])}" value="1"'
-                         f'{"" if ok else " disabled"}><span>{E(d["name"])}<span class="mut small">{E(note)}</span></span></label>')
-        boxes.append(f'<fieldset style="border:0;padding:0;margin:0 0 10px"><legend class="small" style="font-weight:600;margin-bottom:4px">{E(g)} '
-                     f'<button type="button" class="btn quiet sm grpall" style="padding:2px 8px;font-size:12px">Centang semua</button></legend>'
-                     f'<div style="display:flex;flex-wrap:wrap;gap:4px 18px">{"".join(items)}</div></fieldset>')
-    running = WP_JOB.get("running")
-    apply_form = f"""<section class="card"><h2>Terapkan wallpaper</h2>
-<form method="post" action="/wallpaper/apply" {confirm("Wallpaper di komputer yang dicentang akan diganti. Pengguna yang sedang login langsung melihat perubahannya.", "Terapkan", "Terapkan wallpaper?")}>{hidden(csrf)}
-<p class="small" style="margin:0 0 8px;font-weight:600">Gambar</p>
-<div class="wp-grid">{"".join(tiles)}</div>
-<div class="grid" style="margin-top:14px"><label>Tampilan<select name="style">{styles}</select></label>
-<label class="check" style="align-self:end"><input type="checkbox" name="lock" value="1"><span>Kunci wallpaper
-<span class="hint">Siswa tidak bisa menggantinya. Terapkan tanpa centang ini untuk membuka kunci.</span></span></label></div>
-<div style="border-top:1px solid var(--line);margin-top:6px;padding-top:12px" id="wpdev">
-<p style="margin:0 0 8px;font-weight:600">Komputer <button type="button" class="btn quiet sm" id="wpall" style="padding:2px 8px;font-size:12px">Centang semua komputer</button></p>
-{"".join(boxes) or '<p class="mut small">Belum ada komputer.</p>'}</div>
-<div class="acts"><button class="btn primary"{" disabled" if running else ""} data-busy="Memulai…">Terapkan ke komputer terpilih</button></div></form></section>"""
+            if not (d.get("agent_secret") and d.get("ip")):
+                why = '<span class="mut small">belum ada agen</span>'
+            elif v and v < WP_MIN_AGENT:
+                why = f'<a class="small" href="/settings?edit={quote(d["id"])}">agen v{v}: perbarui dulu</a>'
+            else:
+                why = ""
+            ready_total += not why
+            items.append(f'<label class="check wp-dev{" off" if why else ""}"><input type="checkbox" name="dev_{E(d["id"])}" value="1"'
+                         f'{" disabled" if why else ""}><span>{E(d["name"])} {why}</span></label>')
+        boxes.append(f'<fieldset class="wp-grp"><legend>{E(g)} <button type="button" class="lnk grpall">Centang semua</button></legend>'
+                     f'<div class="wp-devs">{"".join(items)}</div></fieldset>')
+    if not boxes:
+        dev_html = '<p class="mut small" style="margin:0">Belum ada komputer. Tambahkan di Pengaturan.</p>'
+    elif not ready_total:
+        dev_html = "".join(boxes) + ('<p class="small" style="margin:8px 0 0;color:var(--warn)">Belum ada komputer dengan agen versi '
+                                     f'{WP_MIN_AGENT}. Klik <b>Perbarui agen</b> di Pengaturan → Komputer.</p>')
+    else:
+        dev_html = "".join(boxes)
+    form = f"""<section class="card"><h2>Ganti wallpaper</h2>
+<form method="post" action="/wallpaper/apply" id="wpform" data-confirm="" data-ok="Terapkan" data-title="Terapkan wallpaper?">{hidden(csrf)}
+<div class="wp-step"><h3><span>1</span>Pilih gambar</h3><div class="wp-grid">{"".join(tiles)}</div></div>
+<div class="wp-step"><h3><span>2</span>Tampilan</h3>
+<div class="wp-opts"><label style="margin:0">Posisi gambar<select name="style" id="wpstyle">{styles}</select></label>
+<label class="check" style="margin:0"><input type="checkbox" name="lock" value="1" id="wplock"><span>Kunci wallpaper
+<span class="hint">Siswa tidak bisa menggantinya. Terapkan tanpa centang ini untuk membuka kunci.</span></span></label></div></div>
+<div class="wp-step" id="wpdev"><h3><span>3</span>Pilih komputer {'<button type="button" class="lnk" id="wpall">Centang semua yang siap</button>' if ready_total else ''}</h3>
+{dev_html}</div>
+<div class="wp-foot"><p class="small mut" id="wpsum" aria-live="polite"></p>
+<button class="btn primary" id="wpgo" disabled data-busy="Memulai…">{'Sedang diterapkan…' if running else 'Pilih komputer dulu'}</button></div>
+</form>{"".join(del_forms)}{upload_form}</section>"""
     # hasil terakhir
     res = ""
     if WP_JOB:
-        names = {d["id"]: d["name"] for d in CFG.get("devices", [])}
-        rows = "".join(f'<div class="row"><div class="row-main"><b>{E(names.get(i, i))}</b>'
-                       f'<div class="small" style="color:var({"--ok" if r["ok"] else "--err"})">{E(r["msg"])}</div></div></div>'
-                       for i, r in WP_JOB.get("results", {}).items())
-        ok = sum(1 for r in WP_JOB.get("results", {}).values() if r["ok"])
-        head = (f'<span class="spin"></span> Sedang diterapkan: {E(WP_JOB["what"])}… ({len(WP_JOB["results"])} selesai)' if running else
-                f'{E(WP_JOB["what"])} — berhasil di {ok} dari {len(WP_JOB["results"])} komputer · {E(time.strftime("%H:%M", time.localtime(WP_JOB["end"])))}')
-        res = (f'<section class="card" id="wpres"><h2>Hasil terakhir</h2><p class="small" style="margin:0 0 8px">{head}</p><div class="list">{rows}</div></section>'
+        names = {d["id"]: d for d in CFG.get("devices", [])}
+        items = sorted(WP_JOB.get("results", {}).items(), key=lambda x: x[1]["ok"])
+        ok = sum(1 for _, r in items if r["ok"])
+        bad = len(items) - ok
+        rows = []
+        for i, r in items:
+            d = names.get(i) or {"name": i, "id": i}
+            fix = (f'<a class="btn sm" href="/settings?edit={quote(d["id"])}">Perbarui agen</a>' if "Perbarui agen" in r["msg"] else "")
+            rows.append(f'<div class="row"><div class="row-main"><b>{E(d["name"])}</b> '
+                        f'<span class="tag {"ok" if r["ok"] else "bad"}">{"berhasil" if r["ok"] else "gagal"}</span>'
+                        f'<div class="small mut">{E(r["msg"])}</div></div><div class="acts">{fix}</div></div>')
+        if running:
+            head = f'<span class="spin"></span> Sedang diterapkan: <b>{E(WP_JOB["what"])}</b> · {len(items)} komputer selesai…'
+        else:
+            head = (f'<b>{E(WP_JOB["what"])}</b> · {E(time.strftime("%H:%M", time.localtime(WP_JOB["end"])))} · '
+                    f'<span class="tag ok">{ok} berhasil</span>' + (f' <span class="tag bad">{bad} gagal</span>' if bad else ""))
+        res = (f'<section class="card" id="wpres"><h2>Hasil penerapan</h2><p class="small" style="margin:0 0 8px">{head}</p>'
+               f'<div class="list">{"".join(rows)}</div></section>'
                + ('<script>setTimeout(function(){location.reload()},3000)</script>' if running else ""))
-    # pustaka gambar
-    lib = "".join(f'<div class="row"><div class="row-main" style="display:flex;gap:12px;align-items:center">'
-                  f'<span class="wp-mini" style="background-image:url(/wp/{E(w["id"])}.{w["ext"]})"></span><div><b>{E(w["name"])}</b>'
-                  f'<div class="meta"><span>{w["w"]}×{w["h"]}</span><span>{w["size"] // 1024} KB</span></div></div></div>'
-                  f'<div class="acts">{del_form("/wallpaper/delete", csrf, w["name"] + " dihapus dari panel. Wallpaper yang sudah terpasang di komputer tidak berubah.", "Hapus gambar?", id=w["id"])}</div></div>'
-                  for w in imgs)
-    upload = f"""<section class="card"><h2>Unggah gambar</h2>
-<form method="post" action="/wallpaper/upload" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
-<label style="margin:0;flex:1 1 240px">File gambar<input type="file" name="file" accept="image/jpeg,image/png" required>
-<span class="hint">JPG atau PNG, maksimal 16 MB. Sebaiknya seukuran layar, mis. 1920×1080.</span></label>
-<label style="margin:0;flex:0 1 220px">Nama<input name="name" maxlength="60" placeholder="otomatis dari nama file"></label>
-<button class="btn" data-busy="Mengunggah…">Unggah</button></form>
-{f'<div class="list" style="margin-top:12px">{lib}</div>' if lib else ''}</section>"""
     js = """(function(){
-document.querySelectorAll('.grpall').forEach(function(b){b.onclick=function(){var c=b.closest('fieldset').querySelectorAll('input[type=checkbox]:not(:disabled)'),
- on=[].some.call(c,function(i){return !i.checked});c.forEach(function(i){i.checked=on})}});
-var a=document.getElementById('wpall');if(a)a.onclick=function(){var c=document.querySelectorAll('#wpdev input[type=checkbox]:not(:disabled)'),
- on=[].some.call(c,function(i){return !i.checked});c.forEach(function(i){i.checked=on})};
-var f=document.querySelector('form[action="/wallpaper/apply"]');if(f)f.addEventListener('submit',function(e){
- if(!f.querySelector('#wpdev input:checked')){e.preventDefault();e.stopImmediatePropagation();alert('Centang minimal satu komputer.')}},true);
+var f=document.getElementById('wpform'),go=document.getElementById('wpgo'),sum=document.getElementById('wpsum');
+var up=document.getElementById('wpfile');if(up)up.onchange=function(){if(!up.files.length)return;var t=document.querySelector('.wp-add .wp-thumb');
+ if(t)t.innerHTML='<span class="spin"></span>Mengunggah…';document.getElementById('wpup').submit()};
+function boxes(){return f.querySelectorAll('#wpdev input[type=checkbox]:not(:disabled)')}
+function toggle(list){var on=[].some.call(list,function(i){return !i.checked});list.forEach(function(i){i.checked=on});upd()}
+document.querySelectorAll('.grpall').forEach(function(b){b.onclick=function(){toggle(b.closest('fieldset').querySelectorAll('input:not(:disabled)'))}});
+var all=document.getElementById('wpall');if(all)all.onclick=function(){toggle(boxes())};
+function upd(){var n=f.querySelectorAll('#wpdev input:checked').length,src=f.querySelector('input[name=src]:checked'),
+ name=src&&src.value!=='default'?src.dataset.name:'Bawaan Windows',st=document.getElementById('wpstyle'),lk=document.getElementById('wplock').checked;
+ var running=go.textContent.indexOf('Sedang')===0;
+ go.disabled=!n||running;if(!running)go.textContent=n?'Terapkan ke '+n+' komputer':'Pilih komputer dulu';
+ sum.textContent=name+' · '+st.options[st.selectedIndex].text+(lk?' · dikunci':'');
+ f.dataset.confirm='Wallpaper "'+name+'" ('+st.options[st.selectedIndex].text.toLowerCase()+(lk?', dikunci':'')+') diterapkan ke '+n+
+  ' komputer. Pengguna yang sedang login langsung melihat perubahannya.'}
+f.addEventListener('change',upd);upd();
 })();"""
-    body = res + apply_form + upload
-    return shell(user, csrf, "/wallpaper", body, q, js)
+    return shell(user, csrf, "/wallpaper", form + res, q, js)
 
 
 def apps_page(user, csrf, q):
@@ -3614,7 +3663,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not devs:
                     return self.back("/wallpaper", "Centang minimal satu komputer yang sudah beragen.", True)
                 threading.Thread(target=apply_wallpaper, args=(devs, src, style, form.get("lock") == "1", user), daemon=True).start()
-                return self.redirect("/wallpaper#wpres")
+                return self.redirect("/wallpaper#wpres")  # hasil di bawah formulir
             if path == "/wallpaper/delete":
                 w = next((x for x in CFG.get("wallpapers", []) if x["id"] == form.get("id")), None)
                 if not w:
