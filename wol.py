@@ -699,6 +699,10 @@ def scanner_loop():
                 scan_all(only_due=True)
         except Exception as e:
             print("pemindai otomatis:", e, file=sys.stderr)
+        try:
+            wp_check_all()
+        except Exception as e:
+            print("cek wallpaper:", e, file=sys.stderr)
 
 
 # ------------------------------------------------------- versi & pembaruan agen
@@ -1576,35 +1580,98 @@ def wp_path(w):
     return os.path.join(WP_DIR, f"{w['id']}.{w['ext']}")
 
 
+WP_CHECK_MIN = 10    # cek wallpaper yang diganti setiap 10 menit
+WP_CHECK_AGENT = 8   # agen mulai versi ini bisa melaporkan wallpaper yang sedang dipakai
+WP_LAST_CHECK = [0]
+
+
+def wp_send(d, src, style, lock, user):
+    """Pasang wallpaper di satu komputer. -> {"ok", "msg"}; bila berhasil, dicatat sebagai wallpaper yang disetujui."""
+    img = None if src == "default" else next((w for w in CFG.get("wallpapers", []) if w["id"] == src), None)
+    if src != "default" and not img:
+        return {"ok": False, "msg": "gambar sudah dihapus dari pustaka"}
+    if not d.get("agent_secret") or not d.get("ip"):
+        return {"ok": False, "msg": "belum ada agen"}
+    payload = {"action": "wallpaper", "mode": "image" if img else "default", "style": style, "lock": bool(lock)}
+    if img:
+        try:
+            panel = local_ip_for(d["ip"])
+        except OSError:
+            return {"ok": False, "msg": "IP komputer tidak bisa dijangkau"}
+        payload.update(url=f"http://{panel}:{int(CFG.get('port', 8080))}/wp/{img['id']}.{img['ext']}", sha256=img["id"], ext=img["ext"])
+    try:
+        r = agent_cmd(d, user, payload, timeout=150)
+        res = {"ok": bool(r.get("ok")), "msg": clean_text(r.get("msg")) or "-"}
+    except (AgentOld, urllib.error.HTTPError) as e:
+        if isinstance(e, AgentOld) or getattr(e, "code", 0) == 400:
+            return {"ok": False, "msg": f"agen versi lama, klik Perbarui agen (perlu versi {WP_MIN_AGENT})"}
+        return {"ok": False, "msg": agent_error(e)}
+    except Exception as e:
+        return {"ok": False, "msg": agent_error(e)}
+    if res["ok"]:
+        with CFG_LOCK:
+            d["wallpaper"] = {"src": src, "name": img["name"] if img else "Bawaan Windows", "style": style, "lock": bool(lock),
+                              "time": int(time.time()), "by": user}
+            d.pop("wp_check", None)
+            d.pop("wp_accept", None)
+            save_config(CFG)
+    return res
+
+
+def wp_check(d):
+    """Bandingkan wallpaper tiap profil dengan yang disetujui. Menyimpan hasil di d["wp_check"]; True bila tidak sesuai."""
+    want = d.get("wallpaper")
+    if not want or not d.get("agent_secret"):
+        return False
+    try:
+        r = agent_cmd(d, "panel", {"action": "wpstatus"}, timeout=60)
+    except (AgentOld, urllib.error.HTTPError):
+        set_agent_version(d, min(int(d.get("agent_version") or WP_CHECK_AGENT - 1), WP_CHECK_AGENT - 1))
+        return False
+    except Exception:
+        return False  # komputer mati: coba lagi nanti
+    expect = want["src"] if want["src"] != "default" else str(r.get("default_sha256") or "")
+    bad = [{"user": clean_text(p.get("user")), "file": os.path.basename(clean_text(p.get("path")).replace("\\", "/")) or "(kosong)",
+            "online": bool(p.get("online"))}
+           for p in r.get("profiles") or [] if str(p.get("sha256") or "").lower() != expect.lower()]
+    sig = hashlib.sha256(json.dumps(sorted((b["user"], b["file"]) for b in bad)).encode()).hexdigest()[:16] if bad else ""
+    with CFG_LOCK:
+        d["wp_check"] = {"time": int(time.time()), "bad": bad, "sig": sig, "unlocked": want.get("lock") and not r.get("locked")}
+        save_config(CFG)
+    return wp_flagged(d)
+
+
+def wp_flagged(d):
+    c = d.get("wp_check") or {}
+    return bool(d.get("wallpaper") and c.get("bad") and c.get("sig") != d.get("wp_accept"))
+
+
+def wp_check_all(force=False):
+    if not force and time.time() - WP_LAST_CHECK[0] < WP_CHECK_MIN * 60:
+        return
+    WP_LAST_CHECK[0] = time.time()
+    devs = [d for d in list(CFG.get("devices", [])) if d.get("wallpaper") and d.get("agent_secret") and d.get("ip")
+            and int(d.get("agent_version") or WP_CHECK_AGENT) >= WP_CHECK_AGENT]
+    if not devs:
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        flags = list(ex.map(wp_check, devs))
+    for d, bad in zip(devs, flags):
+        if bad and CFG.get("wp_auto_restore"):
+            w = d["wallpaper"]
+            res = wp_send(d, w["src"], w["style"], w["lock"], "otomatis")
+            write_log("otomatis", "wallpaper-dikembalikan" if res["ok"] else "wallpaper-gagal-dikembalikan", f"{d['id']}: {res['msg']}", "-")
+
+
 def apply_wallpaper(devs, src, style, lock, user):
     """Kirim perintah wallpaper ke banyak komputer sekaligus (latar belakang)."""
     img = None if src == "default" else next((w for w in CFG.get("wallpapers", []) if w["id"] == src), None)
     WP_JOB.update(running=True, start=int(time.time()), end=None, by=user, results={},
                   what=("Bawaan Windows" if not img else img["name"]) + f" · {dict(WP_STYLES).get(style, style)}" + (" · dikunci" if lock else ""))
-
-    def one(d):
-        if not d.get("agent_secret") or not d.get("ip"):
-            return d["id"], {"ok": False, "msg": "belum ada agen"}
-        payload = {"action": "wallpaper", "mode": "image" if img else "default", "style": style, "lock": bool(lock)}
-        if img:
-            try:
-                panel = local_ip_for(d["ip"])
-            except OSError:
-                return d["id"], {"ok": False, "msg": "IP komputer tidak bisa dijangkau"}
-            payload.update(url=f"http://{panel}:{int(CFG.get('port', 8080))}/wp/{img['id']}.{img['ext']}", sha256=img["id"], ext=img["ext"])
-        try:
-            r = agent_cmd(d, user, payload, timeout=150)
-            return d["id"], {"ok": bool(r.get("ok")), "msg": clean_text(r.get("msg")) or "-"}
-        except (AgentOld, urllib.error.HTTPError) as e:
-            if isinstance(e, AgentOld) or getattr(e, "code", 0) == 400:
-                return d["id"], {"ok": False, "msg": f"agen versi lama, klik Perbarui agen (perlu versi {WP_MIN_AGENT})"}
-            return d["id"], {"ok": False, "msg": agent_error(e)}
-        except Exception as e:
-            return d["id"], {"ok": False, "msg": agent_error(e)}
     try:
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for did, res in ex.map(one, devs):
-                WP_JOB["results"][did] = res
+            for d, res in zip(devs, ex.map(lambda d: wp_send(d, src, style, lock, user), devs)):
+                WP_JOB["results"][d["id"]] = res
     finally:
         WP_JOB.update(running=False, end=int(time.time()))
         ok = sum(1 for r in WP_JOB["results"].values() if r["ok"])
@@ -1848,6 +1915,8 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .adm{display:flex;gap:14px;margin-top:6px}.adm form{margin:0}
 .lnk{background:none;border:0;padding:2px 0;font:inherit;font-size:13px;font-weight:600;color:var(--acc);cursor:pointer;text-decoration:none}
 .lnk:hover{text-decoration:underline}.lnk:disabled{color:var(--mut);cursor:wait}
+.wp-mon{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--line);margin-top:10px;padding-top:10px}
+.wp-mon>span{flex:1 1 220px}.wp-mon form{margin:0}
 .wp-step{border-top:1px solid var(--line);padding:14px 0 4px}.wp-step:first-of-type{border-top:0;padding-top:4px}
 .wp-step h3{display:flex;align-items:center;gap:8px;font-size:15px;margin:0 0 10px}
 .wp-step h3>span{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--acc);color:#fff;font-size:12px}
@@ -2081,7 +2150,9 @@ LOG_LABELS = {
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
     "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
     "terminal-gagal": "Gagal membuka kunci terminal", "terminal-buka-kunci": "Membuka kunci terminal",
-    "wallpaper": "Menerapkan wallpaper", "wallpaper-unggah": "Mengunggah wallpaper", "wallpaper-hapus": "Menghapus wallpaper",
+    "wallpaper": "Menerapkan wallpaper", "wallpaper-dikembalikan": "Mengembalikan wallpaper yang diganti",
+    "wallpaper-gagal-dikembalikan": "Gagal mengembalikan wallpaper", "wallpaper-setujui": "Menyetujui wallpaper yang diganti",
+    "wallpaper-otomatis": "Mengubah kembalikan wallpaper otomatis", "wallpaper-unggah": "Mengunggah wallpaper", "wallpaper-hapus": "Menghapus wallpaper",
     "cari-jaringan": "Mencari agen di jaringan", "perbarui-ip": "Memperbarui IP komputer",
     "tambah-dari-jaringan": "Menambah komputer dari pencarian jaringan", "tambah-dari-skrip": "Menambah komputer dari skrip",
     "tambah-vm": "Menambah VM", "ubah-vm": "Mengubah data VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
@@ -2298,8 +2369,13 @@ def home_page(user, csrf, q):
         warn = ""
         if is_admin(user):
             nf = len(flagged(d["id"]))
+            tags = []
             if nf:
-                warn = f'<div style="margin-top:6px"><a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a></div>'
+                tags.append(f'<a class="tag warn" href="/apps?dev={quote(d["id"])}">{nf} aplikasi cocok aturan</a>')
+            if wp_flagged(d):
+                tags.append('<a class="tag bad" href="/wallpaper#wpdrift" title="Wallpaper berbeda dari yang disetujui">wallpaper diganti</a>')
+            if tags:
+                warn = f'<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">{"".join(tags)}</div>'
         edit = (f'<div class="adm"><form method="post" action="/devices/test">{hidden(csrf, id=d["id"], back="home")}'
                 f'<button class="lnk" data-busy="Mengetes…" title="Cek port, ARP, ping, dan agen">Tes</button></form>'
                 f'<a class="lnk" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a></div>' if is_admin(user) else "")
@@ -2774,8 +2850,11 @@ def wallpaper_page(user, csrf, q):
             else:
                 why = ""
             ready_total += not why
+            cur = d.get("wallpaper")
+            now = ("" if why or not cur else
+                   f'<span class="tag {"bad" if wp_flagged(d) else ""}" title="Wallpaper yang disetujui">{E(cur["name"])}{" · diganti" if wp_flagged(d) else ""}</span>')
             items.append(f'<label class="check wp-dev{" off" if why else ""}"><input type="checkbox" name="dev_{E(d["id"])}" value="1"'
-                         f'{" disabled" if why else ""}><span>{E(d["name"])} {why}</span></label>')
+                         f'{" disabled" if why else ""}><span>{E(d["name"])} {why}{now}</span></label>')
         boxes.append(f'<fieldset class="wp-grp"><legend>{E(g)} <button type="button" class="lnk grpall">Centang semua</button></legend>'
                      f'<div class="wp-devs">{"".join(items)}</div></fieldset>')
     if not boxes:
@@ -2836,7 +2915,40 @@ function upd(){var n=f.querySelectorAll('#wpdev input:checked').length,src=f.que
   ' komputer. Pengguna yang sedang login langsung melihat perubahannya.'}
 f.addEventListener('change',upd);upd();
 })();"""
-    return shell(user, csrf, "/wallpaper", form + res, q, js)
+    # ---- wallpaper yang diganti / tidak disetujui
+    flagged = [d for d in CFG.get("devices", []) if wp_flagged(d)]
+    watched = [d for d in CFG.get("devices", []) if d.get("wallpaper")]
+    drows = []
+    for d in flagged:
+        c, w = d["wp_check"], d["wallpaper"]
+        who = ", ".join(f'{E(b["user"])} → <span class="mono">{E(b["file"])}</span>' + (" (sedang login)" if b["online"] else "") for b in c["bad"][:4])
+        more = f" dan {len(c['bad']) - 4} lainnya" if len(c["bad"]) > 4 else ""
+        lockmsg = '<div class="small" style="color:var(--err)">Kunci wallpaper terlepas.</div>' if c.get("unlocked") else ""
+        drows.append(f'<div class="row"><div class="row-main"><b>{E(d["name"])}</b> <span class="tag bad">diganti</span>'
+                     f'<div class="small">Seharusnya <b>{E(w["name"])}</b>. Sekarang: {who}{more}</div>{lockmsg}'
+                     f'<div class="mut small">Dicek {E(time.strftime("%H:%M", time.localtime(c["time"])))}</div></div>'
+                     f'<div class="acts"><form method="post" action="/wallpaper/restore">{hidden(csrf, id=d["id"])}<button class="btn sm primary" data-busy="Mengembalikan…">Kembalikan</button></form>'
+                     f'<form method="post" action="/wallpaper/accept" {confirm("Wallpaper yang sekarang di " + d["name"] + " diterima. Penanda muncul lagi bila diganti lagi.", "Setujui", "Setujui wallpaper ini?")}>'
+                     f'{hidden(csrf, id=d["id"])}<button class="btn sm quiet">Setujui</button></form></div></div>')
+    last = max([(d.get("wp_check") or {}).get("time", 0) for d in watched] or [0])
+    auto = CFG.get("wp_auto_restore")
+    ctrl = (f'<div class="wp-mon"><span class="small mut">{len(watched)} komputer dipantau · dicek tiap {WP_CHECK_MIN} menit'
+            + (f' · terakhir {E(time.strftime("%H:%M", time.localtime(last)))}' if last else "") + '</span>'
+            f'<form method="post" action="/wallpaper/check">{hidden(csrf)}<button class="btn sm" data-busy="Mengecek…">Cek sekarang</button></form>'
+            f'<form method="post" action="/wallpaper/auto">{hidden(csrf, on="0" if auto else "1")}<button class="btn sm {"primary" if auto else "quiet"}" '
+            f'aria-pressed="{"true" if auto else "false"}" title="Wallpaper yang diganti langsung dipasang ulang saat dicek">Kembalikan otomatis: {"aktif" if auto else "mati"}</button></form></div>')
+    if flagged:
+        restore_all = (f'<form method="post" action="/wallpaper/restore">{hidden(csrf, id="semua")}'
+                       f'<button class="btn sm primary" data-busy="Mengembalikan…">Kembalikan semua ({len(flagged)})</button></form>') if len(flagged) > 1 else ""
+        drift = (f'<section class="card" id="wpdrift" style="border-color:color-mix(in srgb,var(--err) 45%,var(--line))">'
+                 f'<div class="sec-head" style="margin:0 0 8px"><h2 style="margin:0">Wallpaper tidak sesuai <span class="tag bad">{len(flagged)}</span></h2>{restore_all}</div>'
+                 f'<div class="list">{"".join(drows)}</div>{ctrl}</section>')
+    elif watched:
+        drift = (f'<section class="card" id="wpdrift"><div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">'
+                 f'<span class="tag ok">Semua sesuai</span><span class="small">Tidak ada wallpaper yang diganti di komputer yang dipantau.</span></div>{ctrl}</section>')
+    else:
+        drift = ""
+    return shell(user, csrf, "/wallpaper", drift + form + res, q, js)
 
 
 def apps_page(user, csrf, q):
@@ -3611,6 +3723,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_apps_uninstall(form, user, ip)
         if path == "/apps/dismiss":
             return self.do_apps_dismiss(form, user, ip)
+        if path == "/wallpaper/check":
+            wp_check_all(force=True)
+            n = sum(1 for d in CFG["devices"] if wp_flagged(d))
+            return self.back("/wallpaper", f"Selesai dicek: {n} komputer wallpapernya diganti." if n else "Selesai dicek: semua sesuai.", bool(n))
+        if path == "/wallpaper/auto":
+            CFG["wp_auto_restore"] = form.get("on") == "1"
+            save_config(CFG)
+            write_log(user, "wallpaper-otomatis", "aktif" if CFG["wp_auto_restore"] else "mati", ip)
+            return self.back("/wallpaper", "Kembalikan otomatis " + ("aktif: wallpaper yang diganti dipasang ulang setiap kali dicek."
+                                                                     if CFG["wp_auto_restore"] else "dimatikan."))
+        if path == "/wallpaper/accept":
+            d = next((x for x in CFG["devices"] if x["id"] == form.get("id")), None)
+            if not d or not d.get("wp_check"):
+                return self.back("/wallpaper", "Komputer tidak ditemukan.", True)
+            d["wp_accept"] = d["wp_check"].get("sig")
+            save_config(CFG)
+            write_log(user, "wallpaper-setujui", d["id"], ip)
+            return self.back("/wallpaper", f"Wallpaper di {d['name']} disetujui.")
+        if path == "/wallpaper/restore":
+            targets = [x for x in CFG["devices"] if wp_flagged(x)] if form.get("id") == "semua" else \
+                      [x for x in CFG["devices"] if x["id"] == form.get("id") and x.get("wallpaper")]
+            if not targets:
+                return self.back("/wallpaper", "Tidak ada yang perlu dikembalikan.", True)
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                results = list(ex.map(lambda x: wp_send(x, x["wallpaper"]["src"], x["wallpaper"]["style"], x["wallpaper"]["lock"], user), targets))
+            okn = sum(1 for r in results if r["ok"])
+            for x, r in zip(targets, results):
+                write_log(user, "wallpaper-dikembalikan" if r["ok"] else "wallpaper-gagal-dikembalikan", f"{x['id']}: {r['msg']}", ip)
+            fail = [f"{x['name']}: {r['msg']}" for x, r in zip(targets, results) if not r["ok"]]
+            return self.back("/wallpaper", f"Dikembalikan di {okn} dari {len(targets)} komputer." + (" Gagal — " + "; ".join(fail) if fail else ""), bool(fail))
         with CFG_LOCK:
             if path == "/servers/add":
                 return self.do_vm_add(form, user, ip)

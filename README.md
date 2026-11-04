@@ -162,6 +162,16 @@ UDP 7 & 9 (WOL), TCP 8765 (agen), dan ICMP, dan tidak ada masquerade/srcnat untu
 3. **Kunci wallpaper** memasang kebijakan Windows agar siswa tidak bisa menggantinya. Terapkan lagi tanpa centang
    *Kunci* (mis. *Bawaan Windows*) untuk membuka kuncinya.
 
+**Penanda wallpaper diganti.** Setiap wallpaper yang berhasil diterapkan dicatat sebagai wallpaper yang disetujui
+untuk komputer itu. Panel mengeceknya tiap 10 menit (atau **Cek sekarang**): bila ada profil pengguna yang
+wallpapernya berbeda (dibandingkan lewat isi file/SHA-256, bukan nama file), komputer itu muncul di
+**Wallpaper tidak sesuai** (siapa yang mengganti, dengan file apa, sedang login atau tidak) dan kartunya di Beranda
+diberi tanda merah *wallpaper diganti*. Pilihannya:
+- **Kembalikan** (atau **Kembalikan semua**) — pasang ulang wallpaper yang disetujui;
+- **Setujui** — terima wallpaper yang sekarang; penanda muncul lagi bila diganti lagi;
+- **Kembalikan otomatis** — wallpaper yang diganti langsung dipasang ulang setiap kali dicek.
+Butuh agen versi 8. Agar siswa tidak bisa mengganti sama sekali, pakai **Kunci wallpaper**.
+
 Cara kerjanya: tiap komputer mengunduh sendiri gambarnya dari panel (hanya dari jaringan sekolah) dan mengecek
 SHA-256-nya, lalu memasangnya untuk semua profil pengguna (termasuk pengguna baru). Pengguna yang sedang login
 langsung melihat perubahannya. Butuh agen versi 7: klik **Perbarui agen** pada komputer lama.

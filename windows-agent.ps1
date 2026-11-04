@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 7
+$AgentVersion = 8
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -358,6 +358,29 @@ function Set-Wallpaper($c) {
     return @{ ok = $true; msg = $msg }
 }
 
+function Get-WallpaperStatus {
+    # wallpaper tiap profil pengguna saat ini: path + SHA-256 filenya, untuk dibandingkan panel dengan yang disetujui
+    $hashOf = { param($p) if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { try { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() } catch { '' } } else { '' } }
+    $list = New-Object System.Collections.Generic.List[object]
+    $active = @{}
+    foreach ($pr in Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue) {
+        try { $o = Invoke-CimMethod -InputObject $pr -MethodName GetOwner -ErrorAction Stop; if ($o.User) { $active[$o.User.ToLower()] = $true } } catch {}
+    }
+    foreach ($p in Get-Profiles) {
+        $h = Open-UserHive $p
+        if (-not $h) { continue }
+        try {
+            $v = Get-ItemProperty -Path "$($h.Root)\Control Panel\Desktop" -ErrorAction SilentlyContinue
+            $path = [string]$v.Wallpaper
+            $user = Split-Path $p.LocalPath -Leaf
+            $list.Add([pscustomobject]@{ user = $user; path = $path; sha256 = (& $hashOf $path); online = [bool]$active[$user.ToLower()] })
+        } finally { Close-UserHive $h }
+    }
+    $def = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img0.jpg'
+    $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
+    return @{ ok = $true; profiles = @($list); default_sha256 = (& $hashOf $def); locked = [bool]$pol.Wallpaper }
+}
+
 # ---------------------------------------------------------------- relay Wake-on-LAN
 # Panel di subnet lain tidak bisa mengirim broadcast ke subnet ini; agen yang hidup di subnet ini mengirimkannya.
 function Send-Wol([string]$mac, $targets, [int]$port) {
@@ -461,6 +484,9 @@ function Handle($ctx) {
                 $r = Invoke-Uninstall ([string]$c.id)
                 Write-Log "Uninstall diminta $script:By : $($r.msg)"
                 Send-Json $ctx 200 $r
+            }
+            'wpstatus' {
+                Send-Json $ctx 200 (Get-WallpaperStatus)
             }
             'wallpaper' {
                 $r = Set-Wallpaper $c
