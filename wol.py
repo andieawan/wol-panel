@@ -190,6 +190,21 @@ def group_datalist(dl_id, kind=None):
     return f'<datalist id="{dl_id}">' + "".join(f'<option value="{E(o)}">' for o in opts) + "</datalist>"
 
 
+def name_key(d):
+    """Urutan alami nama komputer: LAB1-PC2 sebelum LAB1-PC10."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(d.get("name") or d.get("host") or ""))]
+
+
+def by_name(devs):
+    return sorted(devs, key=name_key)
+
+
+def keep_group_order(groups):
+    """Urutan kategori tetap seperti urutan pertama kali muncul di daftar komputer (tidak ikut urutan nama)."""
+    order = device_groups()
+    return dict(sorted(groups.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order)))
+
+
 def can_access(user, dev):
     """Admin: semua komputer. Pengguna: komputer yang diizinkan admin (data lama tanpa daftar = semua)."""
     rec = CFG["users"].get(user) or {}
@@ -200,7 +215,7 @@ def can_access(user, dev):
 
 
 def user_devices(user):
-    return [d for d in CFG.get("devices", []) if can_access(user, d)]
+    return by_name(d for d in CFG.get("devices", []) if can_access(user, d))
 
 
 def is_admin(user):
@@ -2403,6 +2418,7 @@ def home_page(user, csrf, q):
 <a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer" title="Buka remote desktop">Remote {icon('ext')}</a>
 {stop}</div></article>""")
         by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
+    by_group = keep_group_order(by_group)
     if not by_group:
         tip = ('<a class="btn primary" href="/settings?new=1#form-dev">' + icon("plus") + 'Tambah komputer</a>') if is_admin(user) \
             else '<p class="small">Belum ada komputer yang diizinkan untuk akun ini. Hubungi admin.</p>'
@@ -2527,7 +2543,7 @@ def settings_devices(user, csrf, q, kind="desktop"):
 
     # ---- daftar komputer
     rows = []
-    for d in CFG["devices"]:
+    for d in by_name(CFG["devices"]):
         if dev_kind(d) != kind:
             continue
         has_agent = bool(d.get("agent_secret"))
@@ -2603,7 +2619,7 @@ def settings_devices(user, csrf, q, kind="desktop"):
     # ---- daftar tunggu & tambah lewat skrip
     pend = [p for p in CFG.get("pending", []) if dev_kind(p) == kind]
     prow = []
-    for p in sorted(pend, key=lambda x: x["host"].lower()):
+    for p in sorted(pend, key=name_key):
         same = next((d for d in CFG["devices"] if d["mac"] == p["mac"]), None)
         notes = []
         if same:
@@ -2734,8 +2750,9 @@ def settings_users(user, csrf, q):
     # ---- komputer yang boleh diakses (khusus peran Pengguna)
     cur = (CFG["users"].get(target) or {}).get("devices", "*") if target else []
     groups = {}
-    for d in CFG.get("devices", []):
+    for d in by_name(CFG.get("devices", [])):
         groups.setdefault(clean_group(d.get("group")), []).append(d)
+    groups = keep_group_order(groups)
     boxes = "".join(
         f'<fieldset style="border:0;padding:0;margin:0 0 10px"><legend class="small" style="font-weight:600;margin-bottom:4px">{E(g)} '
         f'<button type="button" class="btn quiet sm grpall" style="padding:2px 8px;font-size:12px">Centang semua</button></legend>'
@@ -2836,8 +2853,9 @@ def wallpaper_page(user, csrf, q):
     styles = "".join(f'<option value="{k}">{v}</option>' for k, v in WP_STYLES)
     # 3. komputer
     groups = {}
-    for d in CFG.get("devices", []):
+    for d in by_name(CFG.get("devices", [])):
         groups.setdefault(clean_group(d.get("group")), []).append(d)
+    groups = keep_group_order(groups)
     boxes, ready_total = [], 0
     for g, ds in groups.items():
         items = []
@@ -2880,7 +2898,7 @@ def wallpaper_page(user, csrf, q):
     res = ""
     if WP_JOB:
         names = {d["id"]: d for d in CFG.get("devices", [])}
-        items = sorted(WP_JOB.get("results", {}).items(), key=lambda x: x[1]["ok"])
+        items = sorted(WP_JOB.get("results", {}).items(), key=lambda x: (x[1]["ok"], name_key(names.get(x[0]) or {"name": x[0]})))
         ok = sum(1 for _, r in items if r["ok"])
         bad = len(items) - ok
         rows = []
@@ -2916,7 +2934,7 @@ function upd(){var n=f.querySelectorAll('#wpdev input:checked').length,src=f.que
 f.addEventListener('change',upd);upd();
 })();"""
     # ---- wallpaper yang diganti / tidak disetujui
-    flagged = [d for d in CFG.get("devices", []) if wp_flagged(d)]
+    flagged = by_name(d for d in CFG.get("devices", []) if wp_flagged(d))
     watched = [d for d in CFG.get("devices", []) if d.get("wallpaper")]
     drows = []
     for d in flagged:
@@ -2957,7 +2975,7 @@ def apps_page(user, csrf, q):
         dev = next((d for d in CFG["devices"] if d["id"] == dev_id), None)
         if dev:
             return apps_device_page(user, csrf, q, dev)
-    agents = [d for d in CFG["devices"] if d.get("agent_secret")]
+    agents = by_name(d for d in CFG["devices"] if d.get("agent_secret"))
     if not agents:
         body = (f'<div class="sec-head"><h2>Aplikasi</h2></div><div class="card empty">{icon("monitor")}'
                 '<h3 style="margin:8px 0 4px">Belum ada komputer yang dipasangi agen</h3>'
