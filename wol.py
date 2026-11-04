@@ -1325,10 +1325,19 @@ def register_pending(data, from_ip):
     return ent, None
 
 
+def subnet_wol_addr(net, skip=None):
+    """Alamat WOL tambahan (mis. IP ARP-broadcast di router) yang sudah dipakai komputer lain di subnet ini."""
+    for d in CFG.get("devices", []):
+        n = dev_network(d)
+        if d is not skip and n == net and d.get("broadcast") and d["broadcast"] != str(net.broadcast_address):
+            return d["broadcast"]
+    return str(net.broadcast_address)
+
+
 def approve_pending(ent, name=""):
     """Tambahkan komputer dari daftar tunggu; bila MAC sudah ada, perbarui IP/subnet/agennya. -> (perangkat, baru?)"""
     net = ipaddress.IPv4Network(f"{ent['ip']}/{ent['prefix']}", strict=False)
-    upd = {"ip": ent["ip"], "prefix": ent["prefix"], "broadcast": str(net.broadcast_address),
+    upd = {"ip": ent["ip"], "prefix": ent["prefix"], "broadcast": subnet_wol_addr(net),
            "agent_secret": ent["agent_secret"], "agent_port": ent.get("agent_port", AGENT_PORT)}
     dev = next((d for d in CFG["devices"] if d["mac"] == ent["mac"]), None)
     if dev:
@@ -1356,6 +1365,129 @@ def vm_online_all():
     with ThreadPoolExecutor(max_workers=min(16, len(vms))) as ex:
         res = list(ex.map(lambda v: check_port(v["host"], int(v.get("port", 22))), vms))
     return {v["id"]: r for v, r in zip(vms, res)}
+
+
+# ------------------------------------------------------- cari komputer beragen di jaringan
+DISCOVERY = {}         # {"running", "start", "end", "nets", "scanned", "found": [...], "error"}
+DISCOVERY_LOCK = threading.Lock()
+DISCOVER_MAX_HOSTS = 4096
+
+
+def agent_fp(secret):
+    return hashlib.sha256(f"wol-fp|{secret}".encode()).hexdigest()[:16]
+
+
+def default_scan_nets():
+    nets = []
+    for d in list(CFG.get("devices", [])) + list(CFG.get("pending", [])):
+        n = dev_network(d) if "id" in d else ipaddress.IPv4Network(f"{d['ip']}/{d['prefix']}", strict=False)
+        if n and str(n) not in nets:
+            nets.append(str(n))
+    if not nets:
+        try:
+            nets.append(str(ipaddress.IPv4Network(f"{panel_lan_ip()}/24", strict=False)))
+        except ValueError:
+            pass
+    return nets
+
+
+def parse_scan_nets(text):
+    """'192.168.120.0/23, 192.168.10.0/24' -> daftar jaringan privat (maks. 4096 host)."""
+    nets, total = [], 0
+    for part in re.split(r"[,\s]+", text or ""):
+        if not part:
+            continue
+        n = ipaddress.IPv4Network(part if "/" in part else part + "/24", strict=False)
+        if not n.is_private or n.prefixlen < 16:
+            raise ValueError(f"{part}: hanya jaringan lokal, minimal /16")
+        total += max(n.num_addresses - 2, 1)
+        nets.append(n)
+    if not nets:
+        raise ValueError("isi minimal satu subnet")
+    if total > DISCOVER_MAX_HOSTS:
+        raise ValueError(f"terlalu luas ({total} host); maksimal {DISCOVER_MAX_HOSTS} host sekali cari")
+    return nets
+
+
+def port_open(ip, port, timeout=0.6):
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def agent_hello(ip):
+    """(data /hello, status): status 'ok', 'old' (agen <6, hanya /ping), 'foreign' (agen menolak IP panel), atau None."""
+    try:
+        with NO_PROXY.open(f"http://{ip}:{AGENT_PORT}/hello", timeout=4) as r:
+            return json.loads(r.read().decode("utf-8-sig")), "ok"
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return None, "foreign"
+        if e.code == 404:
+            return None, "old"
+    except Exception:
+        pass
+    return None, None
+
+
+def classify_found(ip, hello, how):
+    devs = list(CFG.get("devices", []))
+    pend = list(CFG.get("pending", []))
+    r = {"ip": ip, "how": how}
+    if hello:
+        r.update({k: clean_text(hello.get(k)) for k in ("host", "mac", "fp")})
+        r["version"] = int(hello.get("version") or 0)
+        try:
+            r["mac"] = normalize_mac(r["mac"]) if r["mac"] else ""
+            r["prefix"] = int(hello.get("prefix") or 0) if 8 <= int(hello.get("prefix") or 0) <= 30 else 24
+        except ValueError:
+            r["mac"], r["prefix"] = "", 24
+        dev = next((d for d in devs if d.get("agent_secret") and agent_fp(d["agent_secret"]) == r["fp"]), None)
+        if dev:
+            r.update(dev_id=dev["id"], dev_name=dev["name"], old_ip=dev.get("ip", ""),
+                     status="known" if dev.get("ip") == ip else "ipchange")
+            return r
+        p = next((p for p in pend if agent_fp(p["agent_secret"]) == r["fp"]), None)
+        if p:
+            r.update(status="pending", pend_mac=p["mac"])
+            return r
+        dev = next((d for d in devs if r["mac"] and d["mac"] == r["mac"]), None)
+        if dev:  # komputer sudah ada, tapi agennya memakai kunci lain
+            r.update(status="nokey", dev_id=dev["id"], dev_name=dev["name"], old_ip=dev.get("ip", ""))
+            return r
+        r["status"] = "new" if r["mac"] else "nomac"
+        return r
+    dev = next((d for d in devs if d.get("ip") == ip), None)
+    r["host"], r["mac"], r["prefix"] = "", "", None
+    if dev:
+        r.update(status="known", dev_id=dev["id"], dev_name=dev["name"], old_ip=ip)
+    else:
+        r["status"] = how  # 'old' / 'foreign'
+    return r
+
+
+def run_discovery(nets, user):
+    hosts = [str(h) for n in nets for h in (n.hosts() if n.num_addresses > 2 else [n.network_address])]
+    with DISCOVERY_LOCK:
+        DISCOVERY.update(running=True, start=int(time.time()), end=None, nets=[str(n) for n in nets],
+                         scanned=0, total=len(hosts), found=[], error=None, by=user)
+    try:
+        with ThreadPoolExecutor(max_workers=128) as ex:
+            opened = [h for h, ok in zip(hosts, ex.map(lambda h: port_open(h, AGENT_PORT), hosts)) if ok]
+        DISCOVERY["scanned"] = len(hosts)
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            hellos = list(ex.map(agent_hello, opened))
+        found = [classify_found(ip, h, how) for ip, (h, how) in zip(opened, hellos) if how]
+        order = {"ipchange": 0, "new": 1, "pending": 2, "nokey": 3, "old": 4, "foreign": 5, "nomac": 6, "known": 7}
+        found.sort(key=lambda r: (order.get(r["status"], 9), ipaddress.IPv4Address(r["ip"])))
+        DISCOVERY["found"] = found
+    except Exception as e:
+        DISCOVERY["error"] = str(e)
+    finally:
+        DISCOVERY.update(running=False, end=int(time.time()))
+    write_log(user, "cari-jaringan", f"{len(DISCOVERY.get('found', []))} agen di {', '.join(DISCOVERY['nets'])}", "-")
 
 
 def all_status(devs=None):
@@ -1780,6 +1912,8 @@ LOG_LABELS = {
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
     "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
     "terminal-gagal": "Gagal membuka kunci terminal", "terminal-buka-kunci": "Membuka kunci terminal",
+    "cari-jaringan": "Mencari agen di jaringan", "perbarui-ip": "Memperbarui IP komputer",
+    "tambah-dari-jaringan": "Menambah komputer dari pencarian jaringan", "tambah-dari-skrip": "Menambah komputer dari skrip",
     "tambah-vm": "Menambah VM", "ubah-vm": "Mengubah data VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
     "vm-os-upgrade": "Update OS", "vm-os-upgrade-gagal": "Update OS gagal", "vm-app-update": "Update aplikasi",
     "vm-app-update-gagal": "Update aplikasi gagal", "vm-reboot": "Reboot", "vm-reboot-gagal": "Reboot gagal",
@@ -2247,7 +2381,65 @@ pengaturan Wake-on-LAN di Windows dinyalakan, agen terpasang, lalu komputer munc
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus')}Tambah lewat skrip (otomatis)</summary>
 <div style="padding:0 16px 16px">{join_body}</div></details>"""
 
-    return (agent_card + pending_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + join_card + form_card)
+    # ---- cari komputer beragen di jaringan
+    dz = dict(DISCOVERY)
+    drows = []
+    for r in dz.get("found", []):
+        st, ip = r["status"], r["ip"]
+        who = E(r.get("host") or ip)
+        meta = f'<div class="meta"><span>{E(ip)}/{r.get("prefix") or "?"}</span>' + (f'<span class="mono">{E(r["mac"])}</span>' if r.get("mac") else "") \
+               + (f'<span>agen v{r["version"]}</span>' if r.get("version") else "") + "</div>"
+        act = ""
+        if st == "new":
+            tag = '<span class="tag warn">belum di panel</span>'
+            act = (f'<form method="post" action="/devices/discover-add" style="display:flex;align-items:center;gap:6px;margin:0">{hidden(csrf, ip=ip)}'
+                   f'<input name="name" value="{E(r.get("host") or ip)}" maxlength="60" aria-label="Nama komputer" style="width:170px;padding:6px 8px">'
+                   f'<button class="btn sm primary">Tambahkan</button></form>')
+        elif st == "ipchange":
+            tag = f'<span class="tag warn">{E(r["dev_name"])}: IP berubah dari {E(r["old_ip"] or "-")}</span>'
+            act = f'<form method="post" action="/devices/discover-add">{hidden(csrf, ip=ip)}<button class="btn sm primary">Perbarui IP</button></form>'
+        elif st == "pending":
+            tag = '<span class="tag">di daftar tunggu</span>'
+            act = f'<form method="post" action="/devices/discover-add">{hidden(csrf, ip=ip)}<button class="btn sm primary">Tambahkan</button></form>'
+        elif st == "known":
+            tag = f'<span class="tag ok">sudah di panel: {E(r["dev_name"])}</span>' + (' <span class="tag">agen lama, klik Perbarui agen</span>' if r["how"] == "old" else "")
+        elif st == "nokey":
+            tag = (f'<span class="tag warn" title="Agen di komputer ini memakai kunci yang tidak dikenal panel">{E(r["dev_name"])}: kunci agen beda</span>')
+            act = f'<form method="post" action="/devices/agent">{hidden(csrf, id=r["dev_id"])}<button class="btn sm">Pasang ulang agen</button></form>'
+        elif st == "old":
+            tag = '<span class="tag">agen versi lama, belum dikenal</span>'
+            act = '<span class="mut small">Jalankan skrip <b>Tambah lewat skrip</b> di komputer itu</span>'
+        elif st == "foreign":
+            tag = '<span class="tag bad" title="Agen hanya menerima IP panel yang tercatat saat dipasang">agen menolak IP panel ini</span>'
+            act = '<span class="mut small">IP panel berubah / agen dari panel lain: jalankan skrip daftar ulang</span>'
+        else:
+            tag = '<span class="tag">MAC tidak terbaca</span>'
+        drows.append(f'<div class="row"><div class="row-main"><b>{who}</b> {tag}{meta}</div><div class="acts" style="align-items:center">{act}</div></div>')
+    nets_val = ", ".join(dz.get("nets") or default_scan_nets())
+    if dz.get("running"):
+        status = (f'<p class="small" style="margin:12px 0 0"><span class="spin"></span> Memindai {E(", ".join(dz["nets"]))} '
+                  f'({dz.get("total", 0)} alamat)… halaman diperbarui otomatis.</p><script>setTimeout(function(){{location.reload()}},3000)</script>')
+    elif dz.get("end"):
+        t = time.strftime("%H:%M", time.localtime(dz["end"]))
+        n_act = sum(1 for r in dz.get("found", []) if r["status"] in ("new", "ipchange", "pending"))
+        status = (f'<p class="small" style="margin:12px 0 8px">Selesai {E(t)}: {len(dz.get("found", []))} agen ditemukan di {E(", ".join(dz["nets"]))}'
+                  + (f', <b>{n_act} perlu tindakan</b>' if n_act else "") + "."
+                  + (f' <span style="color:var(--err)">{E(dz["error"])}</span>' if dz.get("error") else "") + "</p>"
+                  + (f'<div class="list">{"".join(drows)}</div>' if drows else
+                     '<p class="mut small" style="margin:0">Tidak ada agen yang menjawab. Pastikan komputernya menyala dan agennya terpasang.</p>'))
+    else:
+        status = ""
+    disc_card = f"""<details class="card" id="discover"{' open' if dz.get('running') or dz.get('end') else ''} style="padding:0">
+<summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('search') if 'search' in ICONS else icon('plus')}Cari komputer beragen di jaringan</summary>
+<div style="padding:0 16px 16px"><p class="small" style="margin:0 0 12px">Panel memindai port agen ({AGENT_PORT}) di subnet berikut dan menemukan komputer yang
+agennya sudah terpasang: yang belum ada di panel, yang IP-nya berubah, atau yang masih di daftar tunggu. Komputer harus sedang menyala.</p>
+<form method="post" action="/devices/discover" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
+<label style="margin:0;flex:1 1 260px">Subnet<input name="nets" value="{E(nets_val)}" spellcheck="false" placeholder="mis. 192.168.120.0/23">
+<span class="hint">Pisahkan dengan koma. Maksimal {DISCOVER_MAX_HOSTS} alamat sekali cari.</span></label>
+<label style="margin:0;flex:0 1 200px">Kategori untuk yang baru<input name="group" value="{E(dz.get('group') or 'Komputer Lab')}" list="dl-dgroup" maxlength="40"></label>{group_datalist("dl-dgroup")}
+<button class="btn primary"{' disabled' if dz.get('running') else ''} data-busy="Memulai…">Cari</button></form>{status}</div></details>"""
+
+    return (agent_card + pending_card + f'<div class="sec-head"><h2>Daftar komputer</h2></div>{listing}' + disc_card + join_card + form_card)
 
 
 def settings_users(user, csrf, q):
@@ -3133,6 +3325,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.back("/settings", "Perintah daftar dicabut. Komputer yang sudah mendaftar tetap ada di daftar tunggu.")
             if path == "/devices/pending-add":
                 return self.do_pending_add(form, user, ip)
+            if path == "/devices/discover":
+                if DISCOVERY.get("running"):
+                    return self.back("/settings", "Pencarian sedang berjalan.", True)
+                try:
+                    nets = parse_scan_nets(form.get("nets", ""))
+                except ValueError as e:
+                    return self.back("/settings", f"Subnet tidak valid: {e}.", True)
+                DISCOVERY["group"] = clean_group(form.get("group") or "Komputer Lab")
+                threading.Thread(target=run_discovery, args=(nets, user), daemon=True).start()
+                return self.redirect("/settings?tab=komputer#discover")
+            if path == "/devices/discover-add":
+                return self.do_discover_add(form, user, ip)
             if path == "/devices/pending-ignore":
                 CFG["pending"] = [p for p in CFG["pending"] if p["mac"] != form.get("mac")]
                 save_config(CFG)
@@ -3569,6 +3773,51 @@ class Handler(BaseHTTPRequestHandler):
             return reply(f"Gagal: {err}.")
         write_log("-", "daftar-komputer", f"{ent['host']} {ent['ip']}", ip)
         return reply(agent_script(ent))
+
+    def do_discover_add(self, form, user, ip):
+        r = next((x for x in DISCOVERY.get("found", []) if x["ip"] == form.get("ip")), None)
+        if not r:
+            return self.back("/settings", "Data pencarian sudah tidak ada. Klik Cari lagi.", True)
+        net = ipaddress.IPv4Network(f"{r['ip']}/{r.get('prefix') or 24}", strict=False)
+        if r["status"] == "ipchange":
+            dev = next((d for d in CFG["devices"] if d["id"] == r["dev_id"]), None)
+            if not dev:
+                return self.back("/settings", "Komputer tidak ditemukan.", True)
+            old_net, custom = dev_network(dev), dev.get("broadcast")
+            keep = custom and old_net and custom != str(old_net.broadcast_address) and old_net == net
+            dev.update(ip=r["ip"], prefix=net.prefixlen, broadcast=custom if keep else subnet_wol_addr(net, dev))
+            msg = f"IP {dev['name']} diperbarui: {r['old_ip'] or '-'} → {r['ip']}."
+            write_log(user, "perbarui-ip", f"{dev['id']} {r['old_ip']}→{r['ip']}", ip)
+        elif r["status"] == "pending":
+            ent = next((p for p in CFG["pending"] if p["mac"] == r["pend_mac"]), None)
+            if not ent:
+                return self.back("/settings", "Sudah tidak ada di daftar tunggu.", True)
+            ent.update(ip=r["ip"], prefix=net.prefixlen)
+            dev, _ = approve_pending(ent)
+            msg = f"{dev['name']} ditambahkan."
+            write_log(user, "tambah-dari-skrip", dev["id"], ip)
+        elif r["status"] == "new":
+            if any(d["mac"] == r["mac"] for d in CFG["devices"]):
+                return self.back("/settings", "MAC itu sudah ada di panel.", True)
+            name = clean_text(form.get("name"))[:60] or r.get("host") or r["ip"]
+            base = slugify(name)[:28]
+            did, i = base, 2
+            while any(d["id"] == did for d in CFG["devices"]):
+                did, i = f"{base}-{i}", i + 1
+            # agen sudah ada tapi kuncinya tidak dikenal panel: port agen dipakai untuk cek status
+            dev = {"id": did, "name": name, "group": clean_group(DISCOVERY.get("group") or "Komputer Lab"), "mac": r["mac"],
+                   "ip": r["ip"], "prefix": net.prefixlen, "broadcast": subnet_wol_addr(net), "port": 9,
+                   "check_ports": [AGENT_PORT], "remote_url": DEFAULT_REMOTE}
+            CFG["devices"].append(dev)
+            msg = (f"{name} ditambahkan (Hidupkan & status sudah bisa). Untuk Matikan dan pindai aplikasi, "
+                   f"klik Pasang agen pada {name} karena kunci agen lamanya tidak dikenal panel.")
+            write_log(user, "tambah-dari-jaringan", did, ip)
+        else:
+            return self.back("/settings", "Komputer ini tidak perlu ditambahkan dari sini.", True)
+        r["status"] = "known"
+        r.setdefault("dev_name", r.get("host") or r["ip"])
+        save_config(CFG)
+        return self.redirect("/settings?" + urlencode({"msg": msg, "tab": "komputer"}) + "#discover")
 
     def do_pending_add(self, form, user, ip):
         mac = form.get("mac", "")

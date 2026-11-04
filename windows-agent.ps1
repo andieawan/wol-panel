@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 5
+$AgentVersion = 6
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -313,6 +313,21 @@ function Handle($ctx) {
     $req  = $ctx.Request
     $from = $req.RemoteEndPoint.Address.ToString()
     $path = $req.Url.AbsolutePath
+
+    if ($req.HttpMethod -eq 'GET' -and $path -eq '/hello') {
+        # perkenalan untuk fitur "Cari di jaringan": nama, MAC, IP, subnet, dan sidik kunci (bukan kuncinya)
+        if ($from -ne $PanelIp) { Send-Text $ctx 403 'forbidden'; return }
+        $la = $req.LocalEndPoint.Address.ToString()
+        $mac = ''; $prefix = 0
+        try {
+            $ipo = Get-NetIPAddress -IPAddress $la -ErrorAction Stop | Select-Object -First 1
+            $prefix = [int]$ipo.PrefixLength
+            $mac = ((Get-NetAdapter -InterfaceIndex $ipo.InterfaceIndex -ErrorAction Stop).MacAddress -replace '-', ':').ToUpper()
+        } catch {}
+        Send-Json $ctx 200 @{ ok = $true; version = $AgentVersion; host = $env:COMPUTERNAME; ip = $la; prefix = $prefix; mac = $mac
+                              fp = (Get-Sha256 "wol-fp|$Secret").Substring(0, 16) }
+        return
+    }
 
     if ($req.HttpMethod -eq 'GET' -and $path -eq '/ping') {
         if ($from -eq $PanelIp -or $from -eq '127.0.0.1' -or $from -eq '::1') { Send-Text $ctx 200 'ok' }

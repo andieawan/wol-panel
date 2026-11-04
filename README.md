@@ -106,6 +106,23 @@ diperbarui, sedangkan nama dan pengaturan lainnya tetap.
 Perintahnya berlaku 24 jam, bisa dipakai di banyak komputer, dan bisa dicabut kapan saja. Komputer tidak masuk panel
 sebelum admin mengklik Tambahkan. Wake-on-LAN di **BIOS** tetap harus diaktifkan manual di tiap komputer.
 
+### Cari komputer beragen di jaringan
+
+**Pengaturan → Komputer → Cari komputer beragen di jaringan.** Panel memindai port agen (8765) di subnet yang diisi
+(bawaannya subnet komputer yang sudah ada, maksimal 4096 alamat sekali cari). Komputer harus sedang menyala. Hasilnya:
+
+| Hasil | Tindakan |
+|---|---|
+| *IP berubah* (mis. dapat IP baru dari DHCP) | **Perbarui IP** — dikenali dari sidik kunci agen, bukan dari IP |
+| *Belum di panel* | **Tambahkan** — nama, MAC, IP, subnet dari agen; masuk kategori yang dipilih |
+| *Di daftar tunggu* | **Tambahkan** |
+| *Kunci agen beda* (komputer ada, agennya dari pemasangan lain) | **Pasang ulang agen** |
+| *Agen versi lama* / *menolak IP panel* | Jalankan skrip **Tambah lewat skrip** di komputer itu |
+
+Komputer baru di subnet yang sudah punya **Alamat WOL tambahan** (IP ARP-broadcast di router) otomatis memakai alamat
+yang sama. Perkenalan agen (`/hello`) butuh agen versi 6: klik **Perbarui agen** pada komputer lama. Agen hanya
+mengirim nama komputer, MAC, IP, subnet, dan sidik kunci (bukan kuncinya), dan hanya ke IP panel.
+
 ### Komputer di subnet lain
 
 Panel bisa menyalakan komputer di subnet lain selama masih satu jaringan sekolah (dirutekan router, tanpa NAT di
