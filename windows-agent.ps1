@@ -27,7 +27,7 @@ $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 6
+$AgentVersion = 7
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -263,6 +263,101 @@ function Invoke-Uninstall([string]$id) {
     }
 }
 
+# ---------------------------------------------------------------- wallpaper
+# Gambar diunduh dari panel (URL harus ke IP panel) dan dicek SHA-256-nya, lalu dipasang untuk semua profil
+# pengguna. Pengguna yang sedang login langsung berganti lewat tugas yang berjalan di sesi mereka.
+$WpDir = Join-Path $env:SystemRoot 'Web\Wallpaper\WOLPanel'   # bisa dibaca semua pengguna, ditulis admin
+$WpStyles = @{ fill = @('10', '0'); fit = @('6', '0'); stretch = @('2', '0'); center = @('0', '0'); tile = @('0', '1'); span = @('22', '0') }
+
+function Set-DesktopKey([string]$root, [string]$path, $st) {
+    $k = "$root\Control Panel\Desktop"
+    if (-not (Test-Path $k)) { return }
+    Set-ItemProperty -Path $k -Name Wallpaper -Value $path
+    Set-ItemProperty -Path $k -Name WallpaperStyle -Value $st[0]
+    Set-ItemProperty -Path $k -Name TileWallpaper -Value $st[1]
+}
+
+function Set-Wallpaper($c) {
+    $st = $WpStyles[[string]$c.style]; if (-not $st) { $st = $WpStyles['fill'] }
+    New-Item -ItemType Directory -Path $WpDir -Force | Out-Null
+    if ([string]$c.mode -eq 'default') {
+        $path = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img0.jpg'
+        if (-not (Test-Path -LiteralPath $path)) {
+            $f = Get-ChildItem (Join-Path $env:SystemRoot 'Web\Wallpaper\Windows') -Filter *.jpg -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $f) { return @{ ok = $false; msg = 'Wallpaper bawaan Windows tidak ditemukan.' } }
+            $path = $f.FullName
+        }
+    } else {
+        $sha = ([string]$c.sha256).ToUpper()
+        $ext = [string]$c.ext
+        try { $u = [Uri][string]$c.url } catch { return @{ ok = $false; msg = 'URL gambar tidak valid.' } }
+        if ($u.Scheme -ne 'http' -or $u.Host -ne $PanelIp -or $sha -notmatch '^[0-9A-F]{64}$' -or $ext -notmatch '^(jpg|png)$') {
+            return @{ ok = $false; msg = 'Gambar harus dari panel ini.' }
+        }
+        $path = Join-Path $WpDir ("wallpaper-" + $sha.Substring(0, 12).ToLower() + "." + $ext)
+        if (-not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $sha) {
+            $tmp = Join-Path $WpDir 'unduh.tmp'
+            try { Invoke-WebRequest -Uri $u -OutFile $tmp -UseBasicParsing -TimeoutSec 90 }
+            catch { return @{ ok = $false; msg = "Gagal mengunduh gambar dari panel: $($_.Exception.Message)" } }
+            if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash -ne $sha) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                return @{ ok = $false; msg = 'Gambar rusak saat diunduh (hash tidak cocok).' }
+            }
+            Move-Item -LiteralPath $tmp -Destination $path -Force
+        }
+        Get-ChildItem $WpDir -Filter 'wallpaper-*' | Where-Object { $_.FullName -ne $path } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    # semua profil pengguna (yang sedang login maupun tidak) + profil bawaan untuk pengguna baru
+    $n = 0
+    foreach ($p in Get-Profiles) {
+        $h = Open-UserHive $p
+        if (-not $h) { continue }
+        try { Set-DesktopKey $h.Root $path $st; $n++ } catch {} finally { Close-UserHive $h }
+    }
+    $def = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+    if (Test-Path -LiteralPath $def) {
+        & reg.exe load 'HKU\WOLWP_DEFAULT' "$def" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            try { Set-DesktopKey 'Registry::HKEY_USERS\WOLWP_DEFAULT' $path $st } catch {} finally {
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers(); & reg.exe unload 'HKU\WOLWP_DEFAULT' 2>&1 | Out-Null }
+        }
+    }
+
+    # kunci: kebijakan komputer agar siswa tidak bisa mengganti wallpaper
+    $pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $ad  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop'
+    if ($c.lock) {
+        New-Item -Path $pol -Force | Out-Null; New-Item -Path $ad -Force | Out-Null
+        Set-ItemProperty -Path $pol -Name Wallpaper -Value $path
+        Set-ItemProperty -Path $pol -Name WallpaperStyle -Value $st[0]
+        Set-ItemProperty -Path $ad -Name NoChangingWallPaper -Value 1 -Type DWord
+    } else {
+        Remove-ItemProperty -Path $pol -Name Wallpaper, WallpaperStyle -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $ad -Name NoChangingWallPaper -ErrorAction SilentlyContinue
+    }
+
+    # pengguna yang sedang login: terapkan sekarang di sesi mereka
+    $apply = Join-Path $WpDir 'terapkan.ps1'
+    Set-Content -Path $apply -Encoding UTF8 -Value @(
+        '$p = (Get-ItemProperty ''HKCU:\Control Panel\Desktop'').Wallpaper',
+        'Add-Type -TypeDefinition ''using System.Runtime.InteropServices; public class WolWp { [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }''',
+        '[WolWp]::SystemParametersInfo(20, 0, $p, 3) | Out-Null')
+    $online = 0
+    try {
+        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$apply`""
+        $prn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
+        Register-ScheduledTask -TaskName 'WOL Panel Wallpaper' -Action $act -Principal $prn -Force `
+            -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)) | Out-Null
+        Start-ScheduledTask -TaskName 'WOL Panel Wallpaper'
+        $online = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue).Count
+    } catch {}
+    $what = if ([string]$c.mode -eq 'default') { 'Wallpaper bawaan Windows' } else { 'Wallpaper baru' }
+    $msg = "$what dipasang untuk $n profil" + $(if ($online) { ", langsung tampil di $online sesi yang sedang login" } else { ', tampil saat pengguna login' }) +
+           $(if ($c.lock) { '; dikunci.' } else { '.' })
+    return @{ ok = $true; msg = $msg }
+}
+
 # ---------------------------------------------------------------- relay Wake-on-LAN
 # Panel di subnet lain tidak bisa mengirim broadcast ke subnet ini; agen yang hidup di subnet ini mengirimkannya.
 function Send-Wol([string]$mac, $targets, [int]$port) {
@@ -365,6 +460,11 @@ function Handle($ctx) {
             'uninstall' {
                 $r = Invoke-Uninstall ([string]$c.id)
                 Write-Log "Uninstall diminta $script:By : $($r.msg)"
+                Send-Json $ctx 200 $r
+            }
+            'wallpaper' {
+                $r = Set-Wallpaper $c
+                Write-Log "Wallpaper diminta $script:By : $($r.msg)"
                 Send-Json $ctx 200 $r
             }
             'wol' {

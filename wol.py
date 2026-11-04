@@ -1540,6 +1540,95 @@ def run_discovery(nets, user):
     write_log(user, "cari-jaringan", f"{len(DISCOVERY.get('found', []))} agen di {', '.join(DISCOVERY['nets'])}", "-")
 
 
+# ------------------------------------------------------- wallpaper
+WP_DIR = os.path.join(BASE, "wallpapers")
+WP_MAX = 16 * 1024 * 1024
+WP_STYLES = (("fill", "Isi layar (dipotong)"), ("fit", "Pas (ada tepi)"), ("stretch", "Regangkan"),
+             ("center", "Tengah"), ("tile", "Ubin"), ("span", "Bentang (banyak layar)"))
+WP_MIN_AGENT = 7
+WP_JOB = {}          # {"running", "start", "end", "by", "what", "results": {dev_id: {"ok", "msg"}}}
+
+
+def image_info(data):
+    """(ekstensi, lebar, tinggi) untuk JPG/PNG, atau None bila bukan gambar yang didukung."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 24:
+        w, h = struct.unpack(">II", data[16:24])
+        return "png", w, h
+    if data[:3] == b"\xff\xd8\xff":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            m = data[i + 1]
+            if m in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return "jpg", w, h
+            if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+                i += 2
+                continue
+            i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+        return "jpg", 0, 0
+    return None
+
+
+def wp_path(w):
+    return os.path.join(WP_DIR, f"{w['id']}.{w['ext']}")
+
+
+def apply_wallpaper(devs, src, style, lock, user):
+    """Kirim perintah wallpaper ke banyak komputer sekaligus (latar belakang)."""
+    img = None if src == "default" else next((w for w in CFG.get("wallpapers", []) if w["id"] == src), None)
+    WP_JOB.update(running=True, start=int(time.time()), end=None, by=user, results={},
+                  what=("Bawaan Windows" if not img else img["name"]) + f" · {dict(WP_STYLES).get(style, style)}" + (" · dikunci" if lock else ""))
+
+    def one(d):
+        if not d.get("agent_secret") or not d.get("ip"):
+            return d["id"], {"ok": False, "msg": "belum ada agen"}
+        payload = {"action": "wallpaper", "mode": "image" if img else "default", "style": style, "lock": bool(lock)}
+        if img:
+            try:
+                panel = local_ip_for(d["ip"])
+            except OSError:
+                return d["id"], {"ok": False, "msg": "IP komputer tidak bisa dijangkau"}
+            payload.update(url=f"http://{panel}:{int(CFG.get('port', 8080))}/wp/{img['id']}.{img['ext']}", sha256=img["id"], ext=img["ext"])
+        try:
+            r = agent_cmd(d, user, payload, timeout=150)
+            return d["id"], {"ok": bool(r.get("ok")), "msg": clean_text(r.get("msg")) or "-"}
+        except (AgentOld, urllib.error.HTTPError) as e:
+            if isinstance(e, AgentOld) or getattr(e, "code", 0) == 400:
+                return d["id"], {"ok": False, "msg": f"agen versi lama, klik Perbarui agen (perlu versi {WP_MIN_AGENT})"}
+            return d["id"], {"ok": False, "msg": agent_error(e)}
+        except Exception as e:
+            return d["id"], {"ok": False, "msg": agent_error(e)}
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for did, res in ex.map(one, devs):
+                WP_JOB["results"][did] = res
+    finally:
+        WP_JOB.update(running=False, end=int(time.time()))
+        ok = sum(1 for r in WP_JOB["results"].values() if r["ok"])
+        write_log(user, "wallpaper", f"{WP_JOB['what']} → {ok}/{len(devs)} komputer", "-")
+
+
+def parse_multipart(ctype, body):
+    """Isian & file dari multipart/form-data (tanpa modul cgi). -> (form, files{name: (filename, bytes)})"""
+    from email.parser import BytesParser
+    from email.policy import default as email_default
+    msg = BytesParser(policy=email_default).parsebytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body)
+    form, files = {}, {}
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        data = part.get_payload(decode=True) or b""
+        if part.get_filename() is not None:
+            files[name] = (part.get_filename(), data)
+        else:
+            form[name] = data.decode("utf-8", "replace")
+    return form, files
+
+
 def all_status(devs=None):
     devs = list(CFG.get("devices", []) if devs is None else devs)
     if not devs:
@@ -1757,6 +1846,15 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .adm{display:flex;gap:14px;margin-top:6px}.adm form{margin:0}
 .lnk{background:none;border:0;padding:2px 0;font:inherit;font-size:13px;font-weight:600;color:var(--acc);cursor:pointer;text-decoration:none}
 .lnk:hover{text-decoration:underline}.lnk:disabled{color:var(--mut);cursor:wait}
+.wp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.wp-tile{display:grid;gap:6px;margin:0;cursor:pointer;position:relative;min-width:0}.wp-tile input{position:absolute;top:8px;left:8px;width:1px;height:1px;opacity:0;pointer-events:none}
+.wp-thumb{display:grid;place-items:center;aspect-ratio:16/10;border-radius:10px;background:var(--off-soft) center/cover no-repeat;
+ border:2px solid var(--line);color:var(--mut);gap:4px;font-size:13px}.wp-thumb svg{width:26px;height:26px}
+.wp-def{background:linear-gradient(135deg,#0b5cad,#4aa3ff);color:#fff;border-color:transparent}
+.wp-tile input:checked+.wp-thumb{border-color:var(--acc);box-shadow:0 0 0 3px var(--ring)}
+.wp-tile input:focus-visible+.wp-thumb{outline:3px solid var(--acc);outline-offset:2px}
+.wp-cap{font-size:13px;font-weight:600;display:grid;line-height:1.3}.wp-cap small{font-weight:400;color:var(--mut)}
+.wp-mini{width:72px;aspect-ratio:16/10;border-radius:6px;background:var(--off-soft) center/cover no-repeat;flex:none}
 .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
 .devgrid>.card{margin:0}
 .htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
@@ -1963,6 +2061,7 @@ LOG_LABELS = {
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
     "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
     "terminal-gagal": "Gagal membuka kunci terminal", "terminal-buka-kunci": "Membuka kunci terminal",
+    "wallpaper": "Menerapkan wallpaper", "wallpaper-unggah": "Mengunggah wallpaper", "wallpaper-hapus": "Menghapus wallpaper",
     "cari-jaringan": "Mencari agen di jaringan", "perbarui-ip": "Memperbarui IP komputer",
     "tambah-dari-jaringan": "Menambah komputer dari pencarian jaringan", "tambah-dari-skrip": "Menambah komputer dari skrip",
     "tambah-vm": "Menambah VM", "ubah-vm": "Mengubah data VM", "hapus-vm": "Menghapus VM", "unduh-vm": "Skrip pasang VM diunduh",
@@ -2006,6 +2105,7 @@ def shell(user, csrf, active, content, q, script=""):
     links = [("/", "Beranda")]
     if is_admin(user):
         links.append(("/apps", "Aplikasi"))
+        links.append(("/wallpaper", "Wallpaper"))
         links.append(("/servers", "Server"))
         if any(v.get("terminal") for v in CFG.get("vms", [])):
             links.append(("/terminal", "Terminal"))
@@ -2612,6 +2712,84 @@ def scan_label(dev_id):
     return f'<span class="mut small">Dipindai {E(t)} · {len(s.get("apps", []))} aplikasi</span>'
 
 
+def wallpaper_page(user, csrf, q):
+    imgs = CFG.get("wallpapers", [])
+    # sumber
+    tiles = [f'<label class="wp-tile"><input type="radio" name="src" value="default" checked>'
+             f'<span class="wp-thumb wp-def">{icon("monitor")}<b>Bawaan Windows</b></span><span class="wp-cap">Bawaan Windows</span></label>']
+    for w in imgs:
+        dim = f"{w['w']}×{w['h']}" if w.get("w") else w["ext"].upper()
+        tiles.append(f'<label class="wp-tile"><input type="radio" name="src" value="{E(w["id"])}">'
+                     f'<span class="wp-thumb" style="background-image:url(/wp/{E(w["id"])}.{w["ext"]})"></span>'
+                     f'<span class="wp-cap">{E(w["name"])}<small>{dim}</small></span></label>')
+    styles = "".join(f'<option value="{k}">{v}</option>' for k, v in WP_STYLES)
+    # komputer per kategori
+    groups = {}
+    for d in CFG.get("devices", []):
+        groups.setdefault(clean_group(d.get("group")), []).append(d)
+    boxes = []
+    for g, ds in groups.items():
+        items = []
+        for d in ds:
+            ok = d.get("agent_secret") and d.get("ip")
+            v = d.get("agent_version")
+            note = "" if ok else " (belum ada agen)"
+            if ok and v and v < WP_MIN_AGENT:
+                note = f" (agen v{v}, perlu Perbarui agen)"
+            items.append(f'<label class="check" style="margin:0"><input type="checkbox" name="dev_{E(d["id"])}" value="1"'
+                         f'{"" if ok else " disabled"}><span>{E(d["name"])}<span class="mut small">{E(note)}</span></span></label>')
+        boxes.append(f'<fieldset style="border:0;padding:0;margin:0 0 10px"><legend class="small" style="font-weight:600;margin-bottom:4px">{E(g)} '
+                     f'<button type="button" class="btn quiet sm grpall" style="padding:2px 8px;font-size:12px">Centang semua</button></legend>'
+                     f'<div style="display:flex;flex-wrap:wrap;gap:4px 18px">{"".join(items)}</div></fieldset>')
+    running = WP_JOB.get("running")
+    apply_form = f"""<section class="card"><h2>Terapkan wallpaper</h2>
+<form method="post" action="/wallpaper/apply" {confirm("Wallpaper di komputer yang dicentang akan diganti. Pengguna yang sedang login langsung melihat perubahannya.", "Terapkan", "Terapkan wallpaper?")}>{hidden(csrf)}
+<p class="small" style="margin:0 0 8px;font-weight:600">Gambar</p>
+<div class="wp-grid">{"".join(tiles)}</div>
+<div class="grid" style="margin-top:14px"><label>Tampilan<select name="style">{styles}</select></label>
+<label class="check" style="align-self:end"><input type="checkbox" name="lock" value="1"><span>Kunci wallpaper
+<span class="hint">Siswa tidak bisa menggantinya. Terapkan tanpa centang ini untuk membuka kunci.</span></span></label></div>
+<div style="border-top:1px solid var(--line);margin-top:6px;padding-top:12px" id="wpdev">
+<p style="margin:0 0 8px;font-weight:600">Komputer <button type="button" class="btn quiet sm" id="wpall" style="padding:2px 8px;font-size:12px">Centang semua komputer</button></p>
+{"".join(boxes) or '<p class="mut small">Belum ada komputer.</p>'}</div>
+<div class="acts"><button class="btn primary"{" disabled" if running else ""} data-busy="Memulai…">Terapkan ke komputer terpilih</button></div></form></section>"""
+    # hasil terakhir
+    res = ""
+    if WP_JOB:
+        names = {d["id"]: d["name"] for d in CFG.get("devices", [])}
+        rows = "".join(f'<div class="row"><div class="row-main"><b>{E(names.get(i, i))}</b>'
+                       f'<div class="small" style="color:var({"--ok" if r["ok"] else "--err"})">{E(r["msg"])}</div></div></div>'
+                       for i, r in WP_JOB.get("results", {}).items())
+        ok = sum(1 for r in WP_JOB.get("results", {}).values() if r["ok"])
+        head = (f'<span class="spin"></span> Sedang diterapkan: {E(WP_JOB["what"])}… ({len(WP_JOB["results"])} selesai)' if running else
+                f'{E(WP_JOB["what"])} — berhasil di {ok} dari {len(WP_JOB["results"])} komputer · {E(time.strftime("%H:%M", time.localtime(WP_JOB["end"])))}')
+        res = (f'<section class="card" id="wpres"><h2>Hasil terakhir</h2><p class="small" style="margin:0 0 8px">{head}</p><div class="list">{rows}</div></section>'
+               + ('<script>setTimeout(function(){location.reload()},3000)</script>' if running else ""))
+    # pustaka gambar
+    lib = "".join(f'<div class="row"><div class="row-main" style="display:flex;gap:12px;align-items:center">'
+                  f'<span class="wp-mini" style="background-image:url(/wp/{E(w["id"])}.{w["ext"]})"></span><div><b>{E(w["name"])}</b>'
+                  f'<div class="meta"><span>{w["w"]}×{w["h"]}</span><span>{w["size"] // 1024} KB</span></div></div></div>'
+                  f'<div class="acts">{del_form("/wallpaper/delete", csrf, w["name"] + " dihapus dari panel. Wallpaper yang sudah terpasang di komputer tidak berubah.", "Hapus gambar?", id=w["id"])}</div></div>'
+                  for w in imgs)
+    upload = f"""<section class="card"><h2>Unggah gambar</h2>
+<form method="post" action="/wallpaper/upload" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin:0">{hidden(csrf)}
+<label style="margin:0;flex:1 1 240px">File gambar<input type="file" name="file" accept="image/jpeg,image/png" required>
+<span class="hint">JPG atau PNG, maksimal 16 MB. Sebaiknya seukuran layar, mis. 1920×1080.</span></label>
+<label style="margin:0;flex:0 1 220px">Nama<input name="name" maxlength="60" placeholder="otomatis dari nama file"></label>
+<button class="btn" data-busy="Mengunggah…">Unggah</button></form>
+{f'<div class="list" style="margin-top:12px">{lib}</div>' if lib else ''}</section>"""
+    js = """(function(){
+document.querySelectorAll('.grpall').forEach(function(b){b.onclick=function(){var c=b.closest('fieldset').querySelectorAll('input[type=checkbox]:not(:disabled)'),
+ on=[].some.call(c,function(i){return !i.checked});c.forEach(function(i){i.checked=on})}});
+var a=document.getElementById('wpall');if(a)a.onclick=function(){var c=document.querySelectorAll('#wpdev input[type=checkbox]:not(:disabled)'),
+ on=[].some.call(c,function(i){return !i.checked});c.forEach(function(i){i.checked=on})};
+var f=document.querySelector('form[action="/wallpaper/apply"]');if(f)f.addEventListener('submit',function(e){
+ if(!f.querySelector('#wpdev input:checked')){e.preventDefault();e.stopImmediatePropagation();alert('Centang minimal satu komputer.')}},true);
+})();"""
+    body = res + apply_form + upload
+    return shell(user, csrf, "/wallpaper", body, q, js)
+
+
 def apps_page(user, csrf, q):
     dev_id = q.get("dev", [""])[0]
     if dev_id:
@@ -3201,6 +3379,18 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/plain; charset=utf-8")
             write_log("-", "unduh-skrip-daftar", "-", self.client_ip())
             return self._send(200, join_script(self.request.getsockname()[0], j["tok"]), "text/plain; charset=utf-8")
+        m = re.fullmatch(r"/wp/([0-9a-f]{64})\.(jpg|png)", url.path)
+        if m:  # gambar wallpaper: diunduh agen dari jaringan sekolah, atau dilihat admin
+            wu, _ = self.session()
+            if not (self.lan_direct() or (wu and is_admin(wu))):
+                return self._send(403, "Ditolak")
+            w = next((x for x in CFG.get("wallpapers", []) if x["id"] == m.group(1) and x["ext"] == m.group(2)), None)
+            try:
+                with open(wp_path(w), "rb") as f:
+                    data = f.read()
+            except (OSError, TypeError):
+                return self._send(404, "Tidak ditemukan")
+            return self._send(200, data, "image/png" if w["ext"] == "png" else "image/jpeg", [("Cache-Control", "private, max-age=86400")])
         m = re.fullmatch(r"/agent/([A-Za-z0-9_-]{20,64})\.ps1", url.path)
         if m:  # unduh pemasang agen memakai token sementara (tanpa login, diambil dari komputer tujuan)
             ent = AGENT_TOKENS.get(m.group(1)) if self.lan_direct() else None
@@ -3230,6 +3420,10 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin(user):
                 return self.redirect("/")
             return self._send(200, settings_page(user, csrf, q))
+        if url.path == "/wallpaper":
+            if not is_admin(user):
+                return self.redirect("/")
+            return self._send(200, wallpaper_page(user, csrf, q))
         if url.path == "/apps":
             if not is_admin(user):
                 return self.redirect("/")
@@ -3276,6 +3470,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------- POST
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if urlparse(self.path).path == "/wallpaper/upload":
+            return self.do_wallpaper_upload(n)
         if n > 20_000:
             return self._send(413, "Terlalu besar")
         raw = self.rfile.read(n)
@@ -3407,6 +3603,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self.back("/settings", "Perintah daftar dicabut. Komputer yang sudah mendaftar tetap ada di daftar tunggu.")
             if path == "/devices/pending-add":
                 return self.do_pending_add(form, user, ip)
+            if path == "/wallpaper/apply":
+                if WP_JOB.get("running"):
+                    return self.back("/wallpaper", "Penerapan sebelumnya masih berjalan.", True)
+                src = form.get("src", "default")
+                if src != "default" and not any(w["id"] == src for w in CFG.get("wallpapers", [])):
+                    return self.back("/wallpaper", "Gambar tidak ditemukan.", True)
+                style = form.get("style") if form.get("style") in dict(WP_STYLES) else "fill"
+                devs = [d for d in CFG["devices"] if form.get("dev_" + d["id"]) == "1" and d.get("agent_secret")]
+                if not devs:
+                    return self.back("/wallpaper", "Centang minimal satu komputer yang sudah beragen.", True)
+                threading.Thread(target=apply_wallpaper, args=(devs, src, style, form.get("lock") == "1", user), daemon=True).start()
+                return self.redirect("/wallpaper#wpres")
+            if path == "/wallpaper/delete":
+                w = next((x for x in CFG.get("wallpapers", []) if x["id"] == form.get("id")), None)
+                if not w:
+                    return self.back("/wallpaper", "Gambar tidak ditemukan.", True)
+                CFG["wallpapers"] = [x for x in CFG["wallpapers"] if x is not w]
+                save_config(CFG)
+                try:
+                    os.remove(wp_path(w))
+                except OSError:
+                    pass
+                write_log(user, "wallpaper-hapus", w["name"], ip)
+                return self.back("/wallpaper", f"{w['name']} dihapus.")
             if path == "/devices/discover":
                 if DISCOVERY.get("running"):
                     return self.back("/settings", "Pencarian sedang berjalan.", True)
@@ -3856,6 +4076,40 @@ class Handler(BaseHTTPRequestHandler):
             return reply(f"Gagal: {err}.")
         write_log("-", "daftar-komputer", f"{ent['host']} {ent['ip']}", ip)
         return reply(agent_script(ent))
+
+    def do_wallpaper_upload(self, n):
+        user, tok = self.session()
+        if not user or not is_admin(user):
+            return self.redirect("/login")
+        if n > WP_MAX + 64 * 1024:
+            return self.back("/wallpaper", "File terlalu besar (maksimal 16 MB).", True)
+        raw = self.rfile.read(n)
+        try:
+            form, files = parse_multipart(self.headers.get("Content-Type", ""), raw)
+        except Exception:
+            return self.back("/wallpaper", "Unggahan tidak terbaca.", True)
+        if not hmac.compare_digest(form.get("csrf", ""), csrf_for(tok)):
+            return self._send(403, page("Ditolak", '<p>Sesi kedaluwarsa, silakan <a href="/wallpaper">muat ulang halaman</a>.</p>'))
+        fname, data = files.get("file", ("", b""))
+        info = image_info(data) if data else None
+        if not info:
+            return self.back("/wallpaper", "File harus gambar JPG atau PNG.", True)
+        ext, w, h = info
+        sha = hashlib.sha256(data).hexdigest()
+        name = clean_text(form.get("name"))[:60] or clean_text(os.path.splitext(os.path.basename(fname or ""))[0])[:60] or "Wallpaper"
+        with CFG_LOCK:
+            if any(x["id"] == sha for x in CFG.setdefault("wallpapers", [])):
+                return self.back("/wallpaper", "Gambar yang sama sudah ada di pustaka.", True)
+            os.makedirs(WP_DIR, exist_ok=True)
+            tmp = os.path.join(WP_DIR, sha + ".tmp")
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, os.path.join(WP_DIR, f"{sha}.{ext}"))
+            CFG["wallpapers"].append({"id": sha, "ext": ext, "name": name, "w": w, "h": h, "size": len(data), "time": int(time.time())})
+            save_config(CFG)
+        write_log(user, "wallpaper-unggah", name, self.client_ip())
+        small = " Ukurannya kecil, bisa tampak pecah di layar besar." if w and w < 1280 else ""
+        return self.back("/wallpaper", f"{name} diunggah ({w}×{h}).{small}")
 
     def do_discover_add(self, form, user, ip):
         r = next((x for x in DISCOVERY.get("found", []) if x["ip"] == form.get("ip")), None)

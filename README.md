@@ -152,6 +152,20 @@ untuk cek status* (mis. 3389). Pastikan firewall MikroTik (chain forward) mengiz
 UDP 7 & 9 (WOL), TCP 8765 (agen), dan ICMP, dan tidak ada masquerade/srcnat untuk lalu lintas antar subnet lokal
 (agen hanya menerima IP panel).
 
+### Wallpaper (menu Wallpaper)
+
+1. **Unggah gambar** JPG/PNG (maks. 16 MB, sebaiknya seukuran layar, mis. 1920×1080). Gambar tersimpan di
+   `/opt/wol-panel/wallpapers/` sebagai pustaka.
+2. **Terapkan wallpaper**: pilih *Bawaan Windows* atau salah satu gambar, pilih tampilan (isi layar, pas, regangkan,
+   tengah, ubin, bentang), centang komputernya (per kategori ada *Centang semua*), lalu **Terapkan**. Hasil per
+   komputer tampil di *Hasil terakhir*.
+3. **Kunci wallpaper** memasang kebijakan Windows agar siswa tidak bisa menggantinya. Terapkan lagi tanpa centang
+   *Kunci* (mis. *Bawaan Windows*) untuk membuka kuncinya.
+
+Cara kerjanya: tiap komputer mengunduh sendiri gambarnya dari panel (hanya dari jaringan sekolah) dan mengecek
+SHA-256-nya, lalu memasangnya untuk semua profil pengguna (termasuk pengguna baru). Pengguna yang sedang login
+langsung melihat perubahannya. Butuh agen versi 7: klik **Perbarui agen** pada komputer lama.
+
 ### Mematikan komputer dari panel
 
 WOL hanya bisa menyalakan. Untuk tombol **Matikan**, komputer Windows perlu dipasangi agen kecil
