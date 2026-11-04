@@ -3789,8 +3789,9 @@ class Handler(BaseHTTPRequestHandler):
             n = sum(1 for d in CFG["devices"] if wp_flagged(d))
             return self.back("/wallpaper", f"Selesai dicek: {n} komputer wallpapernya diganti." if n else "Selesai dicek: semua sesuai.", bool(n))
         if path == "/wallpaper/auto":
-            CFG["wp_auto_restore"] = form.get("on") == "1"
-            save_config(CFG)
+            with CFG_LOCK:
+                CFG["wp_auto_restore"] = form.get("on") == "1"
+                save_config(CFG)
             write_log(user, "wallpaper-otomatis", "aktif" if CFG["wp_auto_restore"] else "mati", ip)
             return self.back("/wallpaper", "Kembalikan otomatis " + ("aktif: wallpaper yang diganti dipasang ulang setiap kali dicek."
                                                                      if CFG["wp_auto_restore"] else "dimatikan."))
@@ -3798,8 +3799,9 @@ class Handler(BaseHTTPRequestHandler):
             d = next((x for x in CFG["devices"] if x["id"] == form.get("id")), None)
             if not d or not d.get("wp_check"):
                 return self.back("/wallpaper", "Komputer tidak ditemukan.", True)
-            d["wp_accept"] = d["wp_check"].get("sig")
-            save_config(CFG)
+            with CFG_LOCK:
+                d["wp_accept"] = d["wp_check"].get("sig")
+                save_config(CFG)
             write_log(user, "wallpaper-setujui", d["id"], ip)
             return self.back("/wallpaper", f"Wallpaper di {d['name']} disetujui.")
         if path == "/wallpaper/restore":
@@ -4434,9 +4436,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.back("/settings", err, True, **keep)
         old = next((d for d in CFG["devices"] if d["id"] == orig), None) if orig else None
         if old:
-            for k in ("agent_secret", "agent_port"):  # kunci agen tetap dipakai saat data komputer diubah
-                if k in old:
-                    dev[k] = old[k]
+            for k, v in old.items():  # kunci agen, versi agen, wallpaper, dll. tetap dipakai saat data komputer diubah
+                dev.setdefault(k, v)
+            if old["id"] != dev["id"]:
+                with SCAN_LOCK:  # hasil pindai ikut pindah ke ID baru
+                    if old["id"] in SCANS:
+                        SCANS[dev["id"]] = SCANS.pop(old["id"])
+                        save_scans()
             if old["id"] != dev["id"]:
                 for t, (did, exp) in list(AGENT_TOKENS.items()):
                     if did == old["id"]:
