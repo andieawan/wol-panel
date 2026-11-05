@@ -52,6 +52,8 @@ LOG_LOCK = threading.Lock()
 FAILS = {}  # ip -> [waktu] percobaan login gagal
 FAIL_LIMIT, FAIL_WINDOW = 5, 600
 WAKE_COOLDOWN = {}  # id perangkat -> waktu terakhir dikirim
+WAKE_JOB = {}       # hidupkan serentak per kategori: {"running", "group", "ids", "done", "gap", "start", "by", "stop"}
+WAKE_JOB_LOCK = threading.Lock()
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
 DEFAULT_REMOTE = "https://remotedesktop.google.com/access"
@@ -78,6 +80,7 @@ def migrate(cfg):
     cfg.setdefault("devices", [])
     cfg.setdefault("trust_proxy", False)
     cfg.setdefault("session_hours", 12)
+    cfg.setdefault("wake_gap", 10)
     cfg.setdefault("app_rules", [])
     cfg.setdefault("scan_minutes", 60)
     cfg.setdefault("vms", [])
@@ -2045,6 +2048,9 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .wp-mini{width:72px;aspect-ratio:16/10;border-radius:6px;background:var(--off-soft) center/cover no-repeat;flex:none}
 .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
 .devgrid>.card{margin:0}
+.wbar{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin:0 0 12px}.wbar form{margin:0}
+.wbar.card{padding:10px 14px;justify-content:space-between;border-color:var(--warn);background:var(--warn-soft)}
+.wbar.card>span{flex:1 1 300px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px}.wbar svg{width:16px;height:16px}
 .htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
 .htabs .cnt{font-size:12px;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--card);color:var(--mut);box-shadow:inset 0 0 0 1px var(--line)}
 .htabs a[aria-current=page] .cnt{background:var(--off-soft)}
@@ -2176,23 +2182,23 @@ JS_BASE = """
 JS_STATUS = """
 (function(){
   var T={on:'Menyala',off:'Mati',unknown:'Status tidak dicek',checking:'Mengecek…',
-         wake:'Sedang dihidupkan…',stop:'Sedang dimatikan…',slow:'Belum merespons'};
-  var C={on:'on',off:'',unknown:'',checking:'',wake:'wait',stop:'wait',slow:'bad'};
+         wake:'Sedang dihidupkan…',stop:'Sedang dimatikan…',slow:'Belum merespons',queue:'Menunggu giliran…'};
+  var C={on:'on',off:'',unknown:'',checking:'',wake:'wait',stop:'wait',slow:'bad',queue:'wait'};
   var N={wake:'Biasanya butuh 30–90 detik sampai Windows siap.',stop:'Windows sedang menutup aplikasi lalu mati.',
          slow:'Sudah lebih dari 3 menit. Cek kabel LAN dan pengaturan Wake-on-LAN di BIOS komputer ini.',
-         unknown:'Isi IP komputer di Pengaturan agar statusnya bisa dicek.'};
+         unknown:'Isi IP komputer di Pengaturan agar statusnya bisa dicek.',queue:'Dihidupkan bergantian agar listrik tidak melonjak.'};
   var t0=Date.now();
   function apply(card,s){
     var p=card.dataset.pending,st;
-    if(p==='wake'){ if(s===true){card.dataset.pending='';st='on'} else st=(Date.now()-t0>180000)?'slow':'wake'; }
+    if(p==='wake'){ if(s===true){card.dataset.pending='';st='on'} else{var el=Date.now()-t0,dl=(+card.dataset.delay||0)*1000;st=el<dl?'queue':el>180000+dl?'slow':'wake'} }
     else if(p==='stop'){ if(s===false){card.dataset.pending='';st='off'} else st='stop'; }
     else st= s===true?'on':s===false?'off':'unknown';
-    card.dataset.state=st==='slow'?'off':st;
+    card.dataset.state=st==='slow'?'off':st==='queue'?'wake':st;
     var pill=card.querySelector('.pill');pill.className='pill '+C[st];pill.lastChild.textContent=T[st];
     card.querySelector('.dev-note').textContent=N[st]||'';
     var w=card.querySelector('.a-wake button');
-    if(w){var busy=st==='wake'||st==='stop';w.disabled=busy;
-      if(!w.classList.contains('pwr'))w.innerHTML=st==='wake'?'<span class="spin"></span>Menyalakan…':w.dataset.label;}
+    if(w){var busy=st==='wake'||st==='stop'||st==='queue';w.disabled=busy;
+      if(!w.classList.contains('pwr'))w.innerHTML=st==='wake'?'<span class="spin"></span>Menyalakan…':st==='queue'?'Antre…':w.dataset.label;}
   }
   document.querySelectorAll('.pw form').forEach(function(f){f.addEventListener('submit',function(){
     if(f.dataset.confirm&&f.dataset.confirmed!=='1')return;  // tunggu konfirmasi
@@ -2239,7 +2245,7 @@ JS_STATUS = """
 """
 
 LOG_LABELS = {
-    "login": "Masuk ke panel", "login-admin-luar-ditolak": "Admin ditolak: masuk dari luar jaringan sekolah", "nyalakan": "Menyalakan", "matikan": "Mematikan",
+    "login": "Masuk ke panel", "login-admin-luar-ditolak": "Admin ditolak: masuk dari luar jaringan sekolah", "nyalakan": "Menyalakan", "nyalakan-semua": "Menghidupkan semua", "matikan": "Mematikan",
     "simpan-perangkat": "Menyimpan data komputer", "hapus-perangkat": "Menghapus komputer",
     "simpan-pengguna": "Menyimpan pengguna", "hapus-pengguna": "Menghapus pengguna",
     "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
@@ -2385,6 +2391,51 @@ def log_list(n=8):
     return "".join(rows)
 
 
+def wake_group_run(devs, user, ip):
+    """Hidupkan komputer satu per satu dengan jeda (mencegah lonjakan listrik). Dijalankan di thread."""
+    failed = []
+    try:
+        for i, d in enumerate(devs):
+            if i:
+                end = time.time() + WAKE_JOB["gap"]
+                while time.time() < end and not WAKE_JOB.get("stop"):
+                    time.sleep(0.5)
+            if WAKE_JOB.get("stop"):
+                break
+            try:
+                send_wol(d)
+                WAKE_COOLDOWN[d["id"]] = time.time()
+            except Exception:
+                failed.append(d["name"])
+            WAKE_JOB["done"] = i + 1
+    finally:
+        WAKE_JOB.update(running=False, end=time.time())
+        sent = WAKE_JOB.get("done", 0) - len(failed)
+        note = " (dihentikan)" if WAKE_JOB.get("stop") else ""
+        write_log(user, "nyalakan-semua", f"{WAKE_JOB['group']}: {sent}/{len(devs)} komputer{note}"
+                  + (f", gagal: {', '.join(failed)}" if failed else ""), ip)
+
+
+def wake_group_bar(csrf, group, devs):
+    """Tombol Hidupkan semua untuk satu kategori di Beranda (min. 2 komputer)."""
+    if len(devs) < 2:
+        return ""
+    gap = int(CFG.get("wake_gap", 10))
+    if WAKE_JOB.get("running"):
+        if WAKE_JOB["group"] != group:
+            return ""
+        n = len(WAKE_JOB["ids"])
+        eta = time.strftime("%H:%M", time.localtime(WAKE_JOB["start"] + (n - 1) * WAKE_JOB["gap"]))
+        return (f'<div class="wbar card"><span>{icon("power")}<b>Menghidupkan {n} komputer</b> satu per satu, jeda {WAKE_JOB["gap"]} detik'
+                f' · selesai sekitar {eta}</span>'
+                f'<form method="post" action="/wake-group/stop">{hidden(csrf)}<button class="btn sm">Hentikan</button></form></div>')
+    msg = (f"Komputer di {group} yang masih mati dihidupkan satu per satu dengan jeda {gap} detik agar listrik tidak melonjak. "
+           f"Komputer yang sudah menyala dilewati.")
+    return (f'<div class="wbar"><form method="post" action="/wake-group" {confirm(msg, "Hidupkan", "Hidupkan semua " + group + "?")}>'
+            f'{hidden(csrf, group=group)}<button class="btn sm" data-busy="Mengecek…">{icon("power")}Hidupkan semua</button></form>'
+            f'<span class="mut small">bergantian, jeda {gap} detik</span></div>')
+
+
 def home_servers(csrf):
     """Ringkasan Server / VM di Beranda (admin): status, pembaruan, dan pintasan."""
     vms = CFG.get("vms", [])
@@ -2457,10 +2508,16 @@ def home_servers(csrf):
 def home_page(user, csrf, q):
     waking, stopping = q.get("waking", [""])[0], q.get("stopping", [""])[0]
     cards = []
-    by_group = {}
+    by_group, devs_by_group = {}, {}
+    job = WAKE_JOB if WAKE_JOB.get("running") else {}
     for d in user_devices(user):
         did = E(d["id"])
+        devs_by_group.setdefault(clean_group(d.get("group")), []).append(d)
         pending = "wake" if d["id"] == waking else "stop" if d["id"] == stopping else ""
+        delay = 0
+        if job and d["id"] in job["ids"]:  # sedang/akan dihidupkan bergantian
+            pending = "wake"
+            delay = max(0, int(job["start"] + job["ids"].index(d["id"]) * job["gap"] - time.time()))
         stop = ""
         if d.get("agent_secret"):
             stop = (f'<form class="a-stop push" method="post" action="/shutdown" '
@@ -2485,7 +2542,7 @@ def home_page(user, csrf, q):
                    f'{hidden(csrf, id=d["id"])}<button class="pwr" aria-label="Matikan {E(d["name"])}">{icon("power")}</button>'
                    f'<span class="pwr-t">Tekan untuk mematikan</span></form>' if d.get("agent_secret") else
                    f'<div class="pwr-on"><span class="pwr" aria-hidden="true">{icon("power")}</span><span class="pwr-t">Menyala</span></div>')
-            cards.append(f"""<article class="card dev pw" id="dev-{did}" data-state="checking" data-pending="{pending}">
+            cards.append(f"""<article class="card dev pw" id="dev-{did}" data-state="checking" data-pending="{pending}" data-delay="{delay}">
 <h2>{E(d['name'])}</h2><span class="pill"><span class="dot"></span><span>Mengecek…</span></span>
 <form class="a-wake" method="post" action="/wake">{hidden(csrf, id=d['id'])}<button class="pwr" aria-label="Hidupkan {E(d['name'])}">{icon('power')}</button>
 <span class="pwr-t">Tekan untuk menghidupkan</span></form>{off}
@@ -2493,7 +2550,7 @@ def home_page(user, csrf, q):
 <a class="btn a-remote" href="{E(d.get('remote_url') or DEFAULT_REMOTE)}" target="_blank" rel="noopener noreferrer">Buka Remote {icon('ext')}</a></article>""")
             by_group.setdefault(clean_group(d.get("group")), []).append(cards.pop())
             continue
-        cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}">
+        cards.append(f"""<article class="card dev" id="dev-{did}" data-state="checking" data-pending="{pending}" data-delay="{delay}">
 <div class="dev-head"><div><h2>{E(d['name'])}</h2>
 <div class="meta"><span>{E(d.get('ip') or 'IP belum diisi')}</span><span class="mono">{E(d['mac'])}</span></div>{warn}{edit}</div>
 <span class="pill"><span class="dot"></span><span>Mengecek…</span></span></div>
@@ -2543,7 +2600,7 @@ def home_page(user, csrf, q):
         gid = f"k{i}"
         if focus and any(f'id="dev-{E(focus)}"' in c for c in gc):
             focus = gid
-        tabs.append((gid, g, len(gc), f'<div class="devgrid">{"".join(gc)}</div>'))
+        tabs.append((gid, g, len(gc), f'{wake_group_bar(csrf, g, devs_by_group.get(g, []))}<div class="devgrid">{"".join(gc)}</div>'))
     if servers:
         tabs.append(("srv", "Server", len(CFG.get("vms", [])), servers))
     if len(tabs) > 1 and not is_admin(user) and sum(t[2] for t in tabs) <= 6:
@@ -2885,6 +2942,8 @@ def settings_general(user, csrf, q):
 Tanpa diisi pun, akses lewat proxy sudah dikenali dari header X-Forwarded-For.</span></label>
 <label style="max-width:220px">Lama sesi login<input name="session_hours" type="number" min="1" max="720" value="{int(CFG.get('session_hours', 12))}">
 <span class="hint">Dalam jam (1–720).</span></label>
+<label style="max-width:220px">Jeda Hidupkan semua<input name="wake_gap" type="number" min="2" max="300" value="{int(CFG.get('wake_gap', 10))}">
+<span class="hint">Detik antar komputer saat tombol Hidupkan semua dipakai (2–300). Makin banyak komputer per jalur listrik, makin besar jedanya.</span></label>
 <button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
 
 
@@ -3781,6 +3840,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/logout":
             return self.redirect("/login", [self.cookie_header("", 0)])
+        if path == "/wake-group":
+            return self.do_wake_group(form, user, ip)
+        if path == "/wake-group/stop":
+            if WAKE_JOB.get("running") and (is_admin(user) or WAKE_JOB.get("by") == user):
+                WAKE_JOB["stop"] = True
+                return self.back("/", "Dihentikan. Komputer yang sudah dikirimi perintah tetap menyala.")
+            return self.back("/", "Tidak ada yang sedang berjalan.")
         if path == "/wake":
             return self.do_wake(form, user, ip)
         if path == "/shutdown":
@@ -4002,6 +4068,30 @@ class Handler(BaseHTTPRequestHandler):
         via = f" (juga lewat agen {', '.join(res['relays'][:3])})" if res["relays"] else ""
         write_log(user, "nyalakan", dev["id"] + via, ip)
         return self.back("/", f"Perintah menyalakan dikirim ke {dev['name']}{via}.", waking=dev["id"])
+
+    def do_wake_group(self, form, user, ip):
+        group = form.get("group", "")
+        devs = [d for d in user_devices(user) if clean_group(d.get("group")) == group]
+        if len(devs) < 2:
+            return self.back("/", "Kategori tidak dikenal.", True)
+        with WAKE_JOB_LOCK:
+            if WAKE_JOB.get("running"):
+                return self.back("/", f"Masih menghidupkan {WAKE_JOB['group']}. Tunggu selesai atau klik Hentikan.", True)
+            WAKE_JOB.update(running=True, group=group, ids=[], done=0, start=time.time(), by=user, stop=False,
+                            gap=int(CFG.get("wake_gap", 10)))
+        try:
+            st = all_status(devs)
+        except Exception:
+            st = {}
+        todo = [d for d in devs if st.get(d["id"]) is not True]
+        if not todo:
+            WAKE_JOB.update(running=False)
+            return self.back("/", f"Semua komputer di {group} sudah menyala.")
+        WAKE_JOB.update(ids=[d["id"] for d in todo], start=time.time())
+        threading.Thread(target=wake_group_run, args=(todo, user, ip), daemon=True).start()
+        end = time.strftime("%H:%M", time.localtime(time.time() + (len(todo) - 1) * WAKE_JOB["gap"]))
+        return self.back("/", f"Menghidupkan {len(todo)} komputer di {group} bergantian, jeda {WAKE_JOB['gap']} detik "
+                              f"(selesai sekitar {end})." + (f" {len(devs) - len(todo)} yang sudah menyala dilewati." if len(todo) < len(devs) else ""))
 
     def do_shutdown(self, form, user, ip):
         dev = next((d for d in CFG.get("devices", []) if d["id"] == form.get("id")), None)
@@ -4583,6 +4673,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except ValueError:
             return self.back("/settings", "Lama sesi harus 1–720 jam.", True, tab="umum")
+        try:
+            gap = int(form.get("wake_gap") or 10)
+            if not 2 <= gap <= 300:
+                raise ValueError
+        except ValueError:
+            return self.back("/settings", "Jeda Hidupkan semua harus 2–300 detik.", True, tab="umum")
         ips = [x for x in re.split(r"[,\s]+", form.get("proxy_ips", "")) if x]
         try:
             ips = [str(ipaddress.ip_address(x)) for x in ips]
@@ -4593,6 +4689,7 @@ class Handler(BaseHTTPRequestHandler):
         CFG["proxy_ips"] = ips
         CFG["trust_proxy"] = form.get("trust_proxy") == "1"
         CFG["session_hours"] = hours
+        CFG["wake_gap"] = gap
         save_config(CFG)
         write_log(user, "pengaturan-umum", "-", ip)
         return self.back("/settings", "Pengaturan umum disimpan.", tab="umum")

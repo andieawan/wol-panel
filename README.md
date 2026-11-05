@@ -194,6 +194,15 @@ Cara kerjanya: tiap komputer mengunduh sendiri gambarnya dari panel (hanya dari 
 SHA-256-nya, lalu memasangnya untuk semua profil pengguna (termasuk pengguna baru). Pengguna yang sedang login
 langsung melihat perubahannya. Butuh agen versi 7: klik **Perbarui agen** pada komputer lama.
 
+### Hidupkan semua (bergantian)
+
+Di Beranda, tiap kategori yang berisi minimal 2 komputer punya tombol **Hidupkan semua**. Komputer yang masih mati
+dihidupkan satu per satu dengan jeda (bawaan 10 detik, ubah di **Pengaturan → Umum → Jeda Hidupkan semua**, 2–300 detik)
+supaya arus lonjakan saat banyak PSU menyala bersamaan tidak menjatuhkan MCB. Komputer yang sudah menyala dilewati.
+Hanya satu penyalaan bergantian yang berjalan pada satu waktu (antar kategori juga tidak bersamaan); tombol **Hentikan**
+membatalkan sisa antrean. Kartu komputer yang belum gilirannya tampil *Menunggu giliran…*. Pengguna biasa hanya
+menghidupkan komputer yang diizinkan untuknya.
+
 ### Mematikan komputer dari panel
 
 WOL hanya bisa menyalakan. Untuk tombol **Matikan**, komputer Windows perlu dipasangi agen kecil
