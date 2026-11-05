@@ -237,6 +237,10 @@ Lalu di panel klik **Agen** → **Lepas agen**.
 
 Mulai agen versi 4, agen bisa **diperbarui dari panel dengan satu tombol**, jadi tidak perlu dipasang ulang di setiap
 komputer.
+
+Di **Beranda** (admin), kartu komputer yang agennya lama punya tautan **Perbarui agen**, dan tiap kategori punya tombol
+**Perbarui agen (n)** untuk memperbarui semua agen lama di kategori itu sekaligus (latar belakang, 4 bersamaan;
+komputer yang mati dilewati, hasilnya di Aktivitas).
 1. Setelah server panel di-update (`git pull && bash install.sh`), panel mengecek versi agen di setiap komputer yang
    menyala, setiap menit.
 2. Komputer dengan agen lebih lama diberi tanda *ada versi X* di **Pengaturan → Komputer**, dan tombol

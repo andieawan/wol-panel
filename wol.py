@@ -54,6 +54,7 @@ FAIL_LIMIT, FAIL_WINDOW = 5, 600
 WAKE_COOLDOWN = {}  # id perangkat -> waktu terakhir dikirim
 WAKE_JOB = {}       # hidupkan serentak per kategori: {"running", "group", "ids", "done", "gap", "start", "by", "stop"}
 WAKE_JOB_LOCK = threading.Lock()
+AGENT_JOB = {}      # perbarui agen per kategori dari Beranda: {"running", "group", "n", "start"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 USER_RE = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
 DEFAULT_REMOTE = "https://remotedesktop.google.com/access"
@@ -2048,7 +2049,7 @@ button.pwr:focus-visible{outline:3px solid var(--acc);outline-offset:6px}
 .wp-mini{width:72px;aspect-ratio:16/10;border-radius:6px;background:var(--off-soft) center/cover no-repeat;flex:none}
 .devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;align-items:start}
 .devgrid>.card{margin:0}
-.wbar{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin:0 0 12px}.wbar form{margin:0}
+.wbar{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin:0 0 12px}.wbar form{margin:0}.wbar .agt{margin-left:auto}
 .wbar.card{padding:10px 14px;justify-content:space-between;border-color:var(--warn);background:var(--warn-soft)}
 .wbar.card>span{flex:1 1 300px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px}.wbar svg{width:16px;height:16px}
 .htabs{justify-content:flex-start}.htabs a{flex:0 1 auto;display:inline-flex;align-items:center;gap:6px}
@@ -2245,7 +2246,7 @@ JS_STATUS = """
 """
 
 LOG_LABELS = {
-    "login": "Masuk ke panel", "login-admin-luar-ditolak": "Admin ditolak: masuk dari luar jaringan sekolah", "nyalakan": "Menyalakan", "nyalakan-semua": "Menghidupkan semua", "matikan": "Mematikan",
+    "login": "Masuk ke panel", "login-admin-luar-ditolak": "Admin ditolak: masuk dari luar jaringan sekolah", "nyalakan": "Menyalakan", "nyalakan-semua": "Menghidupkan semua", "perbarui-agen-semua": "Memperbarui agen", "matikan": "Mematikan",
     "simpan-perangkat": "Menyimpan data komputer", "hapus-perangkat": "Menghapus komputer",
     "simpan-pengguna": "Menyimpan pengguna", "hapus-pengguna": "Menghapus pengguna",
     "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
@@ -2416,24 +2417,63 @@ def wake_group_run(devs, user, ip):
                   + (f", gagal: {', '.join(failed)}" if failed else ""), ip)
 
 
-def wake_group_bar(csrf, group, devs):
-    """Tombol Hidupkan semua untuk satu kategori di Beranda (min. 2 komputer)."""
-    if len(devs) < 2:
+def agent_outdated(d):
+    v = d.get("agent_version")
+    return bool(d.get("agent_secret") and v and MIN_UPDATABLE <= v < template_version())
+
+
+def agent_update_group(devs, user, ip):
+    """Perbarui agen beberapa komputer sekaligus (latar belakang, maks. 4 bersamaan)."""
+    def one(d):
+        if d["id"] in SCAN_BUSY:
+            return False
+        SCAN_BUSY.add(d["id"])
+        try:
+            return agent_update(d, user)[0]
+        finally:
+            SCAN_BUSY.discard(d["id"])
+    try:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            ok = sum(ex.map(one, devs))
+    finally:
+        AGENT_JOB.update(running=False)
+    write_log(user, "perbarui-agen-semua", f"{AGENT_JOB['group']}: {ok}/{len(devs)} komputer"
+              + (" (yang gagal biasanya sedang mati)" if ok < len(devs) else ""), ip)
+
+
+def agent_group_tool(csrf, group, devs):
+    """Tombol Perbarui agen (n) untuk satu kategori di Beranda (admin)."""
+    if AGENT_JOB.get("running") and AGENT_JOB["group"] == group:
+        return (f'<span class="mut small agt">Memperbarui agen {AGENT_JOB["n"]} komputer… '
+                f'muat ulang halaman untuk melihat hasilnya</span>')
+    old = [d for d in devs if agent_outdated(d)]
+    if not old or AGENT_JOB.get("running"):
         return ""
+    msg = (f"Agen di {len(old)} komputer {group} diperbarui ke versi {template_version()}. "
+           f"Komputer harus menyala; yang mati dilewati dan bisa diperbarui nanti.")
+    return (f'<form class="agt" method="post" action="/agent-update-group" {confirm(msg, "Perbarui", "Perbarui agen " + group + "?")}>'
+            f'{hidden(csrf, group=group)}<button class="btn sm" data-busy="Memulai…">Perbarui agen ({len(old)})</button></form>')
+
+
+def wake_group_bar(csrf, group, devs, extra=""):
+    """Tombol Hidupkan semua untuk satu kategori di Beranda (min. 2 komputer), plus alat admin (extra)."""
+    if len(devs) < 2:
+        return f'<div class="wbar">{extra}</div>' if extra else ""
     gap = int(CFG.get("wake_gap", 10))
     if WAKE_JOB.get("running"):
         if WAKE_JOB["group"] != group:
-            return ""
+            return f'<div class="wbar">{extra}</div>' if extra else ""
         n = len(WAKE_JOB["ids"])
         eta = time.strftime("%H:%M", time.localtime(WAKE_JOB["start"] + (n - 1) * WAKE_JOB["gap"]))
         return (f'<div class="wbar card"><span>{icon("power")}<b>Menghidupkan {n} komputer</b> satu per satu, jeda {WAKE_JOB["gap"]} detik'
                 f' · selesai sekitar {eta}</span>'
-                f'<form method="post" action="/wake-group/stop">{hidden(csrf)}<button class="btn sm">Hentikan</button></form></div>')
+                f'<form method="post" action="/wake-group/stop">{hidden(csrf)}<button class="btn sm">Hentikan</button></form></div>'
+                + (f'<div class="wbar">{extra}</div>' if extra else ""))
     msg = (f"Komputer di {group} yang masih mati dihidupkan satu per satu dengan jeda {gap} detik agar listrik tidak melonjak. "
            f"Komputer yang sudah menyala dilewati.")
     return (f'<div class="wbar"><form method="post" action="/wake-group" {confirm(msg, "Hidupkan", "Hidupkan semua " + group + "?")}>'
             f'{hidden(csrf, group=group)}<button class="btn sm" data-busy="Mengecek…">{icon("power")}Hidupkan semua</button></form>'
-            f'<span class="mut small">bergantian, jeda {gap} detik</span></div>')
+            f'<span class="mut small">bergantian, jeda {gap} detik</span>{extra}</div>')
 
 
 def home_servers(csrf):
@@ -2535,7 +2575,10 @@ def home_page(user, csrf, q):
                 warn = f'<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">{"".join(tags)}</div>'
         edit = (f'<div class="adm"><form method="post" action="/devices/test">{hidden(csrf, id=d["id"], back="home")}'
                 f'<button class="lnk" data-busy="Mengetes…" title="Cek port, ARP, ping, dan agen">Tes</button></form>'
-                f'<a class="lnk" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a></div>' if is_admin(user) else "")
+                f'<a class="lnk" href="/settings?edit={quote(d["id"])}#form-dev">Ubah</a>'
+                + (f'<form method="post" action="/devices/agent-update">{hidden(csrf, id=d["id"], back="home")}'
+                   f'<button class="lnk" data-busy="Memperbarui…" title="Agen v{d.get("agent_version")} → v{template_version()}">Perbarui agen</button></form>'
+                   if agent_outdated(d) else "") + '</div>' if is_admin(user) else "")
         if not is_admin(user):  # pengguna biasa: satu tombol power besar
             off = (f'<form class="a-stop" method="post" action="/shutdown" '
                    f'{confirm(d["name"] + " akan mati 10 detik setelah ini. Simpan dulu pekerjaan di komputer itu.", "Matikan", "Matikan " + d["name"] + "?")}>'
@@ -2600,7 +2643,9 @@ def home_page(user, csrf, q):
         gid = f"k{i}"
         if focus and any(f'id="dev-{E(focus)}"' in c for c in gc):
             focus = gid
-        tabs.append((gid, g, len(gc), f'{wake_group_bar(csrf, g, devs_by_group.get(g, []))}<div class="devgrid">{"".join(gc)}</div>'))
+        gd = devs_by_group.get(g, [])
+        tool = agent_group_tool(csrf, g, gd) if is_admin(user) else ""
+        tabs.append((gid, g, len(gc), f'{wake_group_bar(csrf, g, gd, tool)}<div class="devgrid">{"".join(gc)}</div>'))
     if servers:
         tabs.append(("srv", "Server", len(CFG.get("vms", [])), servers))
     if len(tabs) > 1 and not is_admin(user) and sum(t[2] for t in tabs) <= 6:
@@ -3907,7 +3952,18 @@ class Handler(BaseHTTPRequestHandler):
                 ok, msg = agent_update(dev, user)
             finally:
                 SCAN_BUSY.discard(dev["id"])
-            return self.back("/settings", msg, not ok)
+            return self.back("/" if form.get("back") == "home" else "/settings", msg, not ok)
+        if path == "/agent-update-group":
+            group = form.get("group", "")
+            old = [d for d in CFG["devices"] if clean_group(d.get("group")) == group and agent_outdated(d)]
+            if not old:
+                return self.back("/", "Semua agen di kategori ini sudah versi terbaru.")
+            if AGENT_JOB.get("running"):
+                return self.back("/", f"Masih memperbarui agen {AGENT_JOB['group']}, tunggu sebentar.", True)
+            AGENT_JOB.update(running=True, group=group, n=len(old), start=time.time())
+            threading.Thread(target=agent_update_group, args=(old, user, ip), daemon=True).start()
+            return self.back("/", f"Memperbarui agen di {len(old)} komputer {group}. Butuh sekitar 1 menit; "
+                                  "hasilnya tampil di Aktivitas dan label versi tiap komputer.")
         if path == "/apps/uninstall":
             return self.do_apps_uninstall(form, user, ip)
         if path == "/apps/dismiss":
