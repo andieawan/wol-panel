@@ -1377,7 +1377,53 @@ def agent_script(dev):
         tpl = f.read()
     return (tpl.replace("__SECRET__", dev["agent_secret"])
                .replace("__PORT__", str(int(dev.get("agent_port", AGENT_PORT))))
-               .replace("__PANEL_IP__", local_ip_for(dev["ip"])))
+               .replace("__PANEL_IP__", local_ip_for(dev["ip"]))
+               .replace("__PANEL_PORT__", str(int(CFG.get("port", 8080)))))
+
+
+BEAT_SEEN = {}         # nonce laporan agen -> waktu (tolak kiriman ulang)
+
+
+def agent_beat(data, from_ip):
+    """Laporan berkala agen v10+: perbarui IP/subnet bila komputer dapat IP baru dari DHCP. -> pesan singkat"""
+    try:
+        fp, ts, nonce, sig = (str(data[k]) for k in ("fp", "ts", "nonce", "sig"))
+        ip = str(ipaddress.IPv4Address(str(data["ip"])))
+        prefix = parse_prefix(str(data.get("prefix", "")))
+        mac = normalize_mac(str(data["mac"])) if data.get("mac") else ""
+        ver = int(data.get("version") or 0)
+    except (KeyError, ValueError, TypeError):
+        return "data tidak valid"
+    now = time.time()
+    if not ts.isdigit() or abs(now - int(ts)) > 300 or nonce in BEAT_SEEN:
+        return "kedaluwarsa"
+    if ip != from_ip:  # hanya IP pengirim yang boleh dilaporkan (cegah pemalsuan & NAT)
+        return "IP pengirim berbeda"
+    dev = next((d for d in CFG.get("devices", []) if d.get("agent_secret") and agent_fp(d["agent_secret"]) == fp), None)
+    want = dev and hmac.new(dev["agent_secret"].encode(), f"beat|{ts}|{nonce}|{data['ip']}|{data.get('prefix')}|{data.get('mac')}|{data.get('version')}".encode(),
+                            hashlib.sha256).hexdigest()
+    if not dev or not hmac.compare_digest(want, sig):
+        return "tidak dikenal"
+    for k, t in list(BEAT_SEEN.items()):
+        if now - t > 600:
+            BEAT_SEEN.pop(k, None)
+    BEAT_SEEN[nonce] = now
+    with CFG_LOCK:
+        changed = False
+        if ver and dev.get("agent_version") != ver:
+            dev["agent_version"] = ver
+            changed = True
+        old = dev.get("ip")
+        if ip != old and (not mac or mac == dev["mac"]):  # kartu lain (mis. Wi-Fi) tidak mengganti IP untuk WOL
+            net = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+            if net != dev_network(dev):
+                dev["broadcast"] = subnet_wol_addr(net, skip=dev)
+            dev["ip"], dev["prefix"] = ip, prefix
+            changed = True
+            write_log("otomatis", "ip-berubah", f"{dev['id']}:{old} → {ip}", from_ip)
+        if changed:
+            save_config(CFG)
+    return "ok"
 
 
 # ------------------------------------------------------- tambah komputer lewat skrip
@@ -2198,7 +2244,7 @@ LOG_LABELS = {
     "simpan-pengguna": "Menyimpan pengguna", "hapus-pengguna": "Menghapus pengguna",
     "ganti-password": "Mengganti password", "pengaturan-umum": "Mengubah pengaturan umum",
     "token-agen": "Membuat perintah pasang agen", "unduh-agen": "Pemasang agen diunduh",
-    "lepas-agen": "Melepas agen",
+    "lepas-agen": "Melepas agen", "ip-berubah": "IP berubah, diperbarui otomatis",
     "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
@@ -2323,7 +2369,7 @@ def log_list(n=8):
         label = LOG_LABELS.get(act, act)
         if (act.startswith("vm-") or act.startswith("terminal")) and ":" in target:
             label += " " + target.split(":", 1)[1]
-        elif act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen")) and ":" in target:
+        elif act.startswith(("uninstall", "hapus-otomatis", "perbarui-agen", "ip-berubah")) and ":" in target:
             did, info = target.split(":", 1)
             label += f" di {names.get(did, did)} — {info}"
         elif act in ("pindai", "aturan-aplikasi"):
@@ -3714,6 +3760,16 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/join/([A-Za-z0-9_-]{20,64})", path)
         if m:
             return self.do_join(m.group(1), raw, ip)
+        if path == "/agent/beat":  # laporan IP dari agen (tanpa login, ditandatangani kunci agen)
+            if not self.lan_direct():
+                return self._send(403, "Ditolak")
+            try:
+                data = json.loads(raw.decode("utf-8-sig"))
+                assert isinstance(data, dict)
+            except Exception:
+                return self._send(400, "data tidak valid")
+            res = agent_beat(data, self.client_address[0])
+            return self._send(200 if res == "ok" else 400, res, "text/plain; charset=utf-8")
 
         user, tok = self.session()
         if path.startswith("/terminal/") and path != "/terminal/unlock":

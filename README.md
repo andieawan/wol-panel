@@ -126,6 +126,15 @@ Komputer baru di subnet yang sudah punya **Alamat WOL tambahan** (IP ARP-broadca
 yang sama. Perkenalan agen (`/hello`) butuh agen versi 6: klik **Perbarui agen** pada komputer lama. Agen hanya
 mengirim nama komputer, MAC, IP, subnet, dan sidik kunci (bukan kuncinya), dan hanya ke IP panel.
 
+### IP diperbarui otomatis
+
+Agen versi 10 melapor ke panel (`POST /agent/beat`) saat komputer menyala lalu tiap 5 menit. Bila IP komputer berubah
+(DHCP), panel langsung memakai IP baru — status, Matikan, dan pindai tetap jalan tanpa diubah manual. Laporan
+ditandatangani kunci agen, hanya diterima dari jaringan sekolah, dan IP yang dilaporkan harus sama dengan IP pengirim.
+IP hanya diganti bila laporannya dari kartu jaringan dengan MAC yang terdaftar (bukan Wi-Fi). Pindah subnet ikut
+memakai Alamat WOL subnet barunya. Perubahan tercatat di Aktivitas. Tetap disarankan memberi **DHCP static lease** di
+router untuk tiap komputer. Komputer lama: klik **Perbarui agen** sekali (selagi IP-nya masih benar).
+
 ### Komputer di subnet lain
 
 Panel bisa menyalakan komputer di subnet lain selama masih satu jaringan sekolah (dirutekan router, tanpa NAT di

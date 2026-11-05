@@ -25,9 +25,11 @@
 $Secret  = '__SECRET__'
 $Port    = __PORT__
 $PanelIp = '__PANEL_IP__'
+$PanelPort = __PANEL_PORT__
 $Log     = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.log'
 $Seen    = @{}
-$AgentVersion = 9
+$AgentVersion = 10
+$script:LastBeat = [datetime]::MinValue
 $AgentFile = Join-Path (Join-Path $env:ProgramData 'WOLPanelAgent') 'agent.ps1'
 $script:By = ''
 
@@ -498,6 +500,26 @@ function Send-Wol([string]$mac, $targets, [int]$port) {
     return @{ ok = ($sent -gt 0); msg = "$sent paket dikirim" }
 }
 
+# ---------------------------------------------------------------- lapor IP ke panel
+# Saat agen mulai lalu tiap 5 menit: panel memperbarui IP komputer ini bila berubah (DHCP).
+function Send-Beat {
+    if (((Get-Date) - $script:LastBeat).TotalMinutes -lt 5) { return }  # gagal (jaringan belum siap): dicoba lagi 30 detik kemudian
+    try {
+        $r = Find-NetRoute -RemoteIPAddress $PanelIp -ErrorAction Stop |
+            Where-Object { $_.PSObject.Properties['PrefixLength'] -and $_.AddressFamily -eq 'IPv4' } | Select-Object -First 1
+        if (-not $r) { return }
+        $mac = ((Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -ErrorAction Stop).MacAddress -replace '-', ':').ToUpper()
+        $ts = [string][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $nonce = [guid]::NewGuid().ToString('N')
+        $ip = [string]$r.IPAddress; $prefix = [int]$r.PrefixLength
+        $body = @{ fp = (Get-Sha256 "wol-fp|$Secret").Substring(0, 16); ts = $ts; nonce = $nonce; ip = $ip; prefix = $prefix
+                   mac = $mac; version = $AgentVersion; sig = (Get-Sig "beat|$ts|$nonce|$ip|$prefix|$mac|$AgentVersion") } | ConvertTo-Json -Compress
+        [void](Invoke-WebRequest -Uri "http://${PanelIp}:$PanelPort/agent/beat" -Method Post -Body $body -ContentType 'application/json' `
+                   -UseBasicParsing -TimeoutSec 5)
+        $script:LastBeat = Get-Date
+    } catch {}
+}
+
 # ---------------------------------------------------------------- permintaan dari panel
 function Test-Signed($ctx, [string]$kind, [string]$extra) {
     $req   = $ctx.Request
@@ -624,8 +646,11 @@ while ($true) {
         $listener.Prefixes.Add("http://+:$Port/")
         $listener.Start()
         Write-Log "Agen berjalan di port $Port"
+        Send-Beat
         while ($listener.IsListening) {
-            $ctx = $listener.GetContext()
+            $ar = $listener.BeginGetContext($null, $null)
+            while (-not $ar.AsyncWaitHandle.WaitOne(30000)) { Send-Beat }
+            $ctx = $listener.EndGetContext($ar)
             try { Handle $ctx } catch { Write-Log "Error: $($_.Exception.Message)"; Send-Text $ctx 500 'error' }
         }
     } catch {
