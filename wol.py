@@ -3791,7 +3791,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                                f'<p class="mut small" style="margin:4px 0 8px">Pasang satu aplikasi sekolah: kode diambil dari GitHub, lalu '
                                f'<span class="mono">deploy/install.sh</span> aplikasinya dijalankan (nginx, PHP, MariaDB, database). ±5–10 menit.</p>'
                                f'<form method="post" action="/servers/install-app" class="inline" '
-                               f'{confirm("Aplikasi dipasang di " + vm["name"] + ". Kredensial admin yang dicetak skrip pasang tampil di log (catat, lalu ganti). Pusat & Jurnal: buat admin pertama lewat Terminal sesudahnya (perintahnya ada di akhir log).", "Pasang", "Pasang aplikasi di " + vm["name"] + "?")}>'
+                               f'{confirm("Aplikasi dipasang di " + vm["name"] + ". Kredensial admin yang dicetak skrip pasang tampil di log (catat, lalu ganti). Pusat: buat superadmin pertama lewat Terminal sesudahnya (perintahnya ada di akhir log). Jurnal dan aplikasi lain memakai akun Pusat.", "Pasang", "Pasang aplikasi di " + vm["name"] + "?")}>'
                                f'{hidden(csrf, id=vm["id"])}<label style="flex:0 1 320px">Aplikasi<select name="app">{opts}</select></label>'
                                f'<button class="btn primary" data-busy="Memulai…">Pasang aplikasi</button></form></div>')
             elif int(d.get("version") or 0) < INSTALL_MIN_VERSION and "fresh" not in d:
