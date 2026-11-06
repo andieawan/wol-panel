@@ -891,8 +891,24 @@ VMSTATE = {}          # id VM -> {"checked", "data", "error"}
 VM_LOCK = threading.Lock()
 VM_JOBS = {}          # id VM -> {"action", "start", "end", "rc", "by"}
 VM_TOKENS = {}        # token pasang -> (id VM, kedaluwarsa)
-VM_ACTIONS = {"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot",
-              "self-update": "Perbarui wol-update"}
+# Aplikasi yang bisa dipasang di VM baru (kode harus sama dengan katalog app_catalog di vm-update.sh): kode, nama, IP usulan.
+APP_CATALOG = (("pusat", "Pusat Sekolah", "192.168.10.20"), ("web", "Website Sekolah", "192.168.10.21"), ("jurnal", "Jurnal Guru", "192.168.10.22"),
+               ("bk", "Bimbingan Konseling", "192.168.10.23"), ("tu", "Tata Usaha", "192.168.10.24"), ("pkl", "Manajemen PKL", "192.168.10.25"),
+               ("tanggungan", "Tanggungan Siswa", "192.168.10.26"), ("backup", "Backup Master", "192.168.10.30"))
+APP_NAMES = {k: n for k, n, _ in APP_CATALOG}
+INSTALL_MIN_VERSION = 7   # wol-update mulai versi ini punya app-install & penanda VM baru (fresh)
+
+
+class _ActionNames(dict):
+    """Nama aksi VM; 'app-install <kode>' → 'Pasang <nama aplikasi>'."""
+    def get(self, k, default=None):
+        if isinstance(k, str) and k.startswith("app-install "):
+            return "Pasang " + APP_NAMES.get(k.split(" ", 1)[1], k.split(" ", 1)[1])
+        return super().get(k, default)
+
+
+VM_ACTIONS = _ActionNames({"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot",
+                           "self-update": "Perbarui wol-update"})
 VM_SELF_UPDATE_MIN = 3   # wol-update mulai versi ini bisa memperbarui dirinya
 # VM aplikasi sekolah (susunan IP 192.168.10.x, sama dengan Backup Master) untuk isian cepat "Tambah VM".
 SCHOOL_VMS = (("Pusat Sekolah", "192.168.10.20"), ("Website Sekolah", "192.168.10.21"), ("Jurnal Guru", "192.168.10.22"),
@@ -1044,7 +1060,7 @@ def run_vm_job(vm, action, user, steps=None):
                         log.write(f"[panel] Langkah berikutnya dibatalkan karena {VM_ACTIONS.get(act, act)} gagal.\n")
                     break
         action = job["action"]
-        if rc == 0 and set(steps) & {"app-update", "os-upgrade"}:
+        if rc == 0 and any(a in ("app-update", "os-upgrade") or a.startswith("app-install ") for a in steps):
             time.sleep(5)  # beri waktu PHP-FPM/nginx selesai reload
             h = vm_health(vm)
             with open(path, "a", encoding="utf-8") as log:
@@ -3764,6 +3780,23 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                                   f"Hapus {vm['name']}?", id=vm["id"]))
         btns.append(f'<details class="menu push"><summary class="btn sm quiet">Lainnya ▾</summary><div class="menu-pop">{"".join(more_btns)}</div></details>')
 
+        # VM baru & kosong: pasang aplikasi sekolah (hanya bila wol-update melaporkan fresh=1)
+        install_box = ""
+        if d and not d.get("app") and not running:
+            if d.get("fresh") == "1":
+                opts = "".join(f'<option value="{E(k)}"{" selected" if h == vm["host"] else ""}>{E(n)} ({E(h)})</option>'
+                               for k, n, h in APP_CATALOG)
+                install_box = (f'<div style="margin:10px 0 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--acc-soft)">'
+                               f'<b>VM ini masih baru dan kosong</b> <span class="mut small">(dibuat {E(d.get("vm_age_days", "?"))} hari lalu)</span>'
+                               f'<p class="mut small" style="margin:4px 0 8px">Pasang satu aplikasi sekolah: kode diambil dari GitHub, lalu '
+                               f'<span class="mono">deploy/install.sh</span> aplikasinya dijalankan (nginx, PHP, MariaDB, database). ±5–10 menit.</p>'
+                               f'<form method="post" action="/servers/install-app" class="inline" '
+                               f'{confirm("Aplikasi dipasang di " + vm["name"] + ". Kredensial admin yang dicetak skrip pasang tampil di log (catat, lalu ganti). Pusat & Jurnal: buat admin pertama lewat Terminal sesudahnya (perintahnya ada di akhir log).", "Pasang", "Pasang aplikasi di " + vm["name"] + "?")}>'
+                               f'{hidden(csrf, id=vm["id"])}<label style="flex:0 1 320px">Aplikasi<select name="app">{opts}</select></label>'
+                               f'<button class="btn primary" data-busy="Memulai…">Pasang aplikasi</button></form></div>')
+            elif int(d.get("version") or 0) < INSTALL_MIN_VERSION and "fresh" not in d:
+                tags.append('<span class="tag" title="Menu Pasang aplikasi untuk VM baru butuh wol-update versi 7">Belum ada aplikasi · perbarui wol-update</span>')
+
         # detail paket & commit
         detail = ""
         if d.get("pkgs") or d.get("commits"):
@@ -3797,7 +3830,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
 <div class="dev-head"><div><h2>{E(vm['name'])}</h2><div class="meta">{' · '.join(meta)}</div>{app_line}
 <div class="mut small">Dicek {E(fmt_age(st.get('checked')))}</div></div></div>
 <div class="acts">{''.join(tags) or '<span class="tag">Belum dicek</span>'}</div>
-{jobline}{logbox}{detail}
+{jobline}{logbox}{install_box}{detail}
 <div class="dev-acts">{''.join(btns)}</div></article>""")
 
     if not cards:
@@ -4198,6 +4231,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.do_vm_check(form, user, ip)
         if path == "/servers/run":
             return self.do_vm_run(form, user, ip)
+        if path == "/servers/install-app":
+            return self.do_vm_install_app(form, user, ip)
         if path == "/servers/update-all":
             n = sum(1 for vm in CFG.get("vms", []) if not vm_job_running(vm["id"]) and vm_update_plan(vm))
             dest = "/" if form.get("back") == "home" else "/servers"
@@ -4653,6 +4688,20 @@ class Handler(BaseHTTPRequestHandler):
         if vm_job_running(vm["id"]):
             return self.back("/servers", "Sedang ada proses di VM ini.", True)
         run_vm_job(vm, action, user)
+        return self.redirect(f"/servers#vm-{quote(vm['id'])}")
+
+    def do_vm_install_app(self, form, user, ip):
+        vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+        app = form.get("app", "")
+        if not vm or app not in APP_NAMES:
+            return self.back("/servers", "Permintaan tidak valid.", True)
+        if vm_job_running(vm["id"]):
+            return self.back("/servers", "Sedang ada proses di VM ini.", True)
+        d = (VMSTATE.get(vm["id"]) or {}).get("data") or {}
+        if d.get("fresh") != "1" or d.get("app"):
+            return self.back("/servers", "Pasang aplikasi hanya untuk VM baru yang masih kosong. Klik Cek dulu.", True)
+        write_log(user, "vm-pasang-aplikasi", f"{vm['id']}:{app}", ip)
+        run_vm_job(vm, f"app-install {app}", user)  # wol-update di VM memeriksa lagi syarat VM baru
         return self.redirect(f"/servers#vm-{quote(vm['id'])}")
 
     # ---------------- aplikasi

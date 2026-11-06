@@ -352,6 +352,23 @@ sed -i '/wol-panel-update$/d' /root/.ssh/authorized_keys
 rm -f /usr/local/sbin/wol-update /etc/wol-update.conf
 ```
 
+### Pasang aplikasi di VM baru
+
+VM yang **baru dibuat (≤ 7 hari, dihitung dari waktu OS dipasang) dan belum berisi aplikasi apa pun** (tidak ada folder di
+`/var/www` selain `html`) mendapat kotak **Pasang aplikasi** di kartunya. Kotak ini tidak muncul di VM lain.
+
+1. Buat VM (Ubuntu 24.04 + user biasa), lalu **Server → Tambah VM** (*Isi cepat* sesuai susunan IP) dan jalankan perintah
+   pasang wol-update di konsol VM. Klik **Cek**.
+2. Pilih aplikasinya (yang IP-nya cocok sudah terpilih) → **Pasang aplikasi**. Log berjalan langsung di kartu (±5–10 menit).
+3. Sesudah selesai: atur Proxy Host di NPMplus. Pusat & Jurnal: buat admin pertama lewat **Terminal** (perintahnya tertulis
+   di akhir log). Website & Backup Master mencetak kredensial admin di log — catat lalu ganti password.
+
+Keamanan: daftar aplikasi, alamat repo GitHub, dan folder tujuan ditulis di `wol-update` (di VM), bukan dikirim panel —
+panel hanya memilih kode (`pusat`, `web`, `jurnal`, `bk`, `tu`, `pkl`, `tanggungan`, `backup`). `wol-update` menolak
+`app-install` di VM yang sudah berisi aplikasi atau lebih tua dari 7 hari, walau panel memintanya. Domain bawaan
+`<subdomain>.smkibupakusari.sch.id` dan batas hari bisa diganti di `/etc/wol-update.conf` (`DOMAIN_BASE`, `FRESH_DAYS`).
+Butuh wol-update versi 7.
+
 ### Cek aplikasi hidup, status backup, dan notifikasi
 
 **Cek aplikasi.** Selain port SSH, panel memeriksa aplikasinya sendiri lewat `wol-update health` (setiap 5 menit, bisa

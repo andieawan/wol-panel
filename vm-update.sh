@@ -10,15 +10,19 @@
 #   app-update   menjalankan deploy/update.sh milik aplikasi
 #   reboot       restart VM dalam 3 detik
 #   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
+#   app-install KODE  pasang aplikasi sekolah dari katalog di bawah — HANYA di VM yang masih baru & kosong (fresh=1)
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=6
+WOL_UPDATE_VERSION=7
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 APP_DIR=""
 TERM_USER=""
 WOL_UPDATE_SRC="https://raw.githubusercontent.com/andieawan/wol-panel/main/vm-update.sh"
+DOMAIN_BASE="smkibupakusari.sch.id"   # domain sekolah untuk app-install (bisa diganti di /etc/wol-update.conf)
+PROXY_IP="192.168.10.10"              # NPMplus
+FRESH_DAYS=7                          # "Pasang aplikasi" hanya untuk VM yang dibuat <= sekian hari lalu
 [ -f /etc/wol-update.conf ] && . /etc/wol-update.conf
 
 # Migrasi dari versi lama (tanpa TERM_USER): terminal web pindah dari root ke user biasa,
@@ -37,12 +41,14 @@ if [ -z "$TERM_USER" ] && [ "$(id -u)" = 0 ] && [ -w /etc/wol-update.conf ]; the
   echo "TERM_USER=\"$TERM_USER\"" >> /etc/wol-update.conf
 fi
 
-CMD="${SSH_ORIGINAL_COMMAND:-${1:-status}}"
+CMD="${SSH_ORIGINAL_COMMAND:-${*:-status}}"
+ARG="${CMD#* }"; [ "$ARG" = "$CMD" ] && ARG=""
 CMD="${CMD%% *}"
+ARG="${ARG%% *}"
 
 exec 9>/run/wol-update.lock
 case "$CMD" in
-  os-upgrade|app-update|reboot|self-update)
+  os-upgrade|app-update|reboot|self-update|app-install)
     flock -n 9 || { echo "error=Sedang ada proses update lain di VM ini."; exit 75; } ;;
 esac
 
@@ -84,6 +90,74 @@ app_info() {  # $1 = fetch untuk mengambil info commit terbaru dari GitHub
   echo "app_dirty=$dirty"
 }
 
+# Katalog aplikasi yang boleh dipasang lewat panel (kode -> repo|folder|pemilik kode|subdomain).
+# Repo & folder ditentukan DI SINI (bukan oleh panel): kunci panel hanya bisa memilih kode.
+# pemilik "user" = Pusat & Jurnal: kode di-clone sebagai TERM_USER (skrip pasangnya menolak folder milik root).
+app_catalog() {
+  case "$1" in
+    pusat)      echo "pusat-sekolah|/var/www/pusat-sekolah|user|pusat" ;;
+    web)        echo "web-pusat|/var/www/web-pusat|root|@" ;;
+    jurnal)     echo "jurnal-pusat|/var/www/jurnal|user|jurnal" ;;
+    bk)         echo "bk-pusat|/var/www/bk-pusat|root|bk" ;;
+    tu)         echo "tu-pusat|/var/www/tu-pusat|root|tu" ;;
+    pkl)        echo "pkl-pusat|/var/www/pkl-pusat|root|pkl" ;;
+    tanggungan) echo "tanggungan-pusat|/var/www/tanggungan|root|tanggungan" ;;
+    backup)     echo "backup-master|/var/www/backup-master|root|-" ;;
+    *) return 1 ;;
+  esac
+}
+
+vm_age_days() {  # umur VM dari waktu lahir /etc/machine-id (dibuat saat OS dipasang)
+  local t; t="$(stat -c %W /etc/machine-id 2>/dev/null)"
+  { [ -z "$t" ] || [ "$t" = 0 ] || [ "$t" = "-" ]; } && t="$(stat -c %Y /etc/machine-id 2>/dev/null || echo 0)"
+  echo $(( ($(date +%s) - t) / 86400 ))
+}
+
+is_fresh() {  # VM baru (<= FRESH_DAYS hari) dan belum ada aplikasi apa pun
+  [ -z "$APP_DIR" ] || return 1
+  [ "$(vm_age_days)" -le "$FRESH_DAYS" ] || return 1
+  local d
+  for d in /var/www/*/ /root/wol-panel/ /opt/wol-panel/; do
+    [ -d "$d" ] || continue
+    case "$d" in /var/www/html/) continue ;; esac
+    return 1
+  done
+  return 0
+}
+
+fresh_info() {
+  echo "vm_age_days=$(vm_age_days)"
+  if is_fresh; then echo "fresh=1"; else echo "fresh=0"; fi
+}
+
+app_install() {
+  local info repo dir owner sub url domain
+  info="$(app_catalog "$1")" || { echo "error=Kode aplikasi tidak dikenal: $1"; exit 64; }
+  is_fresh || { echo "error=Pasang aplikasi hanya untuk VM baru (<= $FRESH_DAYS hari) yang belum berisi aplikasi."; exit 65; }
+  IFS='|' read -r repo dir owner sub <<<"$info"
+  url="https://github.com/andieawan/$repo.git"
+  case "$sub" in "@") domain="$DOMAIN_BASE" ;; "-") domain="" ;; *) domain="$sub.$DOMAIN_BASE" ;; esac
+  echo "==> Memasang $1 dari $url ke $dir"
+  apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null || { echo "error: gagal memasang git."; exit 1; }
+  install -d -m 755 /var/www
+  if [ "$owner" = user ]; then
+    [ -n "$TERM_USER" ] && [ "$TERM_USER" != root ] || { echo "error: VM ini belum punya user biasa (skrip pasang $1 menolak folder milik root). Buat user lalu jalankan ulang perintah pasang wol-update."; exit 1; }
+    install -d -o "$TERM_USER" -g "$(id -gn "$TERM_USER")" "$dir"
+    runuser -u "$TERM_USER" -- git clone --quiet "$url" "$dir" || { echo "error: git clone gagal."; exit 1; }
+  else
+    git clone --quiet "$url" "$dir" || { echo "error: git clone gagal."; exit 1; }
+  fi
+  echo "==> Menjalankan deploy/install.sh (beberapa menit)"
+  cd "$dir"
+  if [ "$1" = backup ]; then
+    LOKASI="Utama (Proxmox)" bash deploy/install.sh </dev/null || exit 1
+  else
+    DOMAIN="$domain" APP_URL="https://$domain" PROXY_IP="$PROXY_IP" bash deploy/install.sh </dev/null || exit 1
+  fi
+  sed -i '/^APP_DIR=/d' /etc/wol-update.conf; echo "APP_DIR=\"$dir\"" >> /etc/wol-update.conf
+  echo; echo "Selesai: $1 terpasang di $dir.${domain:+ Alamat: https://$domain (atur Proxy Host di NPMplus).}"
+}
+
 app_health() {  # keluaran health_*=… ; health_ok=1 bila semua layanan aktif dan halaman aplikasi menjawab 200
   local ok=1 svc=() u st url host code=""
   for u in nginx apache2 mariadb mysql wol-panel $(systemctl list-unit-files --type=service --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
@@ -111,7 +185,7 @@ app_health() {  # keluaran health_*=… ; health_ok=1 bila semua layanan aktif d
 
 case "$CMD" in
   status)
-    os_info; app_info ;;
+    os_info; fresh_info; app_info ;;
   health)
     echo "version=$WOL_UPDATE_VERSION"; app_health ;;
   check)
@@ -124,6 +198,7 @@ case "$CMD" in
     printf '%s\n' "$list" | grep . | head -300 |
       sed -E 's#^([^/]+)/([^ ]+) ([^ ]+) [^ ]+ \[upgradable from: ([^]]+)\]$#pkg=\1|\4|\3|\2#' | grep '^pkg=' || true
     app_info fetch
+    fresh_info
     app_health
     echo "checked=$(date +%s)" ;;
   os-upgrade)
@@ -139,6 +214,8 @@ case "$CMD" in
       as_owner git -C "$APP_DIR" fetch --quiet 2>/dev/null || true
     fi
     cd "$APP_DIR" && bash deploy/update.sh </dev/null ;;
+  app-install)
+    app_install "$ARG" ;;
   reboot)
     # ditunda 3 detik agar sesi SSH panel selesai rapi; berjalan di VM maupun container LXC
     if systemd-run --quiet --on-active=3 --unit="wol-reboot-$(date +%s)" systemctl reboot; then
