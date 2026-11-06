@@ -361,8 +361,9 @@ VM yang **baru dibuat (≤ 7 hari, dihitung dari waktu OS dipasang) dan belum be
    pasang wol-update di konsol VM. Klik **Cek**.
 2. Pilih aplikasinya (yang IP-nya cocok sudah terpilih) → **Pasang aplikasi**. Log berjalan langsung di kartu (±5–10 menit).
 3. Sesudah selesai: atur Proxy Host di NPMplus. Hanya **Pusat** yang perlu admin pertama: buat lewat **Terminal**
-   (perintahnya tertulis di akhir log). Jurnal dan aplikasi lain memakai akun Pusat (beri peran admin di Pusat → Akun).
-   Website & Backup Master mencetak kredensial admin di log — catat lalu ganti password.
+   (perintahnya tertulis di akhir log). Semua admin & user aplikasi lain dibuat di **Pusat → Akun**; akunnya (dan salinan
+   password) tersalin ke tiap aplikasi lewat webhook & sinkron tiap jam, jadi tetap bisa login lokal saat Pusat mati.
+   Backup Master (tidak tersambung ke Pusat) mencetak kredensial adminnya di log — catat lalu ganti password.
 
 Keamanan: daftar aplikasi, alamat repo GitHub, dan folder tujuan ditulis di `wol-update` (di VM), bukan dikirim panel —
 panel hanya memilih kode (`pusat`, `web`, `jurnal`, `bk`, `tu`, `pkl`, `tanggungan`, `backup`). `wol-update` menolak
