@@ -4,6 +4,7 @@
 # (forced command): panel hanya bisa menjalankan perintah di bawah ini, bukan shell bebas.
 #
 #   status       info OS, uptime, versi aplikasi
+#   health       cek aplikasi hidup: layanan (nginx, php-fpm, mariadb, …) + halaman /up aplikasi Laravel
 #   check        apt-get update + daftar paket yang bisa di-update + commit baru di repo
 #   os-upgrade   apt-get upgrade (aman, tanpa menghapus paket)
 #   app-update   menjalankan deploy/update.sh milik aplikasi
@@ -11,7 +12,7 @@
 #   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=5
+WOL_UPDATE_VERSION=6
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -83,9 +84,36 @@ app_info() {  # $1 = fetch untuk mengambil info commit terbaru dari GitHub
   echo "app_dirty=$dirty"
 }
 
+app_health() {  # keluaran health_*=… ; health_ok=1 bila semua layanan aktif dan halaman aplikasi menjawab 200
+  local ok=1 svc=() u st url host code=""
+  for u in nginx apache2 mariadb mysql wol-panel $(systemctl list-unit-files --type=service --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
+    u="${u%.service}"
+    systemctl list-unit-files --no-legend "$u.service" 2>/dev/null | grep -q enabled || continue
+    st="$(systemctl is-active "$u" 2>/dev/null)"; svc+=("$u:$st")
+    [ "$st" = active ] || ok=0
+  done
+  echo "health_svc=$(IFS=,; echo "${svc[*]}")"
+  if [ -n "$APP_DIR" ] && [ -f "$APP_DIR/artisan" ]; then
+    url="$(sed -n 's/^APP_URL=//p' "$APP_DIR/.env" 2>/dev/null | tail -1 | tr -d "\"' \r")"
+    host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H "Host: ${host:-localhost}" http://127.0.0.1/up 2>/dev/null)"
+    echo "health_url=http://${host:-localhost}/up"
+  elif [ -n "$APP_DIR" ] && [ -f "$APP_DIR/wol.py" ]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8080/login 2>/dev/null)"
+    echo "health_url=http://127.0.0.1:8080/login"
+  fi
+  if [ -n "$code" ]; then
+    echo "health_http=$code"
+    [ "$code" = 200 ] || ok=0
+  fi
+  echo "health_ok=$ok"
+}
+
 case "$CMD" in
   status)
     os_info; app_info ;;
+  health)
+    echo "version=$WOL_UPDATE_VERSION"; app_health ;;
   check)
     os_info
     if ! out="$(apt-get update -qq 2>&1)"; then echo "apt_error=$(echo "$out" | tail -1)"; fi
@@ -96,6 +124,7 @@ case "$CMD" in
     printf '%s\n' "$list" | grep . | head -300 |
       sed -E 's#^([^/]+)/([^ ]+) ([^ ]+) [^ ]+ \[upgradable from: ([^]]+)\]$#pkg=\1|\4|\3|\2#' | grep '^pkg=' || true
     app_info fetch
+    app_health
     echo "checked=$(date +%s)" ;;
   os-upgrade)
     echo "==> apt-get update"; apt-get update || exit 1

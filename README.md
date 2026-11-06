@@ -352,6 +352,29 @@ sed -i '/wol-panel-update$/d' /root/.ssh/authorized_keys
 rm -f /usr/local/sbin/wol-update /etc/wol-update.conf
 ```
 
+### Cek aplikasi hidup, status backup, dan notifikasi
+
+**Cek aplikasi.** Selain port SSH, panel memeriksa aplikasinya sendiri lewat `wol-update health` (setiap 5 menit, bisa
+diubah di **Pengaturan → Umum**): layanan yang aktif di VM (nginx, PHP-FPM, MariaDB/MySQL, wol-panel) harus *active*,
+dan halaman `/up` aplikasi Laravel (alamat dari `APP_URL` di `.env`, diminta langsung ke nginx di VM) harus menjawab 200.
+Hasilnya tampil sebagai *Aplikasi OK* atau *Aplikasi bermasalah: …* di menu Server dan Beranda. Setelah **Update OS** atau
+**Update aplikasi** selesai, panel langsung mengecek lagi dan menulis hasilnya di akhir log. Butuh wol-update versi 6
+(klik **Perbarui wol-update**).
+
+**Status backup dari Backup Master.** Bila panel disambungkan ke Backup Master (**Pengaturan → Umum → Backup Master &
+notifikasi**: alamat, mis. `http://192.168.10.30`, dan kunci API `BM_API_KUNCI`), tiap kartu VM menampilkan umur backup
+terakhirnya (*Backup 5 jam lalu*, atau tanda ⚠ bila Backup Master melihat masalah), dan jendela konfirmasi **Update
+aplikasi** menyebut kapan backup terakhir dibuat. VM dicocokkan lewat IP sumber di Backup Master. Data diambil tiap 10 menit;
+hanya ringkasan, bukan isi backup.
+
+**Notifikasi Telegram** lewat bot Backup Master (panel tidak menyimpan token bot). Pilih kejadiannya di pengaturan yang sama:
+- VM tidak terjangkau ±3 menit, dan saat kembali terjangkau;
+- aplikasi bermasalah (2 kali cek berturut-turut, atau langsung setelah update), dan saat pulih;
+- ada update keamanan OS (sekali per jumlah baru);
+- update / reboot dari panel gagal.
+Tombol **Kirim notifikasi tes** memastikan sambungannya. Di Backup Master isi `BM_TELEGRAM_TOKEN`, `BM_TELEGRAM_CHAT`,
+`BM_API_KUNCI`, dan `BM_API_IP` (IP panel).
+
 ### Terminal web (menu Terminal)
 
 Terminal web adalah shell root ke VM langsung dari browser, jadi tidak perlu PuTTY. Karena aksesnya sangat besar,

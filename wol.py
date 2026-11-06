@@ -70,6 +70,9 @@ PENDING_MAX = 300
 SHUTDOWN_DELAY = 10  # detik peringatan di layar sebelum komputer mati
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
+# Notifikasi Telegram lewat Backup Master (Pengaturan → Umum). kunci => label
+NOTIFY_EVENTS = {"down": "VM tidak terjangkau / kembali terjangkau", "health": "Aplikasi di VM bermasalah / pulih",
+                 "security": "Ada update keamanan OS", "failed": "Update / reboot dari panel gagal"}
 
 
 # ---------------------------------------------------------------- konfigurasi
@@ -87,6 +90,10 @@ def migrate(cfg):
     cfg.setdefault("vms", [])
     cfg.setdefault("vm_check_hours", 6)
     cfg.setdefault("pending", [])
+    cfg.setdefault("health_minutes", 5)
+    cfg.setdefault("bm_url", "")
+    cfg.setdefault("bm_key", "")
+    cfg.setdefault("notify", {k: True for k in NOTIFY_EVENTS})
     for d in cfg.get("devices", []) + cfg.get("pending", []):
         d.setdefault("kind", "lab" if "lab" in str(d.get("group", "")).lower() else "desktop")
     if cfg.get("join"):  # perintah daftar lama (satu untuk semua) -> per jenis
@@ -985,7 +992,11 @@ def vm_check(vm, user="otomatis"):
         st["error"] = err
         if data and not err:
             st["data"] = data
+            if health_from(data):
+                st["health"] = health_from(data)
         save_vmstate()
+    if data and not err:
+        note_security(vm, data)
     return err
 
 
@@ -1033,6 +1044,21 @@ def run_vm_job(vm, action, user, steps=None):
                         log.write(f"[panel] Langkah berikutnya dibatalkan karena {VM_ACTIONS.get(act, act)} gagal.\n")
                     break
         action = job["action"]
+        if rc == 0 and set(steps) & {"app-update", "os-upgrade"}:
+            time.sleep(5)  # beri waktu PHP-FPM/nginx selesai reload
+            h = vm_health(vm)
+            with open(path, "a", encoding="utf-8") as log:
+                if h.get("old"):
+                    log.write("\n[panel] Cek aplikasi dilewati: wol-update di VM ini belum versi 6 (Perbarui wol-update).\n")
+                elif h.get("error"):
+                    log.write(f"\n[panel] Cek aplikasi gagal: {h['error']}\n")
+                else:
+                    prob = health_problem(h)
+                    log.write(f"\n[panel] Cek aplikasi setelah update: {'BERMASALAH — ' + prob if prob else 'OK'}"
+                              f" (HTTP {h.get('http') or '-'}, layanan: {h.get('svc') or '-'})\n")
+            note_health(vm, h, now=True)
+        if rc != 0:
+            notify("failed", f"❌ {VM_ACTIONS.get(action, action)} di {vm['name']} gagal (kode {rc}) oleh {user}. Lihat log di WOL Panel → Server.")
         job["rc"], job["end"] = rc, int(time.time())
         with VM_LOCK:
             st = VMSTATE.setdefault(vm["id"], {})
@@ -1123,6 +1149,224 @@ def check_all_vms(only_due=True):
             vm_check(vm)
         except Exception as e:
             print("cek VM gagal", vm["id"], e, file=sys.stderr)
+
+
+# ------------------------------------------------------- kesehatan aplikasi, status backup, notifikasi
+HEALTH_MIN_VERSION = 6   # wol-update mulai versi ini punya perintah "health"
+BM_STATE = {}            # {"time", "apps": [...], "error", "notify_error", "notify_time"}
+MON = {}                 # id VM -> {"fail": n gagal SSH berturut, "down": bool, "hbad": n, "hdown": bool}
+MON_LOCK = threading.Lock()
+BM_REFRESH = 600         # detik
+
+
+def health_from(d):
+    """Ambil hasil cek aplikasi dari keluaran wol-update (health / check)."""
+    if "health_ok" not in d:
+        return None
+    return {"time": int(time.time()), "ok": d.get("health_ok") == "1", "http": d.get("health_http", ""),
+            "url": d.get("health_url", ""), "svc": d.get("health_svc", "")}
+
+
+def health_problem(h):
+    """Kalimat singkat masalah aplikasi, '' bila sehat."""
+    if not h:
+        return ""
+    if h.get("error"):
+        return h["error"]
+    kata = {"failed": "gagal", "inactive": "mati", "activating": "sedang mulai", "deactivating": "sedang berhenti"}
+    bad = [x.split(":", 1)[0] + " " + kata.get(x.split(":", 1)[1], x.split(":", 1)[1] or "tidak aktif")
+           for x in (h.get("svc") or "").split(",") if ":" in x and not x.endswith(":active")]
+    code = h.get("http") or ""
+    if code and code != "200":
+        bad.insert(0, "halaman aplikasi tidak menjawab" if code in ("000", "") else f"halaman aplikasi HTTP {code}")
+    return ", ".join(bad) if bad or not h.get("ok") else ""
+
+
+def vm_health(vm):
+    """Cek aplikasi hidup lewat 'wol-update health' (layanan + halaman /up). Hasil disimpan di VMSTATE[...]['health']."""
+    try:
+        r = subprocess.run(ssh_cmd(vm, "health"), capture_output=True, text=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        h = {"time": int(time.time()), "error": "Cek aplikasi melebihi 45 detik."}
+    else:
+        d = parse_kv(r.stdout)
+        h = health_from(d) if r.returncode == 0 else None
+        if not h:
+            err = ssh_error(r.stderr + r.stdout, r.returncode)
+            h = {"time": int(time.time()), "error": err, "old": "tidak dikenal" in err}
+    with VM_LOCK:
+        VMSTATE.setdefault(vm["id"], {})["health"] = h
+        save_vmstate()
+    return h
+
+
+def bm_ready():
+    return bool(CFG.get("bm_url") and CFG.get("bm_key"))
+
+
+def bm_call(method, path, data=None, timeout=10):
+    """Panggil API Backup Master (kunci Bearer). Mengembalikan JSON; melempar Exception berisi pesan yang bisa dibaca."""
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(CFG["bm_url"].rstrip("/") + path, data=body, method=method, headers={
+        "Authorization": "Bearer " + CFG["bm_key"], "Accept": "application/json", "Content-Type": "application/json",
+        "User-Agent": "wol-panel"})
+    try:
+        with NO_PROXY.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("error") or ""
+        except Exception:
+            msg = ""
+        raise RuntimeError({401: "kunci API salah", 403: "IP panel tidak diizinkan (BM_API_IP)", 404: "API Backup Master belum aktif (BM_API_KUNCI)"}
+                           .get(e.code, msg or f"HTTP {e.code}")) from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise RuntimeError(f"Backup Master tidak terjangkau ({getattr(e, 'reason', e)})") from None
+
+
+def bm_refresh():
+    if not bm_ready():
+        BM_STATE.clear()
+        return
+    try:
+        apps = bm_call("GET", "/api/status").get("aplikasi") or []
+        BM_STATE.update(time=int(time.time()), apps=apps, error=None)
+    except RuntimeError as e:
+        BM_STATE.update(time=int(time.time()), error=str(e))
+
+
+def vm_backup(vm):
+    """Status backup VM ini dari Backup Master (dicocokkan lewat IP sumber), atau None."""
+    for a in BM_STATE.get("apps") or []:
+        if a.get("host") and a["host"] == vm["host"]:
+            return a
+    return None
+
+
+def notify(event, text):
+    """Kirim notifikasi lewat Backup Master → Telegram (latar belakang; gagal tidak menghentikan apa pun)."""
+    if not bm_ready() or not (CFG.get("notify") or {}).get(event):
+        return
+
+    def go():
+        try:
+            bm_call("POST", "/api/notifikasi", {"teks": text, "dari": "WOL Panel"}, timeout=20)
+            BM_STATE.update(notify_error=None, notify_time=int(time.time()))
+        except RuntimeError as e:
+            BM_STATE.update(notify_error=str(e), notify_time=int(time.time()))
+            print("notifikasi gagal:", e, file=sys.stderr)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def note_security(vm, d):
+    """Beri tahu sekali per jumlah update keamanan yang baru terlihat."""
+    sec, up = int(d.get("security") or 0), int(d.get("upgradable") or 0)
+    with VM_LOCK:
+        st = VMSTATE.setdefault(vm["id"], {})
+        last = st.get("notif_sec", 0)
+        st["notif_sec"] = sec
+    if sec > 0 and sec != last:
+        notify("security", f"🔒 {vm['name']}: {sec} update keamanan OS menunggu ({up} paket). Buka WOL Panel → Server untuk update.")
+
+
+def note_health(vm, h, now=False):
+    """Hitung hasil cek aplikasi; beri tahu setelah 2 kali bermasalah berturut-turut (atau langsung bila now) dan saat pulih."""
+    if not h or h.get("old") or (h.get("error") and not now):
+        return
+    prob = health_problem(h)
+    with MON_LOCK:
+        m = MON.setdefault(vm["id"], {})
+        m["hbad"] = m.get("hbad", 0) + 1 if prob else 0
+        if prob and not m.get("hdown") and (now or m["hbad"] >= 2):
+            m["hdown"] = True
+            msg = f"⚠️ Aplikasi di {vm['name']} ({vm['host']}) bermasalah: {prob}."
+        elif not prob and m.get("hdown"):
+            m["hdown"] = False
+            msg = f"✅ Aplikasi di {vm['name']} sudah normal lagi."
+        else:
+            return
+    notify("health", msg)
+
+
+def monitor_vms():
+    """Tiap menit: VM terjangkau? (beri tahu setelah ±3 menit mati). Cek aplikasi tiap health_minutes. Status backup tiap 10 menit."""
+    vms = [v for v in CFG.get("vms", []) if not vm_job_running(v["id"])
+           and time.time() - (VMSTATE.get(v["id"]) or {}).get("rebooting", 0) > 900]
+    up = vm_online_all()
+    for vm in vms:
+        ok = up.get(vm["id"], False)
+        msg = None
+        with MON_LOCK:
+            m = MON.setdefault(vm["id"], {})
+            if ok:
+                if m.get("down"):
+                    msg = f"✅ {vm['name']} ({vm['host']}) kembali terjangkau."
+                m["fail"], m["down"] = 0, False
+            else:
+                m["fail"] = m.get("fail", 0) + 1
+                if m["fail"] == 3 and not m.get("down"):
+                    m["down"] = True
+                    msg = f"🔴 {vm['name']} ({vm['host']}) tidak terjangkau sejak ±3 menit (SSH port {int(vm.get('port', 22))})."
+        if msg:
+            notify("down", msg)
+    every = int(CFG.get("health_minutes", 5)) * 60
+    for vm in vms:
+        st = VMSTATE.get(vm["id"]) or {}
+        h = st.get("health") or {}
+        ver = int((st.get("data") or {}).get("version") or 0)
+        if every <= 0 or not up.get(vm["id"]) or time.time() - h.get("time", 0) < every:
+            continue
+        if (h.get("old") or (ver and ver < HEALTH_MIN_VERSION)) and time.time() - h.get("time", 0) < 6 * 3600:
+            continue  # wol-update lama: coba lagi tiap 6 jam (mungkin sudah diperbarui)
+        try:
+            note_health(vm, vm_health(vm))
+        except Exception as e:
+            print("cek aplikasi", vm["id"], e, file=sys.stderr)
+    if bm_ready() and time.time() - BM_STATE.get("time", 0) >= BM_REFRESH:
+        bm_refresh()
+
+
+def monitor_loop():
+    time.sleep(20)
+    while True:
+        try:
+            monitor_vms()
+        except Exception as e:
+            print("pemantau VM:", e, file=sys.stderr)
+        time.sleep(60)
+
+
+def vm_status_tags(vm):
+    """Tanda kesehatan aplikasi & backup (dari Backup Master) untuk kartu VM."""
+    st = VMSTATE.get(vm["id"]) or {}
+    tags = []
+    h = st.get("health")
+    if h and h.get("old"):
+        tags.append('<span class="tag" title="Cek aplikasi butuh wol-update versi 6">Cek aplikasi: perbarui wol-update</span>')
+    elif h and not h.get("error"):
+        prob = health_problem(h)
+        title = E(f"{h.get('url', '')} · {h.get('svc', '')} · dicek {fmt_age(h.get('time'))}")
+        tags.append(f'<span class="tag bad" title="{title}">Aplikasi bermasalah: {E(prob)}</span>' if prob else
+                    f'<span class="tag ok" title="{title}">Aplikasi OK</span>')
+    if bm_ready():
+        b = vm_backup(vm)
+        if b:
+            age = (f"{b['umur_jam']:.0f} jam lalu" if (b.get("umur_jam") or 0) >= 1 else "< 1 jam lalu") if b.get("terbaru") else "belum ada"
+            if b.get("masalah"):
+                tags.append(f'<span class="tag warn" title="{E(" ".join(b["masalah"]))}">Backup: {E(age)} ⚠</span>')
+            else:
+                tags.append(f'<span class="tag ok" title="Backup Master · {E(b.get("nama", ""))}">Backup {E(age)}</span>')
+    return tags
+
+
+def backup_note(vm):
+    """Kalimat untuk jendela konfirmasi Update aplikasi."""
+    b = vm_backup(vm) if bm_ready() else None
+    if not b:
+        return ""
+    if not b.get("terbaru"):
+        return " Perhatian: Backup Master belum punya backup aplikasi ini."
+    return f" Backup terakhir di Backup Master: {b['umur_jam']:.0f} jam lalu" + (" (bermasalah: " + " ".join(b["masalah"]) + ")." if b.get("masalah") else ".")
 
 
 # ------------------------------------------------------- terminal web (dibatasi)
@@ -2514,6 +2758,7 @@ def home_servers(csrf):
                 tags.append('<span class="tag ok">Terbaru</span>')
         else:
             tags.append('<span class="tag">Belum dicek</span>')
+        tags += vm_status_tags(vm)
         lj = st.get("last_job")
         if lj and lj.get("rc") not in (0, None) and not running:
             tags.append(f'<span class="tag bad">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} gagal</span>')
@@ -2993,7 +3238,37 @@ Tanpa diisi pun, akses lewat proxy sudah dikenali dari header X-Forwarded-For.</
 <span class="hint">Dalam jam (1–720).</span></label>
 <label style="max-width:220px">Jeda Hidupkan semua<input name="wake_gap" type="number" min="2" max="300" value="{int(CFG.get('wake_gap', 10))}">
 <span class="hint">Detik antar komputer saat tombol Hidupkan semua dipakai (2–300). Makin banyak komputer per jalur listrik, makin besar jedanya.</span></label>
-<button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>"""
+<button class="btn primary" data-busy="Menyimpan…">Simpan</button></form></section>""" + settings_bm(csrf)
+
+
+def settings_bm(csrf):
+    """Sambungan ke Backup Master: status backup tiap VM + notifikasi Telegram lewat bot Backup Master."""
+    nt = CFG.get("notify") or {}
+    checks = "".join(f'<label class="check"><input type="checkbox" name="n_{k}" value="1" {"checked" if nt.get(k) else ""}><span>{E(v)}</span></label>'
+                     for k, v in NOTIFY_EVENTS.items())
+    if not bm_ready():
+        state = '<p class="mut small">Belum disambungkan.</p>'
+    elif BM_STATE.get("error"):
+        state = f'<div class="flash err">{icon("alert")}<div>{E(BM_STATE["error"])}</div></div>'
+    elif BM_STATE.get("time"):
+        state = f'<p class="small" style="color:var(--ok)">Tersambung · {len(BM_STATE.get("apps") or [])} aplikasi · dicek {E(fmt_age(BM_STATE["time"]))}</p>'
+    else:
+        state = '<p class="mut small">Tersimpan, belum dicek.</p>'
+    if BM_STATE.get("notify_error"):
+        state += f'<p class="small" style="color:var(--err)">Notifikasi terakhir gagal ({E(fmt_age(BM_STATE.get("notify_time")))}): {E(BM_STATE["notify_error"])}</p>'
+    test = (f'<form method="post" action="/settings/bm-test" style="margin-top:8px">{hidden(csrf)}<button class="btn sm" data-busy="Mengirim…">Kirim notifikasi tes</button></form>'
+            if bm_ready() else "")
+    return f"""<section class="card"><h2>Backup Master &amp; notifikasi</h2>
+<p class="mut small" style="margin-top:0">Menampilkan status backup tiap VM di menu Server dan mengirim notifikasi ke Telegram lewat bot Backup Master.
+Di <code>.env</code> Backup Master isi <code>BM_API_KUNCI</code> dan <code>BM_API_IP</code> (IP panel ini).</p>{state}
+<form method="post" action="/settings/bm">{hidden(csrf)}
+<div class="grid"><label>Alamat Backup Master<input name="bm_url" value="{E(CFG.get('bm_url', ''))}" placeholder="http://192.168.10.30" spellcheck="false"></label>
+<label>Kunci API<input name="bm_key" type="password" autocomplete="off" placeholder="{'tersimpan — kosongkan bila tidak diganti' if CFG.get('bm_key') else 'isi BM_API_KUNCI'}">
+<span class="hint">Kosongkan alamat untuk memutus sambungan.</span></label></div>
+<h3 style="margin:12px 0 6px">Kirim notifikasi bila</h3>{checks}
+<label style="max-width:240px;margin-top:10px">Cek aplikasi setiap (menit)<input name="health_minutes" type="number" min="0" max="1440" value="{int(CFG.get('health_minutes', 5))}">
+<span class="hint">Memeriksa layanan (nginx, PHP-FPM, MariaDB) dan halaman /up aplikasi di tiap VM. 0 = hanya saat Cek &amp; setelah update.</span></label>
+<button class="btn primary" data-busy="Menyimpan…">Simpan</button></form>{test}</section>"""
 
 
 def app_meta(a, osdate="", source=True):
@@ -3434,6 +3709,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                 tags.append(f'<span class="tag bad" title="{E(d["apt_error"])}">apt gagal</span>')
             if d.get("app_error"):
                 tags.append(f'<span class="tag bad" title="{E(d["app_error"])}">git fetch gagal</span>')
+        tags += vm_status_tags(vm)
         meta = [E(vm["host"])]
         if d.get("os"):
             meta.append(E(d["os"]))
@@ -3465,7 +3741,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                 b = d.get("app_behind", "?")
                 btns.append(act("app-update", "Update aplikasi", "primary" if b not in ("0", "?") else "",
                                 f"deploy/update.sh akan dijalankan: backup database, mode pemeliharaan, git pull, composer, migrasi, "
-                                f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit.", f"Update aplikasi di {vm['name']}?"))
+                                f"lalu aplikasi aktif lagi. Aplikasi tidak bisa diakses selama ±1 menit." + backup_note(vm), f"Update aplikasi di {vm['name']}?"))
         more_btns = []
         if d and VM_SELF_UPDATE_MIN <= int(d.get("version") or 0) < vm_template_version():
             btns.append(act("self-update", "Perbarui wol-update", "primary",
@@ -4097,6 +4373,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_user_delete(form, user, ip)
             if path == "/settings/general":
                 return self.do_general(form, user, ip)
+            if path == "/settings/bm":
+                return self.do_bm(form, user, ip)
+            if path == "/settings/bm-test":
+                return self.do_bm_test(user, ip)
         self._send(404, "Tidak ditemukan")
 
     def do_login(self, form, ip):
@@ -4759,6 +5039,44 @@ class Handler(BaseHTTPRequestHandler):
         write_log(user, "pengaturan-umum", "-", ip)
         return self.back("/settings", "Pengaturan umum disimpan.", tab="umum")
 
+    def do_bm(self, form, user, ip):
+        url = form.get("bm_url", "").strip().rstrip("/")
+        if url and not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d{1,5})?", url):
+            return self.back("/settings", "Alamat Backup Master harus seperti http://192.168.10.30 (tanpa jalur).", True, tab="umum")
+        try:
+            mins = int(form.get("health_minutes") or 0)
+            if not 0 <= mins <= 1440:
+                raise ValueError
+        except ValueError:
+            return self.back("/settings", "Cek aplikasi harus 0–1440 menit.", True, tab="umum")
+        key = form.get("bm_key", "").strip()
+        if key:
+            CFG["bm_key"] = key
+        CFG["bm_url"] = url
+        if not url:
+            CFG["bm_key"] = ""
+        CFG["notify"] = {k: form.get(f"n_{k}") == "1" for k in NOTIFY_EVENTS}
+        CFG["health_minutes"] = mins
+        save_config(CFG)
+        write_log(user, "pengaturan-backup-master", url or "-", ip)
+        if not bm_ready():
+            BM_STATE.clear()
+            return self.back("/settings", "Sambungan Backup Master dimatikan." if not url else "Isi juga kunci API.", bool(url), tab="umum")
+        bm_refresh()
+        if BM_STATE.get("error"):
+            return self.back("/settings", f"Tersimpan, tetapi Backup Master: {BM_STATE['error']}.", True, tab="umum")
+        return self.back("/settings", f"Tersambung ke Backup Master ({len(BM_STATE.get('apps') or [])} aplikasi).", tab="umum")
+
+    def do_bm_test(self, user, ip):
+        if not bm_ready():
+            return self.back("/settings", "Sambungkan Backup Master dulu.", True, tab="umum")
+        try:
+            bm_call("POST", "/api/notifikasi", {"teks": f"🔔 Tes notifikasi dari WOL Panel oleh {user}.", "dari": "WOL Panel"}, timeout=20)
+        except RuntimeError as e:
+            return self.back("/settings", f"Notifikasi gagal: {e}.", True, tab="umum")
+        write_log(user, "tes-notifikasi", "-", ip)
+        return self.back("/settings", "Notifikasi tes terkirim — cek Telegram.", tab="umum")
+
 
 # -------------------------------------------------------------------- CLI
 def ask(prompt, default=""):
@@ -4845,6 +5163,7 @@ def main():
         load_vmstate()
         threading.Thread(target=term_reaper, daemon=True).start()
         threading.Thread(target=scanner_loop, daemon=True).start()
+        threading.Thread(target=monitor_loop, daemon=True).start()
         ThreadingHTTPServer(addr, Handler).serve_forever()
         return
     print(__doc__)
