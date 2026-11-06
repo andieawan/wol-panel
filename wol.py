@@ -887,6 +887,10 @@ VM_TOKENS = {}        # token pasang -> (id VM, kedaluwarsa)
 VM_ACTIONS = {"check": "Cek pembaruan", "os-upgrade": "Update OS", "app-update": "Update aplikasi", "reboot": "Reboot",
               "self-update": "Perbarui wol-update"}
 VM_SELF_UPDATE_MIN = 3   # wol-update mulai versi ini bisa memperbarui dirinya
+# VM aplikasi sekolah (susunan IP 192.168.10.x, sama dengan Backup Master) untuk isian cepat "Tambah VM".
+SCHOOL_VMS = (("Pusat Sekolah", "192.168.10.20"), ("Website Sekolah", "192.168.10.21"), ("Jurnal Guru", "192.168.10.22"),
+              ("Bimbingan Konseling", "192.168.10.23"), ("Tata Usaha", "192.168.10.24"), ("Manajemen PKL", "192.168.10.25"),
+              ("Tanggungan Siswa", "192.168.10.26"), ("WOL Panel", "192.168.10.28"), ("Backup Master", "192.168.10.30"))
 
 
 def vm_template_version():
@@ -3522,14 +3526,19 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
 
     if not cards:
         cards.append(f'<div class="card empty">{icon("monitor")}<h3 style="margin:8px 0 4px">Belum ada VM</h3>'
-                     '<p class="small" style="margin:0">Tambahkan VM aplikasi (Pusat, Absensi, BK, …) di bawah.</p></div>')
+                     '<p class="small" style="margin:0">Tambahkan VM aplikasi (Pusat, Jurnal, BK, …) di bawah.</p></div>')
     ed = next((v for v in vms if v["id"] == q.get("edit", [""])[0]), None)
     fv = lambda k, dflt="": E(q[f"f_{k}"][0] if f"f_{k}" in q else str((ed or {}).get(k, dflt)))
+    taken = {v["host"] for v in vms}
+    quick = [(n, h) for n, h in SCHOOL_VMS if h not in taken] if not ed else []
+    quick_html = ('<p class="mut small" style="margin:0 0 10px">Isi cepat: ' + " ".join(
+        f'<a class="tag" href="/servers?{E(urlencode({"f_name": n, "f_host": h}))}#form-vm" title="{E(h)}">{E(n)}</a>' for n, h in quick)
+        + '</p>') if quick else ""
     add = f"""<details class="card" id="form-vm" style="padding:0"{" open" if not vms or ed or q.get("f_name") else ""}>
 <summary style="list-style:none;cursor:pointer;padding:14px 16px;display:flex;align-items:center;gap:8px;font-weight:600">{icon('plus') if not ed else ''}{'Ubah ' + E(ed['name']) if ed else 'Tambah VM'}</summary>
-<form method="post" action="/servers/add" style="padding:0 16px 16px">{hidden(csrf, orig=ed['id'] if ed else '')}
-<div class="grid"><label>Nama<input name="name" required maxlength="60" placeholder="mis. VM Absensi" value="{fv('name')}"></label>
-<label>IP / host<input name="host" required maxlength="100" placeholder="mis. 192.168.10.21" spellcheck="false" value="{fv('host')}"></label>
+<form method="post" action="/servers/add" style="padding:0 16px 16px">{hidden(csrf, orig=ed['id'] if ed else '')}{quick_html}
+<div class="grid"><label>Nama<input name="name" required maxlength="60" placeholder="mis. Jurnal Guru" value="{fv('name')}"></label>
+<label>IP / host<input name="host" required maxlength="100" placeholder="mis. 192.168.10.22" spellcheck="false" value="{fv('host')}"></label>
 <label>Port SSH<input name="port" type="number" min="1" max="65535" value="{fv('port', '22')}"></label></div>
 <div class="acts"><button class="btn primary" data-busy="Menyimpan…">{'Simpan perubahan' if ed else 'Tambah VM'}</button>
 {'<a class="btn quiet" href="/servers">Batal</a>' if ed else ''}</div></form></details>"""

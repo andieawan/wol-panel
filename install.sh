@@ -52,7 +52,33 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 
+# Backup harian data panel ke /var/backups/wol-panel (ditarik Backup Master).
+# Skrip disimpan milik root di luar $DIR (folder $DIR milik wolpanel; skrip yang dijalankan root tidak boleh bisa diubahnya).
+install -o root -g root -m 755 "$(dirname "$0")/deploy/backup.sh" /usr/local/sbin/wol-panel-backup
+cat > /etc/systemd/system/wol-panel-backup.service <<EOF
+[Unit]
+Description=Backup data WOL Panel
+
+[Service]
+Type=oneshot
+Environment=WOL_DIR=$DIR
+ExecStart=/usr/local/sbin/wol-panel-backup
+EOF
+cat > /etc/systemd/system/wol-panel-backup.timer <<EOF
+[Unit]
+Description=Backup harian WOL Panel
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
+systemctl enable --now wol-panel-backup.timer >/dev/null 2>&1 || true
 systemctl enable wol-panel >/dev/null 2>&1
 if [ -n "${WOL_DEFER_RESTART:-}" ]; then
   systemd-run --quiet --on-active=5 --unit="wol-panel-restart-$(date +%s)" systemctl restart wol-panel
