@@ -13,7 +13,7 @@
 #   app-install KODE  pasang aplikasi sekolah dari katalog di bawah — HANYA di VM yang masih baru & kosong (fresh=1)
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=7
+WOL_UPDATE_VERSION=8
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -107,10 +107,12 @@ app_catalog() {
   esac
 }
 
-vm_age_days() {  # umur VM dari waktu lahir /etc/machine-id (dibuat saat OS dipasang)
-  local t; t="$(stat -c %W /etc/machine-id 2>/dev/null)"
-  { [ -z "$t" ] || [ "$t" = 0 ] || [ "$t" = "-" ]; } && t="$(stat -c %Y /etc/machine-id 2>/dev/null || echo 0)"
-  echo $(( ($(date +%s) - t) / 86400 ))
+vm_age_days() {  # umur VM dari /etc/machine-id: dibuat saat OS dipasang, atau saat boot pertama klon template
+  # (template Proxmox mengosongkan machine-id; isinya ditulis ulang di boot pertama -> waktu ubah = waktu klon)
+  local b m; b="$(stat -c %W /etc/machine-id 2>/dev/null)"; m="$(stat -c %Y /etc/machine-id 2>/dev/null || echo 0)"
+  case "$b" in ''|-|0) b=0 ;; esac
+  [ "$b" -gt "$m" ] && m="$b"
+  echo $(( ($(date +%s) - m) / 86400 ))
 }
 
 is_fresh() {  # VM baru (<= FRESH_DAYS hari) dan belum ada aplikasi apa pun

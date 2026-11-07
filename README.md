@@ -354,7 +354,7 @@ rm -f /usr/local/sbin/wol-update /etc/wol-update.conf
 
 ### Pasang aplikasi di VM baru
 
-VM yang **baru dibuat (≤ 7 hari, dihitung dari waktu OS dipasang) dan belum berisi aplikasi apa pun** (tidak ada folder di
+VM yang **baru dibuat (≤ 7 hari, dihitung dari waktu OS dipasang atau boot pertama klon template — lihat di bawah) dan belum berisi aplikasi apa pun** (tidak ada folder di
 `/var/www` selain `html`) mendapat kotak **Pasang aplikasi** di kartunya. Kotak ini tidak muncul di VM lain.
 
 1. Buat VM (Ubuntu 24.04 + user biasa), lalu **Server → Tambah VM** (*Isi cepat* sesuai susunan IP) dan jalankan perintah
@@ -370,6 +370,10 @@ panel hanya memilih kode (`pusat`, `web`, `jurnal`, `bk`, `tu`, `pkl`, `tanggung
 `app-install` di VM yang sudah berisi aplikasi atau lebih tua dari 7 hari, walau panel memintanya. Domain bawaan
 `<subdomain>.smkibupakusari.sch.id` dan batas hari bisa diganti di `/etc/wol-update.conf` (`DOMAIN_BASE`, `FRESH_DAYS`).
 Butuh wol-update versi 7.
+
+**Template VM di Proxmox.** Sebelum *Convert to template*, kosongkan machine-id di VM itu
+(`sudo truncate -s 0 /etc/machine-id && sudo rm -f /var/lib/dbus/machine-id`). Tiap klon lalu membuat machine-id baru di
+boot pertamanya, sehingga dihitung sebagai VM baru (dan tidak berbagi identitas dengan klon lain). Butuh wol-update versi 8.
 
 ### Cek aplikasi hidup, status backup, dan notifikasi
 
