@@ -957,13 +957,29 @@ def ssh_cmd(vm, action):
             f"{vm.get('user', 'root')}@{vm['host']}", action]
 
 
+HOSTKEY_MSG = "Kunci host VM berubah (VM dibuat ulang / klon baru?). Klik Pakai VM baru bila memang VM ini dipasang ulang."
+
+
+def forget_hostkey(vm):
+    """Hapus kunci host lama VM dari known_hosts panel (VM dibuat ulang di IP yang sama)."""
+    kh = os.path.join(SSH_DIR, "known_hosts")
+    port = int(vm.get("port", 22))
+    name = vm["host"] if port == 22 else f"[{vm['host']}]:{port}"
+    if os.path.exists(kh):
+        subprocess.run(["ssh-keygen", "-R", name, "-f", kh], capture_output=True, timeout=20)
+        try:
+            os.remove(kh + ".old")
+        except OSError:
+            pass
+
+
 def ssh_error(text, rc):
     t = (text or "").strip().splitlines()
     last = t[-1] if t else ""
     if "Permission denied" in last:
         return "Kunci panel ditolak VM — jalankan perintah pasang di VM ini."
     if "Host key verification failed" in last or "REMOTE HOST IDENTIFICATION" in (text or ""):
-        return "Kunci host VM berubah (VM dipasang ulang?). Hapus lalu tambahkan lagi VM ini di panel."
+        return HOSTKEY_MSG
     if "timed out" in last or "No route" in last or "Connection refused" in last:
         return "VM tidak terjangkau lewat SSH (mati, IP salah, atau SSH belum aktif)."
     if last.startswith("error="):
@@ -3700,6 +3716,12 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
         tags = []
         if st.get("error"):
             tags.append(f'<span class="tag bad">{E(st["error"])}</span>')
+        if st.get("error") == HOSTKEY_MSG and not running:
+            install_box_pre = (f'<form method="post" action="/servers/new-host" style="margin-top:8px" '
+                               f'{confirm("Kunci host lama " + vm["host"] + " dilupakan, lalu perintah pasang wol-update untuk VM baru ini ditampilkan. Lakukan hanya bila VM di IP ini memang baru dibuat ulang (bukan disusupi).", "Pakai VM baru", "VM " + vm["name"] + " dibuat ulang?")}>'
+                               f'{hidden(csrf, id=vm["id"])}<button class="btn sm primary">Pakai VM baru</button></form>')
+        else:
+            install_box_pre = ""
         if d:
             up = int(d.get("upgradable") or 0)
             sec = int(d.get("security") or 0)
@@ -3830,7 +3852,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
 <div class="dev-head"><div><h2>{E(vm['name'])}</h2><div class="meta">{' · '.join(meta)}</div>{app_line}
 <div class="mut small">Dicek {E(fmt_age(st.get('checked')))}</div></div></div>
 <div class="acts">{''.join(tags) or '<span class="tag">Belum dicek</span>'}</div>
-{jobline}{logbox}{install_box}{detail}
+{install_box_pre}{jobline}{logbox}{install_box}{detail}
 <div class="dev-acts">{''.join(btns)}</div></article>""")
 
     if not cards:
@@ -4326,6 +4348,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/servers/delete":
                 return self.do_vm_delete(form, user, ip)
             if path == "/servers/install":
+                return self.do_vm_install(form, user, ip)
+            if path == "/servers/new-host":
+                vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
+                if not vm:
+                    return self.back("/servers", "VM tidak ditemukan.", True)
+                forget_hostkey(vm)
+                with VM_LOCK:
+                    VMSTATE[vm["id"]] = {}  # data VM lama tidak berlaku
+                    save_vmstate()
+                write_log(user, "vm-kunci-host-baru", vm["id"], ip)
                 return self.do_vm_install(form, user, ip)
             if path == "/servers/interval":
                 return self.do_vm_interval(form, user, ip)
