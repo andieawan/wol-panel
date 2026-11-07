@@ -1180,18 +1180,111 @@ def wait_vm_back(vm):
         save_vmstate()
 
 
-def check_all_vms(only_due=True):
+CHECK_ALL = {}           # tombol "Cek semua": {"start", "end", "by", "ids", "names", "cur", "res": {id: {"ok","msg","t"}}, "skip": {id: alasan}}
+CHECK_ALL_LOCK = threading.Lock()
+CHECK_ALL_SHOW = 900    # detik: tanda "Sudah dicek" tetap tampil setelah Cek semua selesai
+
+
+def check_all_active():
+    return bool(CHECK_ALL) and CHECK_ALL.get("end") is None
+
+
+def check_all_begin(user):
+    """Siapkan antrean Cek semua (langsung tampil di halaman). False bila masih ada Cek semua yang berjalan."""
+    with CHECK_ALL_LOCK:
+        if check_all_active():
+            return False
+        vms = list(CFG.get("vms", []))
+        CHECK_ALL.clear()
+        CHECK_ALL.update({"start": int(time.time()), "end": None, "by": user, "ids": [v["id"] for v in vms],
+                          "names": {v["id"]: v["name"] for v in vms}, "cur": None, "res": {}, "skip": {}})
+    return True
+
+
+def check_all_vms(only_due=True, track=False):
+    """Cek VM satu per satu. track=True (tombol Cek semua, setelah check_all_begin): kemajuan per VM dicatat di CHECK_ALL."""
     hours = float(CFG.get("vm_check_hours", 6))
-    for vm in list(CFG.get("vms", [])):
-        last = (VMSTATE.get(vm["id"]) or {}).get("checked", 0)
-        if only_due and (hours <= 0 or time.time() - last < hours * 3600):
-            continue
-        if vm_job_running(vm["id"]):
-            continue
-        try:
-            vm_check(vm)
-        except Exception as e:
-            print("cek VM gagal", vm["id"], e, file=sys.stderr)
+    vms = [v for v in CFG.get("vms", []) if not track or v["id"] in CHECK_ALL.get("ids", [])]
+    try:
+        for vm in vms:
+            last = (VMSTATE.get(vm["id"]) or {}).get("checked", 0)
+            if not track and only_due and (hours <= 0 or time.time() - last < hours * 3600):
+                continue
+            if vm_job_running(vm["id"]):
+                if track:
+                    CHECK_ALL["skip"][vm["id"]] = "sedang ada proses"
+                continue
+            if track:
+                CHECK_ALL["cur"] = vm["id"]
+            try:
+                err = vm_check(vm)
+            except Exception as e:
+                err = str(e)[:200]
+                print("cek VM gagal", vm["id"], e, file=sys.stderr)
+            if track:
+                CHECK_ALL["res"][vm["id"]] = {"ok": not err, "msg": err or "", "t": int(time.time())}
+    finally:
+        if track:
+            CHECK_ALL["cur"] = None
+            CHECK_ALL["end"] = int(time.time())
+    return True
+
+
+def check_all_state(vm_id):
+    """Status VM dalam Cek semua terakhir: antre / cek / ok / gagal / lewat, atau None (tidak ada / sudah lama)."""
+    c = CHECK_ALL
+    if not c or vm_id not in c.get("ids", []):
+        return None
+    if c.get("end") and time.time() - c["end"] > CHECK_ALL_SHOW:
+        return None
+    if vm_id in c["res"]:
+        return "ok" if c["res"][vm_id]["ok"] else "gagal"
+    if vm_id in c["skip"]:
+        return "lewat"
+    if c.get("end"):
+        return None
+    return "cek" if c.get("cur") == vm_id else "antre"
+
+
+def check_all_badge(vm_id):
+    s = check_all_state(vm_id)
+    if not s:
+        return ""
+    r = CHECK_ALL["res"].get(vm_id) or {}
+    jam = time.strftime("%H:%M", time.localtime(r["t"])) if r.get("t") else ""
+    return {
+        "cek": '<span class="pill wait" data-cepat="1"><span class="dot"></span><span>Sedang dicek…</span></span>',
+        "antre": '<span class="pill wait" data-cepat="1"><span class="dot"></span><span>Menunggu giliran cek</span></span>',
+        "ok": f'<span class="tag ok">✓ Sudah dicek {jam}</span>',
+        "gagal": f'<span class="tag bad" title="{E(r.get("msg", ""))}">✗ Gagal dicek {jam}</span>',
+        "lewat": '<span class="tag">Dilewati — sedang ada proses</span>',
+    }[s]
+
+
+def check_all_banner():
+    """Ringkasan Cek semua di atas daftar server: berapa yang sudah, sedang, dan belum dicek."""
+    c = CHECK_ALL
+    if not c or (c.get("end") and time.time() - c["end"] > CHECK_ALL_SHOW):
+        return ""
+    ids = [i for i in c["ids"] if i in c["names"]]
+    ikon = {"ok": "✓", "gagal": "✗", "cek": "…", "antre": "○", "lewat": "–"}
+    chips = "".join(f'<span class="tag {"ok" if st == "ok" else "bad" if st == "gagal" else "warn" if st == "cek" else ""}" '
+                    f'title="{E((c["res"].get(i) or {}).get("msg") or c["skip"].get(i, ""))}">'
+                    f'{ikon[st]} {E(c["names"][i])}</span>'
+                    for i in ids for st in [check_all_state(i) or "antre"])
+    selesai = len(c["res"]) + len(c["skip"])
+    gagal = [c["names"].get(i, i) for i, r in c["res"].items() if not r["ok"]]
+    if c.get("end"):
+        head = (f'<b>Cek semua selesai</b> · {time.strftime("%H:%M", time.localtime(c["end"]))} · '
+                f'{len(c["res"]) - len(gagal)} berhasil' + (f', {len(gagal)} gagal' if gagal else "")
+                + (f', {len(c["skip"])} dilewati' if c["skip"] else ""))
+    else:
+        cur = c["names"].get(c.get("cur") or "", "")
+        head = (f'<span class="pill wait" data-cepat="1"><span class="dot"></span><span>Cek semua berjalan</span></span> '
+                f'<b>{selesai} dari {len(ids)} server</b> sudah dicek' + (f' · sedang: {E(cur)}' if cur else ""))
+    return (f'<div class="card" id="cekSemua" style="margin-bottom:12px"><div class="small">{head}</div>'
+            f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">{chips}</div>'
+            '<p class="mut small" style="margin:8px 0 0">✓ sudah dicek · ✗ gagal (arahkan kursor ke tanda di kartu untuk alasannya) · … sedang dicek · ○ menunggu giliran</p></div>')
 
 
 # ------------------------------------------------------- kesehatan aplikasi, status backup, notifikasi
@@ -2816,6 +2909,9 @@ def home_servers(csrf):
         else:
             tags.append('<span class="tag">Belum dicek</span>')
         tags += vm_status_tags(vm)
+        cab = check_all_badge(vm["id"])
+        if cab:
+            tags.insert(0, cab)
         lj = st.get("last_job")
         if lj and lj.get("rc") not in (0, None) and not running:
             tags.append(f'<span class="tag bad">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} gagal</span>')
@@ -2848,7 +2944,10 @@ def home_servers(csrf):
     return (f'<div class="sec-head" style="margin-top:0"><h2 style="white-space:nowrap">{len(vms)} server</h2><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{upd}'
             f'<form method="post" action="/servers/check">{hidden(csrf, id="semua", back="home")}<button class="btn sm" data-busy="Memulai…">Cek semua</button></form>'
             f'<a class="small" href="/servers">Buka Server</a></div></div>'
-            f'<div class="card"><div class="list">{"".join(rows)}</div></div>')
+            f'{check_all_banner()}<div class="card"><div class="list">{"".join(rows)}</div></div>'
+            + ('<script>setTimeout(function(){var s=document.getElementById(\'cekSemua\');'
+               'if(s&&s.offsetParent!==null&&!document.querySelector(\'details.menu[open],dialog[open]\'))location.reload()},4000)</script>'
+               if check_all_active() else ""))
 
 
 def home_page(user, csrf, q):
@@ -3775,6 +3874,9 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
             if d.get("app_error"):
                 tags.append(f'<span class="tag bad" title="{E(d["app_error"])}">git fetch gagal</span>')
         tags += vm_status_tags(vm)
+        cab = check_all_badge(vm["id"])
+        if cab:
+            tags.insert(0, cab)
         meta = [E(vm["host"])]
         if d.get("os"):
             meta.append(E(d["os"]))
@@ -3928,7 +4030,7 @@ document.addEventListener('click',function(e){document.querySelectorAll('details
 document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e){e.preventDefault();
  var b=document.getElementById('job-'+a.dataset.log);b.hidden=!b.hidden;if(!b.hidden)poll(b)}});
 })();"""
-    body = install_card + head + "".join(cards) + add + f'<div class="card">{interval}</div>'
+    body = install_card + head + check_all_banner() + "".join(cards) + add + f'<div class="card">{interval}</div>'
     return shell(user, csrf, "/servers", body, q, js)
 
 
@@ -4699,9 +4801,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_vm_check(self, form, user, ip):
         if form.get("id") == "semua":
-            threading.Thread(target=check_all_vms, kwargs={"only_due": False}, daemon=True).start()
-            return self.back("/" if form.get("back") == "home" else "/servers",
-                             "Pengecekan semua VM berjalan di latar belakang. Muat ulang halaman ini dalam 1 menit.")
+            dest = "/" if form.get("back") == "home" else "/servers"
+            if not check_all_begin(user):
+                return self.back(dest, "Cek semua masih berjalan — lihat tanda di tiap server.")
+            threading.Thread(target=check_all_vms, kwargs={"only_due": False, "track": True}, daemon=True).start()
+            return self.back(dest, f"Cek semua dimulai ({len(CFG['vms'])} server). Tanda di tiap server menunjukkan mana yang sudah dicek.")
         vm = next((v for v in CFG["vms"] if v["id"] == form.get("id")), None)
         if not vm:
             return self.back("/servers", "VM tidak ditemukan.", True)
