@@ -2281,6 +2281,8 @@ a.tag{text-decoration:none}
 .search{margin:0 0 12px}.search input{margin:0}
 .group+.group{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
 .group-head{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px}
+.logview{background:#0d1117;color:#d1d9e0;font:12px/1.5 ui-monospace,Consolas,monospace;padding:10px 12px;border-radius:9px;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.logview .le{color:#ff9b93;background:rgba(248,81,73,.12)}
 pre.log{background:#0d1117;color:#d1d9e0;font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px;border-radius:9px;
 max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0}
 .joblog{margin:0}
@@ -2606,6 +2608,8 @@ def shell(user, csrf, active, content, q, script=""):
         links.append(("/apps", "Aplikasi"))
         links.append(("/wallpaper", "Wallpaper"))
         links.append(("/servers", "Server"))
+        if CFG.get("vms"):
+            links.append(("/logs", "Log"))
         if any(v.get("terminal") for v in CFG.get("vms", [])):
             links.append(("/terminal", "Terminal"))
         links.append(("/settings", "Pengaturan"))
@@ -3928,6 +3932,80 @@ document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e
     return shell(user, csrf, "/servers", body, q, js)
 
 
+LOG_KINDS = (("app", "Aplikasi (Laravel)"), ("nginx", "Nginx — error"), ("php", "PHP-FPM"), ("sistem", "Sistem — peringatan & error"),
+             ("login", "Login SSH"), ("backup", "Backup harian"), ("wol", "Layanan WOL Panel"))
+LOG_MIN_VERSION = 10
+LOG_ERR = re.compile(r"\b(error|err|crit|critical|alert|emerg|emergency|fatal|failed|gagal|exception)\b", re.I)
+
+
+def vm_logs(vm, kind, n):
+    """Baca bagian akhir satu log di VM lewat 'wol-update logs' (hanya baca, daftar log tetap di VM)."""
+    try:
+        r = subprocess.run(ssh_cmd(vm, f"logs {kind} {int(n)}"), capture_output=True, text=True, timeout=40)
+    except subprocess.TimeoutExpired:
+        return None, "Membaca log melebihi 40 detik."
+    if r.returncode != 0 or r.stdout.startswith("error="):
+        err = ssh_error(r.stderr + r.stdout, r.returncode)
+        if "tidak dikenal" in err:
+            err = "wol-update di VM ini belum mendukung baca log — klik Perbarui wol-update di menu Server (butuh versi 10)."
+        return None, err
+    return r.stdout, None
+
+
+def logs_page(user, csrf, q):
+    vms = CFG.get("vms", [])
+    vid = q.get("vm", [vms[0]["id"] if vms else ""])[0]
+    vm = next((v for v in vms if v["id"] == vid), vms[0] if vms else None)
+    kind = q.get("jenis", ["app"])[0]
+    kind = kind if kind in dict(LOG_KINDS) else "app"
+    try:
+        n = max(20, min(2000, int(q.get("baris", ["200"])[0])))
+    except ValueError:
+        n = 200
+    vm_opts = "".join(f'<option value="{E(v["id"])}"{" selected" if vm and v["id"] == vm["id"] else ""}>{E(v["name"])} ({E(v["host"])})</option>' for v in vms)
+    kind_opts = "".join(f'<option value="{k}"{" selected" if k == kind else ""}>{E(lbl)}</option>' for k, lbl in LOG_KINDS)
+    n_opts = "".join(f'<option{" selected" if x == n else ""}>{x}</option>' for x in (100, 200, 500, 1000, 2000))
+    form = f"""<form method="get" action="/logs" class="card inline" style="gap:10px;flex-wrap:wrap;align-items:end">
+<label style="flex:1 1 220px">Server<select name="vm">{vm_opts}</select></label>
+<label style="flex:1 1 200px">Jenis log<select name="jenis">{kind_opts}</select></label>
+<label style="flex:0 1 110px">Baris<select name="baris">{n_opts}</select></label>
+<button class="btn primary">Tampilkan</button></form>"""
+    body = ""
+    if not vm:
+        body = '<div class="card empty"><p>Belum ada server. Tambahkan di menu Server.</p></div>'
+    else:
+        ver = int(((VMSTATE.get(vm["id"]) or {}).get("data") or {}).get("version") or 0)
+        out, err = (None, f"wol-update di {vm['name']} masih versi {ver}; baca log butuh versi {LOG_MIN_VERSION}. "
+                          "Buka menu Server → Perbarui wol-update.") if ver and ver < LOG_MIN_VERSION else vm_logs(vm, kind, n)
+        if err:
+            body = f'<div class="flash err">{icon("alert")}<div>{E(err)}</div></div>'
+        else:
+            lines = out.rstrip("\n").split("\n") if out.strip() else ["(log kosong)"]
+            src = lines.pop(0)[2:] if lines and lines[0].startswith("# ") else ""
+            nerr = sum(1 for ln in lines if LOG_ERR.search(ln))
+            rows = "".join(f'<div class="ll{" le" if LOG_ERR.search(ln) else ""}">{E(ln) or "&nbsp;"}</div>' for ln in lines)
+            body = f"""<div class="card"><div class="inline" style="gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+<b>{E(vm['name'])} · {E(dict(LOG_KINDS)[kind])}</b><span class="mut small">{E(src)} · {len(lines)} baris · {nerr} baris error/peringatan · {time.strftime('%H:%M:%S')}</span></div>
+<div class="inline" style="gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+<input id="lf" type="search" placeholder="Saring teks…" style="flex:1 1 200px">
+<label class="check" style="margin:0"><input type="checkbox" id="le"><span>Hanya error</span></label>
+<label class="check" style="margin:0"><input type="checkbox" id="lr"><span>Muat ulang tiap 15 detik</span></label></div>
+<div class="logview" id="lv">{rows}</div></div>"""
+    note = ('<p class="mut small">Hanya-baca. Log yang bisa dibuka ditentukan wol-update di tiap VM (tidak bisa membuka berkas lain). '
+            'Jenis yang tidak ada di VM itu tampil "belum ada berkas log".</p>')
+    return shell(user, csrf, "/logs", f'<div class="sec-head"><h2>Log server</h2></div>{form}{body}{note}', q, LOGS_JS)
+
+
+LOGS_JS = """
+(function(){var lv=document.getElementById('lv');if(!lv)return;var f=document.getElementById('lf'),e=document.getElementById('le'),r=document.getElementById('lr');
+var k='wol-log-auto';try{r.checked=localStorage.getItem(k)==='1'}catch(x){}
+function apply(){var t=f.value.toLowerCase();lv.querySelectorAll('.ll').forEach(function(d){var ok=(!e.checked||d.classList.contains('le'))&&(!t||d.textContent.toLowerCase().indexOf(t)>=0);d.style.display=ok?'':'none'})}
+f.oninput=apply;e.onchange=apply;lv.scrollTop=lv.scrollHeight;
+r.onchange=function(){try{localStorage.setItem(k,r.checked?'1':'0')}catch(x){}};
+setInterval(function(){if(r.checked&&!f.value&&document.visibilityState==='visible')location.reload()},15000);})();
+"""
+
+
 TERM_JS = """
 (function(){
 var el=document.getElementById('term');if(!el)return;
@@ -4173,6 +4251,10 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin(user):
                 return self.redirect("/")
             return self._send(200, servers_page(user, csrf, q))
+        if url.path == "/logs":
+            if not is_admin(user):
+                return self.redirect("/")
+            return self._send(200, logs_page(user, csrf, q))
         if url.path == "/terminal":
             if not is_admin(user):
                 return self.redirect("/")

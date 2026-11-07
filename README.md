@@ -398,6 +398,23 @@ hanya ringkasan, bukan isi backup.
 Tombol **Kirim notifikasi tes** memastikan sambungannya. Di Backup Master isi `BM_TELEGRAM_TOKEN`, `BM_TELEGRAM_CHAT`,
 `BM_API_KUNCI`, dan `BM_API_IP` (IP panel).
 
+### Log server (menu Log)
+
+Menu **Log** (admin) menampilkan bagian akhir log tiap VM tanpa membuka Terminal: pilih server, jenis log, dan jumlah baris
+(100–2000). Baris error/peringatan diberi warna merah; ada saringan teks, tombol *Hanya error*, dan muat ulang tiap 15 detik.
+
+| Jenis | Isi |
+|---|---|
+| Aplikasi (Laravel) | `storage/logs/*.log` terbaru di folder aplikasi |
+| Nginx — error | `/var/log/nginx/*error.log` terbaru |
+| PHP-FPM | `/var/log/php*-fpm.log` |
+| Sistem | `journalctl -p warning` (peringatan & error sistem) |
+| Login SSH | `journalctl -u ssh` |
+| Backup harian | `/var/log/*-backup.log` terbaru |
+| Layanan WOL Panel | `journalctl -u wol-panel` (VM panel) |
+
+Hanya-baca: daftar log ditentukan `wol-update logs` di VM (versi 10), panel tidak bisa menyebut berkas lain.
+
 ### Terminal web (menu Terminal)
 
 Terminal web adalah shell root ke VM langsung dari browser, jadi tidak perlu PuTTY. Karena aksesnya sangat besar,

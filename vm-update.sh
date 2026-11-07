@@ -11,9 +11,10 @@
 #   reboot       restart VM dalam 3 detik
 #   self-update  perbarui skrip ini dari repo resmi (WOL_UPDATE_SRC), bukan dari panel
 #   app-install KODE  pasang aplikasi sekolah dari katalog di bawah — HANYA di VM yang masih baru & kosong (fresh=1)
+#   logs JENIS [BARIS]  baca saja bagian akhir log (daftar tetap di log_file); logs list = log yang tersedia
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=9
+WOL_UPDATE_VERSION=10
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -56,7 +57,9 @@ fi
 CMD="${SSH_ORIGINAL_COMMAND:-${*:-status}}"
 ARG="${CMD#* }"; [ "$ARG" = "$CMD" ] && ARG=""
 CMD="${CMD%% *}"
+REST="${ARG#* }"; [ "$REST" = "$ARG" ] && REST=""
 ARG="${ARG%% *}"
+ARG2="${REST%% *}"
 
 exec 9>/run/wol-update.lock
 case "$CMD" in
@@ -172,6 +175,42 @@ app_install() {
   echo; echo "Selesai: $1 terpasang di $dir.${domain:+ Alamat: https://$domain (atur Proxy Host di NPMplus).}"
 }
 
+# Log yang boleh dibaca panel (hanya baca, daftar tetap; panel tidak bisa menyebut jalur sendiri).
+LOG_KINDS="app nginx php sistem login backup wol"
+newest() { ls -t "$@" 2>/dev/null | head -1; }
+log_file() {
+  case "$1" in
+    app)    [ -n "$APP_DIR" ] && newest "$APP_DIR"/storage/logs/*.log ;;
+    nginx)  newest /var/log/nginx/*error.log ;;
+    php)    newest /var/log/php*-fpm.log ;;
+    backup) newest /var/log/*-backup.log /var/log/*backup*.log ;;
+    *) return 1 ;;
+  esac
+}
+logs_list() {
+  local k f
+  for k in $LOG_KINDS; do
+    case "$k" in
+      sistem|login|wol) echo "log=$k|journal|0|0" ;;
+      *) f="$(log_file "$k")"; [ -n "$f" ] && [ -f "$f" ] && echo "log=$k|$f|$(stat -c %s "$f")|$(stat -c %Y "$f")" ;;
+    esac
+  done
+}
+logs_show() {
+  local n="${2:-200}" f
+  case "$n" in ''|*[!0-9]*) n=200 ;; esac
+  [ "$n" -gt 2000 ] && n=2000
+  case "$1" in
+    sistem) journalctl -p warning -n "$n" --no-pager -o short-iso 2>&1 ;;
+    login)  journalctl -u ssh -u sshd -n "$n" --no-pager -o short-iso 2>&1 ;;
+    wol)    journalctl -u wol-panel -u wol-panel-backup -n "$n" --no-pager -o short-iso 2>&1 ;;
+    *)
+      f="$(log_file "$1")" || { echo "error=Jenis log tidak dikenal: $1"; exit 64; }
+      [ -n "$f" ] && [ -f "$f" ] || { echo "(belum ada berkas log ini di VM)"; return 0; }
+      echo "# $f"; tail -n "$n" "$f" | cut -c1-2000 ;;
+  esac
+}
+
 app_health() {  # keluaran health_*=… ; health_ok=1 bila semua layanan aktif dan halaman aplikasi menjawab 200
   local ok=1 svc=() u st url host code=""
   for u in nginx apache2 mariadb mysql wol-panel $(systemctl list-unit-files --type=service --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
@@ -230,6 +269,8 @@ case "$CMD" in
     cd "$APP_DIR" && bash deploy/update.sh </dev/null ;;
   app-install)
     app_install "$ARG" ;;
+  logs)
+    if [ "$ARG" = list ] || [ -z "$ARG" ]; then logs_list; else logs_show "$ARG" "$ARG2"; fi ;;
   reboot)
     # ditunda 3 detik agar sesi SSH panel selesai rapi; berjalan di VM maupun container LXC
     if systemd-run --quiet --on-active=3 --unit="wol-reboot-$(date +%s)" systemctl reboot; then
