@@ -1076,30 +1076,41 @@ def run_vm_job(vm, action, user, steps=None):
                         log.write(f"[panel] Langkah berikutnya dibatalkan karena {VM_ACTIONS.get(act, act)} gagal.\n")
                     break
         action = job["action"]
-        if rc == 0 and any(a in ("app-update", "os-upgrade") or a.startswith("app-install ") for a in steps):
-            time.sleep(5)  # beri waktu PHP-FPM/nginx selesai reload
-            h = vm_health(vm)
-            with open(path, "a", encoding="utf-8") as log:
-                if h.get("old"):
-                    log.write("\n[panel] Cek aplikasi dilewati: wol-update di VM ini belum versi 6 (Perbarui wol-update).\n")
-                elif h.get("error"):
-                    log.write(f"\n[panel] Cek aplikasi gagal: {h['error']}\n")
-                else:
-                    prob = health_problem(h)
-                    log.write(f"\n[panel] Cek aplikasi setelah update: {'BERMASALAH — ' + prob if prob else 'OK'}"
-                              f" (HTTP {h.get('http') or '-'}, layanan: {h.get('svc') or '-'})\n")
-            note_health(vm, h, now=True)
-        if rc != 0:
-            notify("failed", f"❌ {VM_ACTIONS.get(action, action)} di {vm['name']} gagal (kode {rc}) oleh {user}. Lihat log di WOL Panel → Server.")
+        # Pekerjaan selesai: catat SEKARANG agar halaman langsung berhenti menunggu (dan tidak hilang bila panel restart).
         job["rc"], job["end"] = rc, int(time.time())
         with VM_LOCK:
             st = VMSTATE.setdefault(vm["id"], {})
             st["last_job"] = {k: job[k] for k in ("action", "start", "end", "rc", "by")}
+            if action != "reboot":
+                st["rechecking"] = int(time.time())  # kartu: "Memperbarui status…" sampai Cek ulang selesai
             save_vmstate()
-        if action != "reboot":
+        if rc != 0:
+            notify("failed", f"❌ {VM_ACTIONS.get(action, action)} di {vm['name']} gagal (kode {rc}) oleh {user}. Lihat log di WOL Panel → Server.")
+        if action == "reboot":
+            if rc == 0:
+                wait_vm_back(vm)
+            return
+        if is_panel_vm(vm) and "app-update" in steps and rc == 0:
+            return  # panel ini restart beberapa detik lagi; status diperbarui otomatis setelah hidup lagi (monitor_loop)
+        try:
+            if rc == 0 and any(a in ("app-update", "os-upgrade") or a.startswith("app-install ") for a in steps):
+                time.sleep(5)  # beri waktu PHP-FPM/nginx selesai reload
+                h = vm_health(vm)
+                with open(path, "a", encoding="utf-8") as log:
+                    if h.get("old"):
+                        log.write("\n[panel] Cek aplikasi dilewati: wol-update di VM ini belum versi 6 (Perbarui wol-update).\n")
+                    elif h.get("error"):
+                        log.write(f"\n[panel] Cek aplikasi gagal: {h['error']}\n")
+                    else:
+                        prob = health_problem(h)
+                        log.write(f"\n[panel] Cek aplikasi setelah update: {'BERMASALAH — ' + prob if prob else 'OK'}"
+                                  f" (HTTP {h.get('http') or '-'}, layanan: {h.get('svc') or '-'})\n")
+                note_health(vm, h, now=True)
             vm_check(vm, user)
-        elif rc == 0:
-            wait_vm_back(vm)
+        finally:
+            with VM_LOCK:
+                VMSTATE.setdefault(vm["id"], {}).pop("rechecking", None)
+                save_vmstate()
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -1359,7 +1370,17 @@ def monitor_vms():
 
 
 def monitor_loop():
-    time.sleep(20)
+    time.sleep(8)
+    for vm in list(CFG.get("vms", [])):  # Cek ulang yang terputus karena panel restart (mis. update panel sendiri)
+        if (VMSTATE.get(vm["id"]) or {}).get("rechecking"):
+            try:
+                vm_check(vm)
+            except Exception as e:
+                print("cek ulang", vm["id"], e, file=sys.stderr)
+            with VM_LOCK:
+                VMSTATE.setdefault(vm["id"], {}).pop("rechecking", None)
+                save_vmstate()
+    time.sleep(12)
     while True:
         try:
             monitor_vms()
@@ -3741,6 +3762,8 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                             f'<span class="tag warn" title="Versi ini belum bisa memperbarui dirinya">wol-update v{hv} · Lainnya → Pasang ulang sekali</span>')
             if time.time() - st.get("rebooting", 0) < 900:
                 tags.insert(0, '<span class="pill wait"><span class="dot"></span><span>Sedang restart… menunggu VM kembali</span></span>')
+            elif time.time() - st.get("rechecking", 0) < 300 and not running:
+                tags.insert(0, '<span class="pill wait" data-cepat="1"><span class="dot"></span><span>Memperbarui status…</span></span>')
             elif d.get("reboot") == "1":
                 tags.append('<span class="tag bad">Perlu reboot</span>')
             if d.get("apt_error"):
@@ -3893,10 +3916,10 @@ function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.
   var atBottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-20;pre.textContent=j.log||'';if(atBottom)pre.scrollTop=pre.scrollHeight;
   if(j.title)box.querySelector('.jobtitle').textContent=j.title;
   if(j.running){state.textContent='sedang berjalan…';setTimeout(function(){poll(box)},2000)}
-  else if(box.dataset.running==='1'){state.textContent=j.rc===0?'selesai':'gagal (kode '+j.rc+')';setTimeout(function(){location.reload()},2500)}
+  else if(box.dataset.running==='1'){state.textContent=j.rc===0?'selesai':'gagal (kode '+j.rc+')';setTimeout(function(){location.reload()},1000)}
  }).catch(function(){setTimeout(function(){poll(box)},4000)})}
 document.querySelectorAll('.joblog[data-running="1"]').forEach(poll);
-if(document.querySelector('.vm .pill.wait'))setTimeout(function(){if(!document.querySelector('details.menu[open],dialog[open]'))location.reload()},15000);
+if(document.querySelector('.vm .pill.wait'))setTimeout(function(){if(!document.querySelector('details.menu[open],dialog[open]'))location.reload()},document.querySelector('.vm .pill.wait[data-cepat]')?4000:15000);
 document.addEventListener('click',function(e){document.querySelectorAll('details.menu[open]').forEach(function(m){if(!m.contains(e.target))m.open=false})});
 document.querySelectorAll('[data-log]').forEach(function(a){a.onclick=function(e){e.preventDefault();
  var b=document.getElementById('job-'+a.dataset.log);b.hidden=!b.hidden;if(!b.hidden)poll(b)}});
