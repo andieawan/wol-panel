@@ -29,7 +29,7 @@ Tanda berhasil: setelah PC dimatikan, lampu port LAN di belakang PC tetap menyal
 ## 2. Pasang panel di server
 
 Buat container LXC Debian 12 kecil di Proxmox (1 core, 256 MB RAM, disk 2 GB), network di bridge yang
-**satu jaringan dengan desktop**, misalnya IP `192.168.10.28/24` (susunan IP sekolah: `.20`–`.26` VM aplikasi, `.30` Backup Master), gateway `192.168.10.254`.
+**satu jaringan dengan desktop**, misalnya IP `192.168.10.13/24` (saat ini; rencana `.28`) (susunan IP sekolah: `.20`–`.26` VM aplikasi, `.30` Backup Master), gateway `192.168.10.254`.
 
 Di container tersebut jalankan:
 
@@ -45,7 +45,7 @@ Untuk memperbarui di kemudian hari (konfigurasi di `/opt/wol-panel/config.json` 
 cd wol-panel && git pull && bash install.sh
 ```
 
-Skrip hanya meminta nama pengguna + password admin. Setelah selesai, buka `http://192.168.10.28:8080`,
+Skrip hanya meminta nama pengguna + password admin. Setelah selesai, buka `http://192.168.10.13:8080`,
 masuk sebagai admin, lalu buka menu **Pengaturan**.
 
 ## 3. Pengaturan lewat web
@@ -64,7 +64,7 @@ Semua diatur dari menu **Pengaturan** (khusus admin), tanpa perlu restart layana
   (remotedesktop.google.com/access), linknya bisa diganti per komputer.
 - **Pengguna**: tambah akun, ubah akses, ganti password (boleh dikosongkan saat mengubah), hapus. Ada dua peran:
   - *Admin*: semua komputer, server/VM, terminal, dan pengaturan. **Hanya bisa masuk dari jaringan sekolah atau VPN**
-    (buka panel lewat IP langsung, mis. `http://192.168.10.28:8080`).
+    (buka panel lewat IP langsung, mis. `http://192.168.10.13:8080`).
   - *Pengguna*: hanya menyalakan dan mematikan **komputer yang dicentang admin** (atau *Semua komputer*, termasuk yang
     ditambahkan nanti). Boleh masuk lewat subdomain dari luar sekolah. Komputer lain tidak tampil dan tidak bisa
     dinyalakan walau dicoba lewat alamat langsung. Tampilannya sederhana: satu **tombol power bulat besar** per

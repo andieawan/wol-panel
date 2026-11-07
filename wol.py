@@ -913,7 +913,7 @@ VM_SELF_UPDATE_MIN = 3   # wol-update mulai versi ini bisa memperbarui dirinya
 # VM aplikasi sekolah (susunan IP 192.168.10.x, sama dengan Backup Master) untuk isian cepat "Tambah VM".
 SCHOOL_VMS = (("Pusat Sekolah", "192.168.10.20"), ("Website Sekolah", "192.168.10.21"), ("Jurnal Guru", "192.168.10.22"),
               ("Bimbingan Konseling", "192.168.10.23"), ("Tata Usaha", "192.168.10.24"), ("Manajemen PKL", "192.168.10.25"),
-              ("Tanggungan Siswa", "192.168.10.26"), ("WOL Panel", "192.168.10.28"), ("Backup Master", "192.168.10.30"))
+              ("Tanggungan Siswa", "192.168.10.26"), ("WOL Panel", "192.168.10.13"), ("Backup Master", "192.168.10.30"))
 
 
 def vm_template_version():
