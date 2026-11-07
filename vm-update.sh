@@ -13,7 +13,7 @@
 #   app-install KODE  pasang aplikasi sekolah dari katalog di bawah — HANYA di VM yang masih baru & kosong (fresh=1)
 #
 # Folder aplikasi diatur di /etc/wol-update.conf (APP_DIR=/var/www/...).
-WOL_UPDATE_VERSION=8
+WOL_UPDATE_VERSION=9
 set -uo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -24,6 +24,18 @@ DOMAIN_BASE="smkibupakusari.sch.id"   # domain sekolah untuk app-install (bisa d
 PROXY_IP="192.168.10.10"              # NPMplus
 FRESH_DAYS=7                          # "Pasang aplikasi" hanya untuk VM yang dibuat <= sekian hari lalu
 [ -f /etc/wol-update.conf ] && . /etc/wol-update.conf
+
+# Aplikasi dipasang SETELAH wol-update (manual / git clone): temukan sendiri lalu simpan di konfigurasi.
+if [ -z "$APP_DIR" ]; then
+  for f in /var/www/*/deploy/update.sh /var/www/*/*/deploy/update.sh /root/wol-panel/deploy/update.sh; do
+    [ -f "$f" ] || continue
+    APP_DIR="$(dirname "$(dirname "$f")")"
+    if [ -w /etc/wol-update.conf ]; then
+      sed -i '/^APP_DIR=/d' /etc/wol-update.conf; echo "APP_DIR=\"$APP_DIR\"" >> /etc/wol-update.conf
+    fi
+    break
+  done
+fi
 
 # Migrasi dari versi lama (tanpa TERM_USER): terminal web pindah dari root ke user biasa,
 # root tetap bisa lewat sudo -i. Berjalan sekali, otomatis setelah "Perbarui wol-update".

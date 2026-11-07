@@ -3761,7 +3761,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
             app_line = (f'<div class="mut small">Aplikasi <span class="mono">{E(d["app"])}</span> · {E(d.get("app_branch", ""))} @ '
                         f'<span class="mono">{E(h.get("hash", "?"))}</span> {E(h.get("msg", ""))[:70]}</div>')
         elif d:
-            app_line = '<div class="mut small">Tidak ada aplikasi dengan deploy/update.sh — hanya update OS.</div>'
+            app_line = '<div class="mut small">Belum terdeteksi aplikasi dengan deploy/update.sh — hanya update OS. Aplikasi dipasang manual? Klik Perbarui wol-update (v9 mendeteksinya sendiri), lalu Cek.</div>'
 
         # tombol
         def act(action, label, cls, text, title):
