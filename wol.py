@@ -893,8 +893,8 @@ VM_JOBS = {}          # id VM -> {"action", "start", "end", "rc", "by"}
 VM_TOKENS = {}        # token pasang -> (id VM, kedaluwarsa)
 # Aplikasi yang bisa dipasang di VM baru (kode harus sama dengan katalog app_catalog di vm-update.sh): kode, nama, IP usulan.
 APP_CATALOG = (("pusat", "Pusat Sekolah", "192.168.10.20"), ("web", "Website Sekolah", "192.168.10.21"), ("jurnal", "Jurnal Guru", "192.168.10.22"),
-               ("bk", "Bimbingan Konseling", "192.168.10.23"), ("tu", "Tata Usaha", "192.168.10.24"), ("pkl", "Manajemen PKL", "192.168.10.25"),
-               ("tanggungan", "Tanggungan Siswa", "192.168.10.26"), ("backup", "Backup Master", "192.168.10.30"))
+               ("bk", "Bimbingan Konseling", "192.168.10.23"), ("tu", "Tata Usaha", "192.168.10.29"), ("pkl", "Manajemen PKL", "192.168.10.30"),
+               ("tanggungan", "Tanggungan Siswa", "192.168.10.31"), ("backup", "Backup Master", "192.168.10.32"))
 APP_NAMES = {k: n for k, n, _ in APP_CATALOG}
 INSTALL_MIN_VERSION = 7   # wol-update mulai versi ini punya app-install & penanda VM baru (fresh)
 
@@ -912,8 +912,8 @@ VM_ACTIONS = _ActionNames({"check": "Cek pembaruan", "os-upgrade": "Update OS", 
 VM_SELF_UPDATE_MIN = 3   # wol-update mulai versi ini bisa memperbarui dirinya
 # VM aplikasi sekolah (susunan IP 192.168.10.x, sama dengan Backup Master) untuk isian cepat "Tambah VM".
 SCHOOL_VMS = (("Pusat Sekolah", "192.168.10.20"), ("Website Sekolah", "192.168.10.21"), ("Jurnal Guru", "192.168.10.22"),
-              ("Bimbingan Konseling", "192.168.10.23"), ("Tata Usaha", "192.168.10.24"), ("Manajemen PKL", "192.168.10.25"),
-              ("Tanggungan Siswa", "192.168.10.26"), ("WOL Panel", "192.168.10.13"), ("Backup Master", "192.168.10.30"))
+              ("Bimbingan Konseling", "192.168.10.23"), ("Tata Usaha", "192.168.10.29"), ("Manajemen PKL", "192.168.10.30"),
+              ("Tanggungan Siswa", "192.168.10.31"), ("WOL Panel", "192.168.10.13"), ("Backup Master", "192.168.10.32"))
 
 
 def vm_template_version():
@@ -3538,7 +3538,7 @@ def settings_bm(csrf):
 <p class="mut small" style="margin-top:0">Menampilkan status backup tiap VM di menu Server dan mengirim notifikasi ke Telegram lewat bot Backup Master.
 Di <code>.env</code> Backup Master isi <code>BM_API_KUNCI</code> dan <code>BM_API_IP</code> (IP panel ini).</p>{state}
 <form method="post" action="/settings/bm">{hidden(csrf)}
-<div class="grid"><label>Alamat Backup Master<input name="bm_url" value="{E(CFG.get('bm_url', ''))}" placeholder="http://192.168.10.30" spellcheck="false"></label>
+<div class="grid"><label>Alamat Backup Master<input name="bm_url" value="{E(CFG.get('bm_url', ''))}" placeholder="http://192.168.10.32" spellcheck="false"></label>
 <label>Kunci API<input name="bm_key" type="password" autocomplete="off" placeholder="{'tersimpan — kosongkan bila tidak diganti' if CFG.get('bm_key') else 'isi BM_API_KUNCI'}">
 <span class="hint">Kosongkan alamat untuk memutus sambungan.</span></label></div>
 <h3 style="margin:12px 0 6px">Kirim notifikasi bila</h3>{checks}
@@ -5474,7 +5474,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_bm(self, form, user, ip):
         url = form.get("bm_url", "").strip().rstrip("/")
         if url and not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d{1,5})?", url):
-            return self.back("/settings", "Alamat Backup Master harus seperti http://192.168.10.30 (tanpa jalur).", True, tab="umum")
+            return self.back("/settings", "Alamat Backup Master harus seperti http://192.168.10.32 (tanpa jalur).", True, tab="umum")
         try:
             mins = int(form.get("health_minutes") or 0)
             if not 0 <= mins <= 1440:

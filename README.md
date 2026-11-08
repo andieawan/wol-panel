@@ -29,7 +29,7 @@ Tanda berhasil: setelah PC dimatikan, lampu port LAN di belakang PC tetap menyal
 ## 2. Pasang panel di server
 
 Buat container LXC Debian 12 kecil di Proxmox (1 core, 256 MB RAM, disk 2 GB), network di bridge yang
-**satu jaringan dengan desktop**, misalnya IP `192.168.10.13/24` (saat ini; rencana `.28`) (susunan IP sekolah: `.20`–`.26` VM aplikasi, `.30` Backup Master), gateway `192.168.10.254`.
+**satu jaringan dengan desktop**, misalnya IP `192.168.10.13/24` (saat ini; rencana `.28`) (susunan IP sekolah: `.20`–`.23` dan `.29`–`.31` VM aplikasi, `.32` Backup Master), gateway `192.168.10.254`.
 
 Di container tersebut jalankan:
 
@@ -385,7 +385,7 @@ Hasilnya tampil sebagai *Aplikasi OK* atau *Aplikasi bermasalah: …* di menu Se
 (klik **Perbarui wol-update**).
 
 **Status backup dari Backup Master.** Bila panel disambungkan ke Backup Master (**Pengaturan → Umum → Backup Master &
-notifikasi**: alamat, mis. `http://192.168.10.30`, dan kunci API `BM_API_KUNCI`), tiap kartu VM menampilkan umur backup
+notifikasi**: alamat, mis. `http://192.168.10.32`, dan kunci API `BM_API_KUNCI`), tiap kartu VM menampilkan umur backup
 terakhirnya (*Backup 5 jam lalu*, atau tanda ⚠ bila Backup Master melihat masalah), dan jendela konfirmasi **Update
 aplikasi** menyebut kapan backup terakhir dibuat. VM dicocokkan lewat IP sumber di Backup Master. Data diambil tiap 10 menit;
 hanya ringkasan, bukan isi backup.
