@@ -1165,6 +1165,123 @@ def vm_term_user(vm):
     return tu or None
 
 
+AGENT_RUNNING = set()   # id VM yang sedang dicek agennya
+
+
+def vm_agent_check(vm):
+    """Periksa "agen" panel di VM: SSH terbuka, wol-update + kuncinya, versi & fitur, folder aplikasi,
+    terminal web, dan aplikasi hidup. Hasil: daftar (status ok/warn/bad/info, judul, keterangan) di VMSTATE[...]['agent']."""
+    items = []
+    add = lambda st, judul, ket="": items.append({"st": st, "t": judul, "d": ket})
+    port = int(vm.get("port", 22))
+    # 1. jaringan
+    try:
+        with socket.create_connection((vm["host"], port), timeout=4):
+            add("ok", f"SSH terbuka di {vm['host']}:{port}")
+    except OSError as e:
+        add("bad", f"SSH tidak terjangkau di {vm['host']}:{port}",
+            "VM mati, IP salah, atau openssh-server belum aktif. " + (str(e)[:80] if str(e) else ""))
+        return items
+    # 2. agen wol-update lewat kunci update (forced command)
+    try:
+        r = subprocess.run(ssh_cmd(vm, "status"), capture_output=True, text=True, timeout=25)
+        d = parse_kv(r.stdout) if r.returncode == 0 else {}
+        err = None if d.get("version") or d.get("host") else ssh_error(r.stderr + r.stdout, r.returncode)
+    except subprocess.TimeoutExpired:
+        d, err = {}, "VM tidak menjawab dalam 25 detik."
+    if err:
+        hint = ("Server → kartu ini → Lainnya → Pasang ulang, lalu jalankan perintahnya di VM sebagai root."
+                if "ditolak" in err else ("Klik Pakai VM baru di kartu ini." if err == HOSTKEY_MSG else ""))
+        add("bad", "Agen wol-update tidak bisa dipakai", err + (" " + hint if hint else ""))
+        return items
+    ver, tv = int(d.get("version") or 0), vm_template_version()
+    if ver and ver < tv:
+        add("warn", f"Agen wol-update v{ver} (terbaru v{tv})",
+            "Klik Perbarui wol-update di kartu ini." if ver >= VM_SELF_UPDATE_MIN else "Versi ini belum bisa memperbarui dirinya: Lainnya → Pasang ulang sekali.")
+    else:
+        add("ok", f"Agen wol-update v{ver or '?'} terpasang", f"Masuk dengan kunci update sebagai {vm.get('user', 'root')}.")
+    fitur = [n for n, v in (("cek aplikasi", HEALTH_MIN_VERSION), ("pasang aplikasi", INSTALL_MIN_VERSION), ("log", LOG_MIN_VERSION)) if ver < v]
+    if fitur:
+        add("warn", "Sebagian fitur panel belum didukung agen", "Belum bisa: " + ", ".join(fitur) + ". Perbarui wol-update.")
+    # 3. folder aplikasi
+    if d.get("app"):
+        add("ok" if d.get("app_script") == "1" else "warn", f"Folder aplikasi {d['app']}",
+            "" if d.get("app_script") == "1" else "deploy/update.sh tidak ada — tombol Update aplikasi tidak muncul.")
+    else:
+        add("info", "Folder aplikasi tidak terdeteksi", "Hanya update OS. Bila aplikasi sudah dipasang, pastikan ada di /var/www/<nama>/deploy/update.sh.")
+    # 4. terminal web
+    tu = d.get("term_user") or ""
+    if not vm.get("terminal"):
+        add("info", "Terminal web tidak diizinkan", "Aktifkan lewat Lainnya → Izinkan terminal bila perlu.")
+    elif not os.path.exists(TERM_KEY):
+        add("bad", "Kunci terminal panel belum dibuat", "Klik Izinkan terminal lagi di kartu ini.")
+    elif not tu:
+        add("warn", "User terminal belum diketahui", "Agen versi lama: perbarui wol-update atau Pasang ulang.")
+    else:
+        try:
+            t = subprocess.run(["ssh", "-i", TERM_KEY, "-p", str(port), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                                "-o", f"UserKnownHostsFile={os.path.join(SSH_DIR, 'known_hosts')}", "-o", "ConnectTimeout=8",
+                                "-o", "LogLevel=ERROR", f"{tu}@{vm['host']}", "true"], capture_output=True, text=True, timeout=20)
+            terr = None if t.returncode == 0 else ssh_error(t.stderr, t.returncode)
+        except subprocess.TimeoutExpired:
+            terr = "tidak menjawab dalam 20 detik"
+        if terr:
+            add("bad", f"Terminal ditolak untuk {tu}",
+                ("Kunci terminal belum ada di VM. " if "ditolak" in terr else terr + ". ")
+                + "Lainnya → Pasang ulang, jalankan perintahnya di VM, pastikan muncul \"Terminal web DIIZINKAN\".")
+        else:
+            add("ok", f"Terminal bisa masuk sebagai {tu}", "root lewat sudo -i" if tu != "root" else "")
+    # 5. aplikasi hidup
+    if d.get("app") and ver >= HEALTH_MIN_VERSION:
+        try:
+            h = health_from(parse_kv(subprocess.run(ssh_cmd(vm, "health"), capture_output=True, text=True, timeout=40).stdout))
+        except subprocess.TimeoutExpired:
+            h = None
+        masalah = health_problem(h) if h else "tidak ada jawaban"
+        add("ok" if h and not masalah else "bad", "Aplikasi berjalan" if h and not masalah else "Aplikasi bermasalah", masalah or (h or {}).get("url", ""))
+    return items
+
+
+def run_agent_check(vm):
+    AGENT_RUNNING.add(vm["id"])
+    try:
+        items = vm_agent_check(vm)
+    except Exception as e:
+        items = [{"st": "bad", "t": "Cek agen gagal", "d": str(e)[:200]}]
+    finally:
+        AGENT_RUNNING.discard(vm["id"])
+    with VM_LOCK:
+        VMSTATE.setdefault(vm["id"], {})["agent"] = {"time": int(time.time()), "items": items}
+        save_vmstate()
+
+
+def agent_summary_tag(vm_id):
+    if vm_id in AGENT_RUNNING:
+        return '<span class="pill wait" data-cepat="1"><span class="dot"></span><span>Mengecek agen…</span></span>'
+    a = (VMSTATE.get(vm_id) or {}).get("agent")
+    if not a or time.time() - a["time"] > 86400:
+        return ""
+    bad = sum(1 for i in a["items"] if i["st"] == "bad")
+    warn = sum(1 for i in a["items"] if i["st"] == "warn")
+    if bad:
+        return f'<span class="tag bad">Agen: {bad} masalah</span>'
+    return f'<span class="tag warn">Agen: {warn} peringatan</span>' if warn else '<span class="tag ok">Agen OK</span>'
+
+
+def agent_report_html(vm_id):
+    a = (VMSTATE.get(vm_id) or {}).get("agent")
+    if not a or vm_id in AGENT_RUNNING:
+        return ""
+    ikon = {"ok": ("✓", "var(--ok)"), "warn": ("!", "var(--warn)"), "bad": ("✗", "var(--err)"), "info": ("i", "var(--mut)")}
+    rows = "".join(f'<li style="display:flex;gap:8px;padding:4px 0"><b style="color:{ikon[i["st"]][1]};width:14px;flex:none;text-align:center">{ikon[i["st"]][0]}</b>'
+                   f'<span>{E(i["t"])}' + (f'<br><span class="mut small">{E(i["d"])}</span>' if i.get("d") else "") + '</span></li>'
+                   for i in a["items"])
+    buka = " open" if any(i["st"] in ("bad", "warn") for i in a["items"]) else ""
+    return (f'<details class="agentrep" style="margin-top:10px"{buka}><summary class="small" style="cursor:pointer">'
+            f'Hasil cek agen · {E(time.strftime("%d/%m %H:%M", time.localtime(a["time"])))}</summary>'
+            f'<ul style="list-style:none;margin:6px 0 0;padding:0" class="small">{rows}</ul></details>')
+
+
 def wait_vm_back(vm):
     """Setelah reboot: tandai 'sedang restart', lalu cek berkala sampai VM bisa dijangkau lagi (maks. 10 menit)."""
     with VM_LOCK:
@@ -2651,7 +2768,7 @@ LOG_LABELS = {
     "pindai": "Memindai aplikasi", "uninstall": "Uninstall", "uninstall-gagal": "Uninstall gagal",
     "hapus-otomatis": "Hapus otomatis", "hapus-otomatis-gagal": "Hapus otomatis gagal",
     "aturan-aplikasi": "Mengubah aturan aplikasi", "perbarui-agen": "Memperbarui agen",
-    "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "terminal-cabut": "Mencabut izin terminal",
+    "terminal": "Membuka terminal", "terminal-izin": "Mengizinkan terminal", "cek-agen": "Cek agen server", "terminal-cabut": "Mencabut izin terminal",
     "terminal-gagal": "Gagal membuka kunci terminal", "terminal-buka-kunci": "Membuka kunci terminal",
     "wallpaper": "Menerapkan wallpaper", "wallpaper-dikembalikan": "Mengembalikan wallpaper yang diganti",
     "wallpaper-gagal-dikembalikan": "Gagal mengembalikan wallpaper", "wallpaper-setujui": "Menyetujui wallpaper yang diganti",
@@ -2912,6 +3029,9 @@ def home_servers(csrf):
         cab = check_all_badge(vm["id"])
         if cab:
             tags.insert(0, cab)
+        agt = agent_summary_tag(vm["id"])
+        if agt:
+            tags.append(agt)
         lj = st.get("last_job")
         if lj and lj.get("rc") not in (0, None) and not running:
             tags.append(f'<span class="tag bad">{E(VM_ACTIONS.get(lj["action"], lj["action"]))} gagal</span>')
@@ -3877,6 +3997,9 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
         cab = check_all_badge(vm["id"])
         if cab:
             tags.insert(0, cab)
+        agt = agent_summary_tag(vm["id"])
+        if agt:
+            tags.append(agt)
         meta = [E(vm["host"])]
         if d.get("os"):
             meta.append(E(d["os"]))
@@ -3898,7 +4021,10 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
             return (f'<form method="post" action="/servers/run" {confirm(text, label, title)}>{hidden(csrf, id=vm["id"], action=action)}'
                     f'<button class="btn sm {cls}"{dis}>{label}</button></form>')
         btns = [f'<form method="post" action="/servers/check">{hidden(csrf, id=vm["id"])}'
-                f'<button class="btn sm" data-busy="Mengecek…"{" disabled" if running else ""}>Cek</button></form>']
+                f'<button class="btn sm" data-busy="Mengecek…"{" disabled" if running else ""}>Cek</button></form>',
+                f'<form method="post" action="/servers/agent-check">{hidden(csrf, id=vm["id"])}'
+                f'<button class="btn sm" data-busy="Mengecek…" title="Periksa SSH, agen wol-update, kunci terminal, dan aplikasi"'
+                f'{" disabled" if running or vm["id"] in AGENT_RUNNING else ""}>Cek agen</button></form>']
         if d:
             up = int(d.get("upgradable") or 0)
             btns.append(act("os-upgrade", "Update OS", "primary" if up else "",
@@ -3981,7 +4107,7 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
 <div class="dev-head"><div><h2>{E(vm['name'])}</h2><div class="meta">{' · '.join(meta)}</div>{app_line}
 <div class="mut small">Dicek {E(fmt_age(st.get('checked')))}</div></div></div>
 <div class="acts">{''.join(tags) or '<span class="tag">Belum dicek</span>'}</div>
-{install_box_pre}{jobline}{logbox}{install_box}{detail}
+{install_box_pre}{jobline}{logbox}{install_box}{detail}{agent_report_html(vm["id"])}
 <div class="dev-acts">{''.join(btns)}</div></article>""")
 
     if not cards:
@@ -4015,7 +4141,9 @@ dan bisa diubah di <span class="mono">/etc/wol-update.conf</span>.</p>
                    f'{hidden(csrf)}<button class="btn sm primary" data-busy="Memulai…">Update semua ({len(plans)})</button></form>')
     head = (f'<div class="sec-head"><h2>Server / VM</h2><div style="display:flex;gap:8px;flex-wrap:wrap">{upd_all}'
             f'<form method="post" action="/servers/check">{hidden(csrf, id="semua")}'
-            f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form></div></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
+            f'<button class="btn sm" data-busy="Memulai…">Cek semua</button></form>'
+            f'<form method="post" action="/servers/agent-check">{hidden(csrf, id="semua")}'
+            f'<button class="btn sm" data-busy="Memulai…" title="Periksa agen di semua server">Cek agen semua</button></form></div></div>') if vms else '<div class="sec-head"><h2>Server / VM</h2></div>'
     js = """(function(){
 function poll(box){var id=box.dataset.vm,pre=box.querySelector('pre'),state=box.querySelector('.jobstate');
  fetch('/api/vmjob?id='+encodeURIComponent(id),{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
@@ -4456,6 +4584,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.back(dest, diagnose(dev))
         if path == "/apps/scan":
             return self.do_apps_scan(form, user, ip)
+        if path == "/servers/agent-check":
+            ids = [v for v in CFG["vms"] if form.get("id") in ("semua", v["id"])]
+            if not ids:
+                return self.back("/servers", "VM tidak ditemukan.", True)
+            todo = [v for v in ids if v["id"] not in AGENT_RUNNING]
+            for v in todo:
+                AGENT_RUNNING.add(v["id"])  # langsung tampil "Mengecek agen…" saat halaman dimuat ulang
+
+            def jalan(vs=todo):
+                for v in vs:
+                    run_agent_check(v)
+            threading.Thread(target=jalan, daemon=True).start()
+            write_log(user, "cek-agen", form.get("id") or "", ip)
+            return self.back("/servers", f"Cek agen dimulai untuk {len(todo)} server — hasilnya muncul di tiap kartu.")
         if path == "/servers/check":
             return self.do_vm_check(form, user, ip)
         if path == "/servers/run":
